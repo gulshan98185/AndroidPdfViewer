@@ -1149,6 +1149,28 @@ public class PDFView extends RelativeLayout {
         return null;
     }
 
+    public String selectAllText() throws Exception {
+        if (selectionPaintView != null) {
+            try {
+                if (dragPinchManager != null) {
+                    int currentPage = getCurrentPage();
+
+                    selPageSt = currentPage;
+                    selPageEd = currentPage;
+                    selStart = 0;
+                    selEnd = dragPinchManager.allText.length();
+                    hasSelection = true;
+                    selectionPaintView.resetSel();
+                    return getSelection();
+                }
+            } catch (Exception e) {
+                Log.e("Select All Exception", "Exception", e);
+                throw e;
+            }
+        }
+        return null;
+    }
+
    /* public ArrayList<RectF> mergeLineRects(List<RectF> selRects, RectF box) {
         RectF tmp = new RectF();
         ArrayList<RectF> selLineRects = new ArrayList<>(selRects.size());
