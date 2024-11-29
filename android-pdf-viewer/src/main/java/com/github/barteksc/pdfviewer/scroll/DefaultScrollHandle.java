@@ -6,6 +6,7 @@ import android.graphics.drawable.Drawable;
 import android.os.Handler;
 import android.util.TypedValue;
 import android.view.MotionEvent;
+import android.view.View;
 import android.view.ViewGroup;
 import android.widget.RelativeLayout;
 import android.widget.TextView;
@@ -161,6 +162,11 @@ public class DefaultScrollHandle extends RelativeLayout implements ScrollHandle 
     @Override
     public void hideDelayed() {
         handler.postDelayed(hidePageScrollerRunnable, 1000);
+    }
+
+    @Override
+    public View getCurrentView() {
+        return textView;
     }
 
     @Override

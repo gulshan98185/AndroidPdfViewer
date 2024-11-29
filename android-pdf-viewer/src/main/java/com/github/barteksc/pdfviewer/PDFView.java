@@ -145,9 +145,19 @@ public class PDFView extends RelativeLayout {
     OnSelection onSelection;
     public final HashMap<Integer, SearchRecord> searchRecords = new HashMap<>();
 
+    boolean isRefresh = false;
+
     public void setIsSearching(boolean isSearching) {
         this.isSearching = isSearching;
         redrawSel();
+    }
+
+    public void setRefresh(boolean isRefresh) {
+        this.isRefresh = isRefresh;
+    }
+
+    public boolean getRefresh(){
+        return this.isRefresh;
     }
 
     public void setOnSelection(OnSelection onSelection) {
@@ -702,17 +712,19 @@ public class PDFView extends RelativeLayout {
             initialRender = false;
             offset += this.spacingTopPx;
         }
-        if (swipeVertical) {
-            if (withAnimation) {
-                animationManager.startYAnimation(currentYOffset, offset);
+        if (!isRefresh) {
+            if (swipeVertical) {
+                if (withAnimation) {
+                    animationManager.startYAnimation(currentYOffset, offset);
+                } else {
+                    moveTo(currentXOffset, currentYOffset);
+                }
             } else {
-                moveTo(currentXOffset, offset);
-            }
-        } else {
-            if (withAnimation) {
-                animationManager.startXAnimation(currentXOffset, offset);
-            } else {
-                moveTo(offset, currentYOffset);
+                if (withAnimation) {
+                    animationManager.startXAnimation(currentXOffset, offset);
+                } else {
+                    moveTo(currentXOffset, currentYOffset);
+                }
             }
         }
         showPage(page);
@@ -895,8 +907,10 @@ public class PDFView extends RelativeLayout {
         // Clear caches
         cacheManager.recycle();
 
-        if (scrollHandle != null && isScrollHandleInit) {
+        if (scrollHandle != null && isScrollHandleInit && !isRefresh) {
             scrollHandle.destroyLayout();
+            scrollHandle = null;
+            isScrollHandleInit = false;
         }
 
         if (pdfFile != null) {
@@ -905,10 +919,9 @@ public class PDFView extends RelativeLayout {
         }
 
         renderingHandler = null;
-        scrollHandle = null;
-        isScrollHandleInit = false;
-        currentXOffset = currentYOffset = 0;
-        zoom = 1f;
+
+//        currentXOffset = currentYOffset = 0;
+//        zoom = 1f;
         recycled = true;
         callbacks = new Callbacks();
         state = State.DEFAULT;
@@ -1310,8 +1323,13 @@ public class PDFView extends RelativeLayout {
         cacheManager.makeANewSet();
 
         pagesLoader.loadPages();
-        redraw();
+        if(!isRefresh) {
+            redraw();
+        }
         redrawSel();
+        if (isRefresh) {
+            setRefresh(false);
+        }
     }
 
     /**
@@ -1332,7 +1350,7 @@ public class PDFView extends RelativeLayout {
         renderingHandler = new RenderingHandler(renderingHandlerThread.getLooper(), this);
         renderingHandler.start();
 
-        if (scrollHandle != null) {
+        if (scrollHandle != null && !isRefresh) {
             scrollHandle.setupLayout(this);
             isScrollHandleInit = true;
         }
@@ -1479,13 +1497,15 @@ public class PDFView extends RelativeLayout {
             return;
         }
 
+        int[] childLocation = new int[2];
+        scrollHandle.getCurrentView().getLocationOnScreen(childLocation);
         float offset, screenCenter;
         if (swipeVertical) {
             offset = currentYOffset;
-            screenCenter = ((float) getHeight()) / 2;
+            screenCenter = childLocation[1];//((float) getHeight()) / 2;
         } else {
             offset = currentXOffset;
-            screenCenter = ((float) getWidth()) / 2;
+            screenCenter = childLocation[0];//((float) getWidth()) / 2;
         }
 
         int page = pdfFile.getPageAtOffset(-(offset - screenCenter), zoom);
@@ -1664,6 +1684,14 @@ public class PDFView extends RelativeLayout {
 
     public float getCurrentXOffset() {
         return currentXOffset;
+    }
+
+    public void setCurrentXOffset(float currentXOffset) {
+        this.currentXOffset = currentXOffset;
+    }
+
+    public void setCurrentYOffset(float currentYOffset) {
+        this.currentYOffset = currentYOffset;
     }
 
     public float getCurrentYOffset() {
@@ -2181,7 +2209,9 @@ public class PDFView extends RelativeLayout {
             PDFView.this.setSpacing(spacing);
             PDFView.this.setSpacingTop(spacingTop);
             PDFView.this.setSpacingBottom(spacingBottom);
-            PDFView.this.setScrollHandle(scrollHandle);
+            if(!PDFView.this.isRefresh) {
+                PDFView.this.setScrollHandle(scrollHandle);
+            }
             PDFView.this.setAutoSpacing(autoSpacing);
             PDFView.this.setPageFitPolicy(pageFitPolicy);
             PDFView.this.setFitEachPage(fitEachPage);

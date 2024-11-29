@@ -1,5 +1,7 @@
 package com.github.barteksc.pdfviewer.scroll;
 
+import android.view.View;
+
 import com.github.barteksc.pdfviewer.PDFView;
 
 public interface ScrollHandle {
@@ -54,4 +56,6 @@ public interface ScrollHandle {
      * Hide handle after some time (defined by implementation)
      */
     void hideDelayed();
+
+    View getCurrentView();
 }
