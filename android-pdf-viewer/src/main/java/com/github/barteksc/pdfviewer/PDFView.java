@@ -730,6 +730,25 @@ public class PDFView extends RelativeLayout {
         showPage(page);
     }
 
+    public void jumpToText(int page) {
+        if (pdfFile == null) {
+            return;
+        }
+
+        page = pdfFile.determineValidPageNumberFrom(page);
+        float offset = page == 0 ? 0 : -pdfFile.getPageOffset(page, zoom);
+        if (page == 0 && initialRender) {
+            initialRender = false;
+            offset += this.spacingTopPx;
+        }
+        if (swipeVertical) {
+            moveTo(currentXOffset, offset);
+        } else {
+            moveTo(offset, currentYOffset);
+        }
+        showPage(page);
+    }
+
     public void jumpTo(int page) {
         jumpTo(page, false);
     }
