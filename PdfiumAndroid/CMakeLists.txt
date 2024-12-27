@@ -53,7 +53,9 @@ set_target_properties( # Specifies the target library.
         PROPERTIES IMPORTED_LOCATION
 
         # Provides the path to the library you want to import.
-        ${CMAKE_SOURCE_DIR}/src/main/jni/lib/${ANDROID_ABI}/libpdfsdk.so)
+        # ${CMAKE_SOURCE_DIR}/src/main/jni/lib/${ANDROID_ABI}/libpdfsdk.so
+        ${CMAKE_SOURCE_DIR}/../../PDFiumNewLibsFixes/${ANDROID_ABI}/libpdfsdk.so
+)
 
 #find_package( Threads )
 find_package(Threads REQUIRED)
