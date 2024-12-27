@@ -55,7 +55,8 @@ android {
     }
     sourceSets {
         main {
-            jniLibs.srcDirs 'src/main/jni/lib'
+            //jniLibs.srcDirs 'src/main/jni/lib'
+            jniLibs.srcDirs '../../PDFiumNewLibsFixes'
         }
     }
 
