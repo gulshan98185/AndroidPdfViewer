@@ -23,7 +23,11 @@ public class PDocSearchTask implements Runnable {
     public PDocSearchTask(PDFView pdoc, String key) {
 
         this.pdoc = new WeakReference<>(pdoc);
-        this.key = key + "\0";
+        if (key.endsWith(" ") && key.length() >= 2) { //search word with space will crash pdfium, so remove end space.
+            this.key = key.substring(0, key.length() - 1) + "\0";
+        } else {
+            this.key = key + "\0";
+        }
     }
 
     public long getKeyStr( ) {
