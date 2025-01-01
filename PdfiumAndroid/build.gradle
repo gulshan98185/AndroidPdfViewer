@@ -30,7 +30,9 @@ android {
                 // Sets optional flags for the C++ compiler.
                 //cppFlags "-fexceptions"
 
-                arguments "-DANDROID_STL=c++_shared", "-DANDROID_TOOLCHAIN=clang"
+                //arguments "-DANDROID_STL=c++_shared", "-DANDROID_TOOLCHAIN=clang"
+                // Commenting to fix conflict issue of pdfsdk and spectrum compression. Conflict area is libc++_shared library., Now commenting this will bundle libc++_shared with each native library can increase build size.
+                arguments "-DANDROID_TOOLCHAIN=clang"
                 cppFlags "-frtti -fexceptions -fsigned-char"
             }
         }
