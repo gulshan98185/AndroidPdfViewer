@@ -542,7 +542,7 @@ public class PDFView extends RelativeLayout {
 
         SizeF size = pdfFile.getPageSize(page);
         //  SizeF size = pdfFile.SizeF size = pdfView.pdfFile.getPageSize(page);(page, getZoom());
-        pdfiumCore.nativeGetCharPos(pagePtr
+        pdfiumCore.getCharPos(pagePtr
                 , 0
                 , 0
                 , (int) size.getWidth(), (int) size.getHeight(), pos, dragPinchManager.loadText(), index, true);
@@ -558,7 +558,7 @@ public class PDFView extends RelativeLayout {
         long pagePtr = pdfFile.pdfDocument.mNativePagesPtr.get(page);
         SizeF size = pdfFile.getPageSize(page);
         //   SizeF size = pdfFile.getScaledPageSize(page, getZoom());
-        pdfiumCore.nativeGetMixedLooseCharPos(pagePtr
+        pdfiumCore.getMixedLooseCharPos(pagePtr
                 , 0
                 , getLateralOffset()
                 , (int) size.getWidth(), (int) size.getHeight(), pos, dragPinchManager.loadText(), index, true);
@@ -572,7 +572,7 @@ public class PDFView extends RelativeLayout {
         long pagePtr = pdfFile.pdfDocument.mNativePagesPtr.get(page);
         SizeF size = pdfFile.getPageSize(page);
         //   SizeF size = pdfFile.getScaledPageSize(page, getZoom());
-        pdfiumCore.nativeGetMixedLooseCharPos(pagePtr
+        pdfiumCore.getMixedLooseCharPos(pagePtr
                 , 0
                 , getLateralOffset()
                 , (int) size.getWidth(), (int) size.getHeight(), pos, dragPinchManager.loadText(), index, true);
@@ -588,14 +588,14 @@ public class PDFView extends RelativeLayout {
             record.data = data;
             long keyStr = task.getKeyStr();
             if (keyStr != 0) {
-                long searchHandle = pdfiumCore.nativeFindTextPageStart(tid, keyStr, task.flag, record.findStart);
+                long searchHandle = pdfiumCore.findTextPageStart(tid, keyStr, task.flag, record.findStart);
                 if (searchHandle != 0) {
-                    while (pdfiumCore.nativeFindTextPageNext(searchHandle)) {
-                        int st = pdfiumCore.nativeGetFindIdx(searchHandle);
-                        int ed = pdfiumCore.nativeGetFindLength(searchHandle);
+                    while (pdfiumCore.findTextPageNext(searchHandle)) {
+                        int st = pdfiumCore.getFindIdx(searchHandle);
+                        int ed = pdfiumCore.getFindLength(searchHandle);
                         getRectsForRecordItem(data, st, ed, page);
                     }
-                    pdfiumCore.nativeFindTextPageEnd(searchHandle);
+                    pdfiumCore.findTextPageEnd(searchHandle);
                 }
             }
             //CMN.pt("getAllSearchedHighlightRects：");
@@ -643,12 +643,12 @@ public class PDFView extends RelativeLayout {
         long pid = pdfFile.pdfDocument.mNativePagesPtr.get(page);
         SizeF size = pdfFile.getPageSize(page);
         if (st >= 0 && ed > 0) {
-            int rectCount = pdfiumCore.nativeCountRects(tid, st, ed);
+            int rectCount = pdfiumCore.countRects(tid, st, ed);
             if (rectCount > 0) {
                 RectF[] rects = new RectF[rectCount];
                 for (int i = 0; i < rectCount; i++) {
                     RectF rI = new RectF();
-                    pdfiumCore.nativeGetRect(pid
+                    pdfiumCore.getRect(pid
                             , 0
                             , 0
                             , (int) size.getWidth(), (int) size.getHeight()
@@ -871,7 +871,7 @@ public class PDFView extends RelativeLayout {
         if (tid == -1) {
             return null;
         }
-        int foundIdx = pdfiumCore.nativeFindTextPage(tid, key, flag);
+        int foundIdx = pdfiumCore.findTextPage(tid, key, flag);
         SearchRecord ret = foundIdx == -1 ? null : new SearchRecord(pageIdx, foundIdx);
 
         return ret;

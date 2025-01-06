@@ -54,19 +54,11 @@ public class PdfiumCore {
 
     private native int nativeGetPageHeightPoint(long pagePtr);
 
-    public native int nativeGetMixedLooseCharPos(long pagePtr, int offsetY, int offsetX, int width, int height, RectF pt, long tid, int index, boolean loose);
+    private native int nativeGetMixedLooseCharPos(long pagePtr, int offsetY, int offsetX, int width, int height, RectF pt, long tid, int index, boolean loose);
 
-    //private native long nativeGetNativeWindow(Surface surface);
-    //private native void nativeRenderPage(long pagePtr, long nativeWindowPtr);
-    private native void nativeRenderPage(long pagePtr, Surface surface, int dpi,
-                                         int startX, int startY,
-                                         int drawSizeHor, int drawSizeVer,
-                                         boolean renderAnnot);
+    private native void nativeRenderPage(long pagePtr, Surface surface, int dpi,int startX, int startY,int drawSizeHor, int drawSizeVer,boolean renderAnnot);
 
-    private native void nativeRenderPageBitmap(long pagePtr, Bitmap bitmap, int dpi,
-                                               int startX, int startY,
-                                               int drawSizeHor, int drawSizeVer,
-                                               boolean renderAnnot);
+    private native void nativeRenderPageBitmap(long pagePtr, Bitmap bitmap, int dpi,int startX, int startY,int drawSizeHor, int drawSizeVer,boolean renderAnnot);
 
     private native String nativeGetDocumentMetaText(long docPtr, String tag);
 
@@ -78,20 +70,17 @@ public class PdfiumCore {
 
     private native long nativeGetBookmarkDestIndex(long docPtr, long bookmarkPtr);
 
-    public native String nativeGetText(long textPtr);
+    private native String nativeGetText(long textPtr);
 
-    public native int nativeGetCharIndexAtCoord(long pagePtr, double width, double height, long textPtr, double posX, double posY, double tolX, double tolY);
+    private native int nativeGetCharIndexAtCoord(long pagePtr, double width, double height, long textPtr, double posX, double posY, double tolX, double tolY);
 
-    private native void nativeRenderPageBitmap(long docPtr, long pagePtr, Bitmap bitmap, int dpi,
-                                               int startX, int startY,
-                                               int drawSizeHor, int drawSizeVer,
-                                               boolean renderAnnot);
+    private native void nativeRenderPageBitmap(long docPtr, long pagePtr, Bitmap bitmap, int dpi,int startX, int startY,int drawSizeHor, int drawSizeVer,boolean renderAnnot);
 
-    public native long nativeGetLinkAtCoord(long pagePtr, double width, double height, double posX, double posY);
+    private native long nativeGetLinkAtCoord(long pagePtr, double width, double height, double posX, double posY);
 
-    public native String nativeGetLinkTarget(long docPtr, long linkPtr);
+    private native String nativeGetLinkTarget(long docPtr, long linkPtr);
 
-    public native long nativeLoadTextPage(long pagePtr);
+    private native long nativeLoadTextPage(long pagePtr);
 
     private native Size nativeGetPageSizeByIndex(long docPtr, int pageIndex, int dpi);
 
@@ -105,18 +94,27 @@ public class PdfiumCore {
 
     private native RectF nativeGetLinkRect(long linkPtr);
 
-    public native int nativeGetCharPos(long pagePtr, int offsetY, int offsetX, int width, int height, RectF pt, long tid, int index, boolean loose);
-    public native long nativeFindTextPageStart(long textPtr, long keyStr, int flag, int startIdx);
-    public native boolean nativeFindTextPageNext(long searchPtr);
-    public native int nativeGetFindIdx(long searchPtr);
-    public native int nativeGetFindLength(long searchPtr);
-    public native void nativeFindTextPageEnd(long searchPtr);
-    public native int nativeCountRects(long textPtr, int st, int ed);
-    public native boolean nativeGetRect(long pagePtr, int offsetY, int offsetX, int width, int height, long textPtr, RectF rect, int idx);
-    public native int nativeFindTextPage(long pagePtr, String key, int flag);
-    public static native long nativeGetStringChars(String key);
-    private native Point nativePageCoordsToDevice(long pagePtr, int startX, int startY, int sizeX,
-                                                  int sizeY, int rotate, double pageX, double pageY);
+    private native int nativeGetCharPos(long pagePtr, int offsetY, int offsetX, int width, int height, RectF pt, long tid, int index, boolean loose);
+
+    private native long nativeFindTextPageStart(long textPtr, long keyStr, int flag, int startIdx);
+
+    private native boolean nativeFindTextPageNext(long searchPtr);
+
+    private native int nativeGetFindIdx(long searchPtr);
+
+    private native int nativeGetFindLength(long searchPtr);
+
+    private native void nativeFindTextPageEnd(long searchPtr);
+
+    private native int nativeCountRects(long textPtr, int st, int ed);
+
+    private native boolean nativeGetRect(long pagePtr, int offsetY, int offsetX, int width, int height, long textPtr, RectF rect, int idx);
+
+    private native int nativeFindTextPage(long pagePtr, String key, int flag);
+
+    private static native long nativeGetStringChars(String key);
+
+    private native Point nativePageCoordsToDevice(long pagePtr, int startX, int startY, int sizeX,int sizeY, int rotate, double pageX, double pageY);
 
 
     /* synchronize native methods */
@@ -150,6 +148,110 @@ public class PdfiumCore {
     public int getTextRects(long pagePtr, int offsetY, int offsetX, Size size, ArrayList<RectF> arr, long textPtr, int selSt, int selEd) {
         synchronized (lock) {
             return nativeCountAndGetRects(pagePtr, offsetY, offsetX, size.getWidth(), size.getHeight(), arr, textPtr, selSt, selEd);
+        }
+    }
+
+    public int getMixedLooseCharPos(long pagePtr, int offsetY, int offsetX, int width, int height, RectF pt, long tid, int index, boolean loose) {
+        synchronized (lock) {
+            return nativeGetMixedLooseCharPos(pagePtr, offsetY, offsetX, width, height, pt, tid, index, loose);
+        }
+    }
+
+    public long findTextPageStart(long textPtr, long keyStr, int flag, int startIdx) {
+        synchronized (lock) {
+            return nativeFindTextPageStart(textPtr, keyStr, flag, startIdx);
+        }
+    }
+
+
+    public boolean findTextPageNext(long searchPtr) {
+        synchronized (lock) {
+            return nativeFindTextPageNext(searchPtr);
+        }
+    }
+
+    public int getFindIdx(long searchPtr) {
+        synchronized (lock) {
+            return nativeGetFindIdx(searchPtr);
+        }
+    }
+
+    public int getFindLength(long searchPtr) {
+        synchronized (lock) {
+            return nativeGetFindLength(searchPtr);
+        }
+    }
+
+    public void findTextPageEnd(long searchPtr) {
+        synchronized (lock) {
+            nativeFindTextPageEnd(searchPtr);
+        }
+    }
+
+    public int countRects(long textPtr, int st, int ed) {
+        synchronized (lock) {
+            return nativeCountRects(textPtr, st, ed);
+        }
+    }
+
+    public boolean getRect(long pagePtr, int offsetY, int offsetX, int width, int height, long textPtr, RectF rect, int idx) {
+        synchronized (lock) {
+            return nativeGetRect(pagePtr, offsetY, offsetX, width, height, textPtr, rect, idx);
+        }
+    }
+
+    public int findTextPage(long pagePtr, String key, int flag) {
+        synchronized (lock) {
+            return nativeFindTextPage(pagePtr, key, flag);
+        }
+    }
+
+    public static long getStringChars(String key) {
+        synchronized (lock) {
+            return nativeGetStringChars(key);
+        }
+    }
+
+
+    public int getCharPos(long pagePtr, int offsetY, int offsetX, int width, int height, RectF pt, long tid, int index, boolean loose) {
+        synchronized (lock) {
+            return nativeGetCharPos(pagePtr, offsetY, offsetX, width, height, pt, tid, index, loose);
+        }
+    }
+
+    public String getText(long textPtr) {
+        synchronized (lock) {
+            return nativeGetText(textPtr);
+        }
+    }
+
+    public int getCharIndexAtCoord(long pagePtr, double width, double height, long textPtr, double posX, double posY, double tolX, double tolY) {
+        synchronized (lock) {
+            return nativeGetCharIndexAtCoord(pagePtr, width, height, textPtr, posX, posY, tolX, tolY);
+        }
+    }
+
+    public void renderPageBitmap(long docPtr, long pagePtr, Bitmap bitmap, int dpi, int startX, int startY, int drawSizeHor, int drawSizeVer, boolean renderAnnot) {
+        synchronized (lock) {
+            nativeRenderPageBitmap(docPtr, pagePtr, bitmap, dpi, startX, startY, drawSizeHor, drawSizeVer, renderAnnot);
+        }
+    }
+
+    public long getLinkAtCoord(long pagePtr, double width, double height, double posX, double posY) {
+        synchronized (lock) {
+            return nativeGetLinkAtCoord(pagePtr, width, height, posX, posY);
+        }
+    }
+
+    public String getLinkTarget(long docPtr, long linkPtr) {
+        synchronized (lock) {
+            return nativeGetLinkTarget(docPtr, linkPtr);
+        }
+    }
+
+    public void closePages(long[] pagesPtr){
+        synchronized (lock) {
+            nativeClosePages(pagesPtr);
         }
     }
 

@@ -148,7 +148,7 @@ class DragPinchManager implements GestureDetector.OnGestureListener, GestureDete
                 //int charIdx = pdfiumCore.nativeGetCharIndexAtPos(tid, posX, posY, 10.0, 10.0);
                 int pageX = (int) pdfFile.getSecondaryPageOffset(page, pdfView.getZoom());
                 int pageY = (int) pdfFile.getPageOffset(page, pdfView.getZoom());
-                return pdfFile.pdfiumCore.nativeGetCharIndexAtCoord(pagePtr, pageSize.getWidth(), pageSize.getHeight(), tid
+                return pdfFile.pdfiumCore.getCharIndexAtCoord(pagePtr, pageSize.getWidth(), pageSize.getHeight(), tid
                         , Math.abs(mappedX - pageX), Math.abs(mappedY - pageY), 10.0 * tolFactor, 10.0 * tolFactor);
 
 
@@ -206,7 +206,7 @@ class DragPinchManager implements GestureDetector.OnGestureListener, GestureDete
             //int charIdx = pdfiumCore.nativeGetCharIndexAtPos(tid, posX, posY, 10.0, 10.0);
             int pageX = (int) pdfFile.getSecondaryPageOffset(page, pdfView.getZoom());
             int pageY = (int) pdfFile.getPageOffset(page, pdfView.getZoom());
-            return pdfFile.pdfiumCore.nativeGetCharIndexAtCoord(pagePtr, pageSize.getWidth(), pageSize.getHeight(), tid
+            return pdfFile.pdfiumCore.getCharIndexAtCoord(pagePtr, pageSize.getWidth(), pageSize.getHeight(), tid
                     , x, y, 10.0 * tolFactor, 10.0 * tolFactor);
         }
 
@@ -261,7 +261,7 @@ class DragPinchManager implements GestureDetector.OnGestureListener, GestureDete
                     //int charIdx = pdfiumCore.nativeGetCharIndexAtPos(tid, posX, posY, 10.0, 10.0);
                     int pageX = (int) pdfFile.getSecondaryPageOffset(page, pdfView.getZoom());
                     int pageY = (int) pdfFile.getPageOffset(page, pdfView.getZoom());
-                    int charIdx = pdfFile.pdfiumCore.nativeGetCharIndexAtCoord(pagePtr, pageSize.getWidth(), pageSize.getHeight(), tid
+                    int charIdx = pdfFile.pdfiumCore.getCharIndexAtCoord(pagePtr, pageSize.getWidth(), pageSize.getHeight(), tid
                             , Math.abs(mappedX - pageX), Math.abs(mappedY - pageY), 10.0 * tolFactor, 10.0 * tolFactor);
                     String ret = null;
 
@@ -380,7 +380,7 @@ class DragPinchManager implements GestureDetector.OnGestureListener, GestureDete
     public long prepareText(int page) {
         long tid = loadText(page);
         if (tid != -1) {
-            allText = pdfView.pdfiumCore.nativeGetText(tid);
+            allText = pdfView.pdfiumCore.getText(tid);
 
             if (pageBreakIterator == null) {
                 pageBreakIterator = new BreakIteratorHelper();

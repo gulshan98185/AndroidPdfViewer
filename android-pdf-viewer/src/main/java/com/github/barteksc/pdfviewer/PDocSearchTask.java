@@ -32,7 +32,7 @@ public class PDocSearchTask implements Runnable {
 
     public long getKeyStr( ) {
         if(keyStr==0) {
-            keyStr = PdfiumCore.nativeGetStringChars(key);
+            keyStr = PdfiumCore.getStringChars(key);
         }
         return keyStr;
     }

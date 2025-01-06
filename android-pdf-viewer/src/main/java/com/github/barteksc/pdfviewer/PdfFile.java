@@ -272,10 +272,10 @@ class PdfFile {
 
     public long getLinkAtPos(int currentPage,float posX, float posY, SizeF size) {
 
-        return pdfiumCore.nativeGetLinkAtCoord(pdfDocument.mNativePagesPtr.get(currentPage), size.getWidth(), size.getHeight(), posX, posY);
+        return pdfiumCore.getLinkAtCoord(pdfDocument.mNativePagesPtr.get(currentPage), size.getWidth(), size.getHeight(), posX, posY);
     }
     public String getLinkTarget(long lnkPtr) {
-        return pdfiumCore.nativeGetLinkTarget(pdfDocument.mNativeDocPtr, lnkPtr);
+        return pdfiumCore.getLinkTarget(pdfDocument.mNativeDocPtr, lnkPtr);
     }
     public boolean openPage(int pageIndex) throws PageRenderingException {
         int docPage = documentPage(pageIndex);
