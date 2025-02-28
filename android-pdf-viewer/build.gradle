@@ -25,11 +25,11 @@ ext {
 }
 */
 android {
-    compileSdkVersion 34
+    compileSdk rootProject.ext.compileSdkVersion
 
     defaultConfig {
         minSdkVersion 21
-        targetSdkVersion 34
+        targetSdk rootProject.ext.targetSdkVersion
     }
     namespace 'com.github.barteksc.pdfviewer'
 

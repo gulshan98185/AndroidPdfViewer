@@ -14,11 +14,11 @@ buildscript {
 apply plugin: 'com.android.library'
 
 android {
-    compileSdkVersion 34
+    compileSdk rootProject.ext.compileSdkVersion
 
     defaultConfig {
         minSdkVersion 14
-        targetSdkVersion 34
+        targetSdkVersion rootProject.ext.targetSdkVersion
 
         // This block is different from the one you use to link Gradle
         // to your CMake or ndk-build script.
