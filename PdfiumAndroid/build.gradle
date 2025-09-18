@@ -5,7 +5,7 @@ buildscript {
     }
 
     dependencies {
-        classpath 'com.android.tools.build:gradle:8.9.0'
+        classpath 'com.android.tools.build:gradle:8.11.1'
 //        classpath 'com.jfrog.bintray.gradle:gradle-bintray-plugin:1.8.4'
         classpath 'com.github.dcendents:android-maven-gradle-plugin:2.1'
     }
@@ -63,6 +63,7 @@ android {
     }
 
     ndkVersion '21.1.6352462'
+    //ndkVersion "29.0.13599879"
     namespace 'com.shockwave.pdfium'
 }
 
