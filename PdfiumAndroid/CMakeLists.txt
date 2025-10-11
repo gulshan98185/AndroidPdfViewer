@@ -41,53 +41,30 @@ set(THREADS_PREFER_PTHREAD_FLAG ON)
 #        ${CMAKE_SOURCE_DIR}/src/main/jni/lib/${ANDROID_ABI}/libmodpng.so)
 
 
-# Add other prebuilt libraries
-add_library(pdfsdk
-        SHARED
-        IMPORTED)
 
-set_target_properties( # Specifies the target library.
-        pdfsdk
-
-        # Specifies the parameter you want to define.
+set (PDFIUM_DIR ${CMAKE_SOURCE_DIR}/../../ExtLibsAndroid/Pdfium-android)
+add_library(libpdfium SHARED IMPORTED)
+set_target_properties(libpdfium
         PROPERTIES IMPORTED_LOCATION
-
-        # Provides the path to the library you want to import.
-        # ${CMAKE_SOURCE_DIR}/src/main/jni/lib/${ANDROID_ABI}/libpdfsdk.so
-        ${CMAKE_SOURCE_DIR}/../../PDFiumNewLibsFixes/${ANDROID_ABI}/libpdfsdk.so
+        #${CMAKE_SOURCE_DIR}/../../PDFiumNewLibsFixes/${ANDROID_ABI}/libpdfsdk.so
+        ${PDFIUM_DIR}/lib/${ANDROID_ABI}/libpdfium.so
 )
 
 #find_package( Threads )
 find_package(Threads REQUIRED)
+include_directories("${PDFIUM_DIR}/include" "${PDFIUM_DIR}/include/utils")
 
-include_directories(
-        "${CMAKE_SOURCE_DIR}/src/main/jni/include"
-        "${CMAKE_SOURCE_DIR}/src/main/jni/include/utils"
-)
-
-add_library( # Specifies the name of the library.
-        jniPdfium
-
-        # Sets the library as a shared library.
+add_library(jni_pdf_document
         SHARED
-
-        # Provides a relative path to your source file(s).
         ${CMAKE_SOURCE_DIR}/src/main/jni/src/mainJNILib.cpp)
 
-
-find_library( # Defines the name of the path variable that stores the
-        # location of the NDK library.
-        log-lib
-
-        # Specifies the name of the NDK library that
-        # CMake needs to locate.
-        log)
+find_library(log-lib log)
 
 
 # You need to link static libraries against your shared native library.
 target_link_libraries(
-        jniPdfium
-        pdfsdk
+        jni_pdf_document
+        libpdfium
         Threads::Threads
         -ljnigraphics
         android

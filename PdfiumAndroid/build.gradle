@@ -5,7 +5,7 @@ buildscript {
     }
 
     dependencies {
-        classpath 'com.android.tools.build:gradle:8.9.0'
+        classpath 'com.android.tools.build:gradle:8.13.0'
 //        classpath 'com.jfrog.bintray.gradle:gradle-bintray-plugin:1.8.4'
         classpath 'com.github.dcendents:android-maven-gradle-plugin:2.1'
     }
@@ -17,7 +17,7 @@ android {
     compileSdk rootProject.ext.compileSdkVersion
 
     defaultConfig {
-        minSdkVersion 14
+        minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
 
         // This block is different from the one you use to link Gradle
@@ -55,14 +55,14 @@ android {
             pickFirsts += ['**/*.so']
         }
     }
-    sourceSets {
+    /*sourceSets {
         main {
             //jniLibs.srcDirs 'src/main/jni/lib'
             jniLibs.srcDirs '../../PDFiumNewLibsFixes'
         }
-    }
+    }*/
 
-    ndkVersion '21.1.6352462'
+    ndkVersion "29.0.14206865"
     namespace 'com.shockwave.pdfium'
 }
 

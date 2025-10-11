@@ -1,4 +1,6 @@
 #include "util.hpp"
+#include "fpdf_flatten.h"
+#include "fpdf_formfill.h"
 
 #define HAVE_PTHREADS true;
 extern "C" {
@@ -57,6 +59,7 @@ private:
 
 public:
     FPDF_DOCUMENT pdfDocument = NULL;
+    FPDF_FORMHANDLE gForm = nullptr;
     size_t fileSize;
 
     DocumentFile() { initLibraryIfNeed(); }
@@ -186,6 +189,15 @@ static int getBlock(void *param, unsigned long position, unsigned char *outBuffe
     return 1;
 }
 
+// once per document (store somewhere):
+static void ensureForm(DocumentFile* docFile){
+    if (!docFile->gForm) {
+        static FPDF_FORMFILLINFO ffi{}; ffi.version = 2;
+        docFile->gForm = FPDFDOC_InitFormFillEnvironment(docFile->pdfDocument, &ffi);
+        FPDF_SetFormFieldHighlightAlpha(docFile->gForm, 0);
+    }
+}
+
 JNI_FUNC(jlong, PdfiumCore, nativeOpenDocument)(JNI_ARGS, jint fd, jstring password) {
 
     size_t fileLength = (size_t) getFileSize(fd);
@@ -232,6 +244,7 @@ JNI_FUNC(jlong, PdfiumCore, nativeOpenDocument)(JNI_ARGS, jint fd, jstring passw
     }
 
     docFile->pdfDocument = document;
+    ensureForm(docFile);
 
     return reinterpret_cast<jlong>(docFile);
 }
@@ -422,9 +435,9 @@ static void renderPageInternal(FPDF_PAGE page,
     int baseY = (startY < 0) ? 0 : startY;
     int flags = FPDF_REVERSE_BYTE_ORDER;
 
-    if (renderAnnot) {
+    //if (renderAnnot) {
         flags |= FPDF_ANNOT;
-    }
+    //}
 
     FPDFBitmap_FillRect(pdfBitmap, baseX, baseY, baseHorSize, baseVerSize,
                         0xFFFFFFFF); //White
@@ -521,11 +534,15 @@ JNI_FUNC(jstring, PdfiumCore, nativeGetText)(JNI_ARGS, jlong textPtr) {
     delete[]buffer;
     return ret;
 }
-JNI_FUNC(void, PdfiumCore, nativeRenderPageBitmap)(JNI_ARGS, jlong pagePtr, jobject bitmap,
+
+
+
+JNI_FUNC(void, PdfiumCore, nativeRenderPageBitmap)(JNI_ARGS, jlong docPtr, jlong pagePtr, jobject bitmap,
                                                    jint dpi, jint startX, jint startY,
                                                    jint drawSizeHor, jint drawSizeVer,
                                                    jboolean renderAnnot) {
 
+    DocumentFile *doc = reinterpret_cast<DocumentFile *>(docPtr);
     FPDF_PAGE page = reinterpret_cast<FPDF_PAGE>(pagePtr);
 
     if (page == NULL || bitmap == NULL) {
@@ -587,19 +604,23 @@ JNI_FUNC(void, PdfiumCore, nativeRenderPageBitmap)(JNI_ARGS, jlong pagePtr, jobj
     int baseVerSize = (canvasVerSize < drawSizeVer) ? canvasVerSize : (int) drawSizeVer;
     int baseX = (startX < 0) ? 0 : (int) startX;
     int baseY = (startY < 0) ? 0 : (int) startY;
-    int flags = FPDF_REVERSE_BYTE_ORDER;
-
-    if (renderAnnot) {
-        flags |= FPDF_ANNOT;
-    }
 
     FPDFBitmap_FillRect(pdfBitmap, baseX, baseY, baseHorSize, baseVerSize,
                         0xFFFFFFFF); //White
 
+    // 1) Page content (text, images, vectors, non-widget annots)
+    int flagsBase = FPDF_REVERSE_BYTE_ORDER | FPDF_LCD_TEXT | FPDF_ANNOT; // keep FPDF_ANNOT for non-widget annots
     FPDF_RenderPageBitmap(pdfBitmap, page,
                           startX, startY,
-                          (int) drawSizeHor, (int) drawSizeVer,
-                          0, flags);
+                          (int)drawSizeHor, (int)drawSizeVer,
+                          0, flagsBase);
+
+    // 2) Form widgets (AcroForm fields, signature appearance)
+    int flagsFFL = FPDF_REVERSE_BYTE_ORDER | FPDF_LCD_TEXT; // FFL draws widgets; FPDF_ANNOT here is optional
+    FPDF_FFLDraw(doc->gForm, pdfBitmap, page,
+                 startX, startY,
+                 (int)drawSizeHor, (int)drawSizeVer,
+                 0, flagsFFL);
 
     if (info.format == ANDROID_BITMAP_FORMAT_RGB_565) {
         rgbBitmapTo565(tmp, sourceStride, addr, &info);

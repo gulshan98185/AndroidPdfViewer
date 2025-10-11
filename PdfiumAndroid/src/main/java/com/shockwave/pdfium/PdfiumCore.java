@@ -23,8 +23,9 @@ public class PdfiumCore {
 
     static {
         try {
-            System.loadLibrary("pdfsdk");
-            System.loadLibrary("jniPdfium");
+            //System.loadLibrary("pdfsdk");
+            System.loadLibrary("pdfium");
+            System.loadLibrary("jni_pdf_document");
         } catch (UnsatisfiedLinkError e) {
             Log.e(TAG, "Native libraries failed to load - " + e);
         }
@@ -464,7 +465,7 @@ public class PdfiumCore {
                                  boolean renderAnnot) {
         synchronized (lock) {
             try {
-                nativeRenderPageBitmap(doc.mNativePagesPtr.get(pageIndex), bitmap, mCurrentDpi,
+                nativeRenderPageBitmap(doc.mNativeDocPtr,doc.mNativePagesPtr.get(pageIndex), bitmap, mCurrentDpi,
                         startX, startY, drawSizeX, drawSizeY, renderAnnot);
             } catch (NullPointerException e) {
                 Log.e(TAG, "mContext may be null");

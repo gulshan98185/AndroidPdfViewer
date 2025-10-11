@@ -18,12 +18,12 @@ android {
     compileSdkVersion rootProject.ext.compileSdkVersion
 
     defaultConfig {
-        minSdkVersion 14
+        minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
         versionCode 3
         versionName "3.0.0"
     }
-    ndkVersion '21.1.6352462'
+    ndkVersion '29.0.14206865'
 
 }
 
