@@ -1029,4 +1029,26 @@ JNI_FUNC(jlong, PdfiumCore, nativeLoadTextPage)(JNI_ARGS, jlong pagePtr) {
     return loadTextPageInternal(env, (FPDF_PAGE) pagePtr);
 }
 
+JNIEXPORT void JNICALL
+Java_com_shockwave_pdfium_PdfiumCore_nativeCloseTextPage(JNIEnv *env, jobject thiz,
+                                                         jlong text_ptr) {
+    if (text_ptr != 0) {
+        FPDFText_ClosePage(reinterpret_cast<FPDF_TEXTPAGE>(text_ptr));
+    }
+}
+
+JNIEXPORT jint JNICALL
+Java_com_shockwave_pdfium_PdfiumCore_nativeGetTextCount(
+        JNIEnv* env,
+        jobject thiz,
+        jlong text_ptr) {
+
+    if(text_ptr == 0) return 0;
+
+    return FPDFText_CountChars(
+            reinterpret_cast<FPDF_TEXTPAGE>(text_ptr)
+    );
+}
+
+
 }//extern C
