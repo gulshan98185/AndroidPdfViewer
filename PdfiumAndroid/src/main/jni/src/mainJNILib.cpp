@@ -1050,5 +1050,547 @@ Java_com_shockwave_pdfium_PdfiumCore_nativeGetTextCount(
     );
 }
 
+// save new
+#include <android/log.h>
+#include <stdio.h>
+#include <string.h>
+#include "fpdf_save.h"
+#include "fpdf_annot.h"
+#include "fpdf_edit.h"
+#include "fpdfview.h"
+#include <jni.h>
+#include <vector>
+#include "fpdf_text.h"
+
+#ifdef LOG_TAG
+#undef LOG_TAG
+#endif
+#define LOG_TAG "PDF_SAVE"
+#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
+
+typedef struct {
+    FPDF_FILEWRITE base;
+    FILE* file;
+} PdfFileWriter;
+
+// Writer callback
+int WriteBlock(FPDF_FILEWRITE* pThis,
+               const void* data,
+               unsigned long size) {
+
+    PdfFileWriter* writer = (PdfFileWriter*)pThis;
+    if (!writer->file) return 0;
+
+    return fwrite(data, 1, size, writer->file) == size;
+}
+
+// to convert the canvas coordinates top-left (pixels) into pdf coordinates bottom-left (points)
+JNIEXPORT jfloatArray JNICALL
+Java_com_shockwave_pdfium_PdfiumCore_nativeDeviceRectToPageRect(
+        JNIEnv *env,
+        jobject thiz,
+        jlong pagePtr,
+        jint viewWidth,
+        jint viewHeight,
+        jfloat left,
+        jfloat top,
+        jfloat right,
+        jfloat bottom) {
+
+    if (pagePtr == 0) return nullptr;
+
+    FPDF_PAGE page = reinterpret_cast<FPDF_PAGE>(pagePtr);
+
+    double pageLeft, pageTop, pageRight, pageBottom;
+
+    // Convert top-left
+    FPDF_DeviceToPage(
+            page,
+            0,                 // start_x
+            0,                 // start_y
+            viewWidth,         // size_x
+            viewHeight,        // size_y
+            0,                 // rotation
+            (int) left,
+            (int) top,
+            &pageLeft,
+            &pageTop
+    );
+
+    // Convert bottom-right
+    FPDF_DeviceToPage(
+            page,
+            0,
+            0,
+            viewWidth,
+            viewHeight,
+            0,
+            (int) right,
+            (int) bottom,
+            &pageRight,
+            &pageBottom
+    );
+
+    jfloatArray result = env->NewFloatArray(4);
+    float values[4] = {
+            (float) pageLeft,
+            (float) pageTop,
+            (float) pageRight,
+            (float) pageBottom
+    };
+
+    env->SetFloatArrayRegion(result, 0, 4, values);
+    return result;
+}
+
+
+JNIEXPORT jboolean JNICALL
+Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeSaveAnnotations( // todo main annotation block
+        JNIEnv* env,
+        jobject thiz,
+        jstring inputPath_,
+        jstring outputPath_,
+        jobjectArray highlightsArray) {
+
+    const char* inputPath = env->GetStringUTFChars(inputPath_, 0);
+    const char* outputPath = env->GetStringUTFChars(outputPath_, 0);
+
+    FPDF_DOCUMENT doc = FPDF_LoadDocument(inputPath, nullptr);
+    if (!doc) {
+        env->ReleaseStringUTFChars(inputPath_, inputPath);
+        env->ReleaseStringUTFChars(outputPath_, outputPath);
+        return JNI_FALSE;
+    }
+
+    int highlightCount = env->GetArrayLength(highlightsArray);
+    jclass highlightClass = env->FindClass("com/cv/lufick/compose_editor/data_class/PdfAnnotationNative");
+
+    // Field IDs for coordinates and colors
+    jfieldID typeField = env->GetFieldID(highlightClass, "type", "I");
+    jfieldID pageField = env->GetFieldID(highlightClass, "pageIndex", "I");
+    jfieldID leftField = env->GetFieldID(highlightClass, "left", "F");
+    jfieldID topField = env->GetFieldID(highlightClass, "top", "F");
+    jfieldID rightField = env->GetFieldID(highlightClass, "right", "F");
+    jfieldID bottomField = env->GetFieldID(highlightClass, "bottom", "F");
+    jfieldID rField = env->GetFieldID(highlightClass, "r", "I");
+    jfieldID gField = env->GetFieldID(highlightClass, "g", "I");
+    jfieldID bField = env->GetFieldID(highlightClass, "b", "I");
+    jfieldID urlField = env->GetFieldID(highlightClass, "linkUrl", "Ljava/lang/String;");
+
+    FPDF_PAGE currentPage = nullptr;
+    int lastPageIndex = -1;
+
+    for (int i = 0; i < highlightCount; i++) {
+        jobject obj = env->GetObjectArrayElement(highlightsArray, i);
+
+        int typeInt = env->GetIntField(obj, typeField);
+        int pageIndex = env->GetIntField(obj, pageField);
+        float left = env->GetFloatField(obj, leftField);
+        float top = env->GetFloatField(obj, topField);
+        float right = env->GetFloatField(obj, rightField);
+        float bottom = env->GetFloatField(obj, bottomField);
+        int r = env->GetIntField(obj, rField);
+        int g = env->GetIntField(obj, gField);
+        int b = env->GetIntField(obj, bField);
+
+        // Load page only when index changes
+        if (pageIndex != lastPageIndex) {
+            if (currentPage != nullptr) {
+                FPDFPage_GenerateContent(currentPage);
+                FPDF_ClosePage(currentPage);
+            }
+            currentPage = FPDF_LoadPage(doc, pageIndex);
+            lastPageIndex = pageIndex;
+        }
+
+//        if (currentPage) {
+//            // Create a HIGHLIGHT annotation
+////            FPDF_ANNOTATION annot = FPDFPage_CreateAnnot(currentPage, FPDF_ANNOT_HIGHLIGHT);
+//
+//            int pdfAnnotType;
+//            if (typeInt == 1) {
+//                pdfAnnotType = FPDF_ANNOT_UNDERLINE;
+//            } else if (typeInt == 2) {
+//                pdfAnnotType = FPDF_ANNOT_STRIKEOUT;
+//            } else if (typeInt == 3) {
+//                pdfAnnotType = FPDF_ANNOT_LINK;
+//            } else if (typeInt == 4) {
+//                pdfAnnotType = FPDF_ANNOT_REDACT;
+//            } else {
+//                pdfAnnotType = FPDF_ANNOT_HIGHLIGHT;
+//            }
+//
+//            LOGE("Creating Annot: Type %d at L:%.1f T:%.1f R:%.1f B:%.1f", typeInt, left, top, right, bottom);
+//
+//            FPDF_ANNOTATION annot = FPDFPage_CreateAnnot(currentPage, pdfAnnotType);
+//            if (!annot) {
+//                LOGE("ANNOT CREATION FAILED for type %d", pdfAnnotType);
+//            }
+//            if (annot) {
+//                // Define the Bounding Box (Rect)
+//                FS_RECTF rect;
+//                rect.left = fmin(left, right);
+//                rect.right = fmax(left, right);
+//                rect.bottom = fmin(top, bottom);
+//                rect.top = fmax(top, bottom);
+//                FPDFAnnot_SetRect(annot, &rect);
+//
+//                // Set QuadPoints
+//                // Order: Top-Left, Top-Right, Bottom-Left, Bottom-Right
+//                FS_QUADPOINTSF quadPoints;
+//                quadPoints.x1 = rect.left;  quadPoints.y1 = rect.top;    // Top-Left
+//                quadPoints.x2 = rect.right; quadPoints.y2 = rect.top;    // Top-Right
+//                quadPoints.x3 = rect.left;  quadPoints.y3 = rect.bottom; // Bottom-Left
+//                quadPoints.x4 = rect.right; quadPoints.y4 = rect.bottom; // Bottom-Right
+//
+//                // Use the function to attach these points to the annotation
+//                FPDFAnnot_AppendAttachmentPoints(annot, &quadPoints);
+//                FPDFAnnot_SetColor(annot, FPDFANNOT_COLORTYPE_Color, r, g, b, 255);
+//
+//                FPDFAnnot_SetFlags(annot, FPDF_ANNOT_FLAG_PRINT);
+//                FPDFPage_CloseAnnot(annot);
+//            }
+//        }
+
+        if (currentPage) {
+            int pdfAnnotType;
+
+            // MAP JAVA TYPE TO PDFIUM TYPE
+            if (typeInt == 1) {
+                pdfAnnotType = FPDF_ANNOT_UNDERLINE;
+            } else if (typeInt == 2) {
+                pdfAnnotType = FPDF_ANNOT_STRIKEOUT;
+            } else if (typeInt == 3) {
+                pdfAnnotType = FPDF_ANNOT_LINK;
+            } else if (typeInt == 4) {
+                // FORCE SQUARE (5) INSTEAD OF REDACT (28)
+                pdfAnnotType = FPDF_ANNOT_SQUARE;
+            } else {
+                pdfAnnotType = FPDF_ANNOT_HIGHLIGHT;
+            }
+
+            LOGE("Creating Annot: JavaType=%d -> PDFType=%d", typeInt, pdfAnnotType);
+
+            FPDF_ANNOTATION annot = FPDFPage_CreateAnnot(currentPage, pdfAnnotType);
+
+            if (annot) {
+                FS_RECTF rect;
+                rect.left = fmin(left, right);
+                rect.right = fmax(left, right);
+                rect.bottom = fmin(top, bottom);
+                rect.top = fmax(top, bottom);
+                FPDFAnnot_SetRect(annot, &rect);
+
+                if (typeInt == 3) {
+                    jstring jUrl = (jstring)env->GetObjectField(obj, urlField);
+                    if (jUrl) {
+                        const char* url = env->GetStringUTFChars(jUrl, 0);
+                        FPDFAnnot_SetURI(annot, url);
+                        LOGE("Link URI set: %s", url);
+                        env->ReleaseStringUTFChars(jUrl, url);
+                    }
+
+                    // B. Turn Text Blue - We iterate objects to find text under this link
+                    int objCount = FPDFPage_CountObjects(currentPage);
+                    for (int j = 0; j < objCount; j++) {
+                        FPDF_PAGEOBJECT pageObj = FPDFPage_GetObject(currentPage, j);
+                        if (FPDFPageObj_GetType(pageObj) == FPDF_PAGEOBJ_TEXT) {
+                            float l, b, r, t;
+                            if (FPDFPageObj_GetBounds(pageObj, &l, &b, &r, &t)) {
+                                // INCREASED TOLERANCE: Use 2.0f instead of 1.0f
+                                // PDF text often floats slightly outside the selection rect
+                                if (l >= (rect.left - 2.0f) && r <= (rect.right + 2.0f) &&
+                                    b >= (rect.bottom - 2.0f) && t <= (rect.top + 2.0f)) {
+
+                                    FPDFPageObj_SetFillColor(pageObj, 0, 0, 255, 255); // Blue
+                                }
+                            }
+                        }
+                    }
+                    // C. Add QuadPoints for the Link (helps viewers show the clickable area)
+                    FS_QUADPOINTSF qp;
+                    qp.x1 = rect.left;  qp.y1 = rect.top;
+                    qp.x2 = rect.right; qp.y2 = rect.top;
+                    qp.x3 = rect.left;  qp.y3 = rect.bottom;
+                    qp.x4 = rect.right; qp.y4 = rect.bottom;
+                    FPDFAnnot_AppendAttachmentPoints(annot, &qp);
+                } else if (typeInt == 4) {
+                    // REDACTION LOGIC (Using Square) - as we not have actual redaction active in this version
+                    // Border color Black
+                    FPDFAnnot_SetColor(annot, FPDFANNOT_COLORTYPE_Color, 0, 0, 0, 255);
+                    FPDFAnnot_SetColor(annot, FPDFANNOT_COLORTYPE_InteriorColor, 0, 0, 0, 255);
+
+                    LOGE("Redaction created successfully using SQUARE type");
+                } else {
+                    // HIGHLIGHT/UNDERLINE LOGIC
+                    FPDFAnnot_SetColor(annot, FPDFANNOT_COLORTYPE_Color, r, g, b, 255);
+
+                    FS_QUADPOINTSF quadPoints;
+                    quadPoints.x1 = rect.left;  quadPoints.y1 = rect.top;
+                    quadPoints.x2 = rect.right; quadPoints.y2 = rect.top;
+                    quadPoints.x3 = rect.left;  quadPoints.y3 = rect.bottom;
+                    quadPoints.x4 = rect.right; quadPoints.y4 = rect.bottom;
+                    FPDFAnnot_AppendAttachmentPoints(annot, &quadPoints);
+                }
+
+                FPDFAnnot_SetFlags(annot, FPDF_ANNOT_FLAG_PRINT);
+                FPDFPage_CloseAnnot(annot);
+            } else {
+                // If this still fails for type 5, then there is a problem with the Page handle
+                LOGE("ANNOT CREATION FAILED for type %d", pdfAnnotType);
+            }
+        }
+        env->DeleteLocalRef(obj);
+    }
+
+    // Clean up last page and save
+    if (currentPage != nullptr) {
+        FPDFPage_GenerateContent(currentPage);
+        FPDF_ClosePage(currentPage);
+    }
+
+    FILE* file = fopen(outputPath, "wb");
+    if (!file) {
+        FPDF_CloseDocument(doc);
+        env->ReleaseStringUTFChars(inputPath_, inputPath);
+        env->ReleaseStringUTFChars(outputPath_, outputPath);
+        return JNI_FALSE;
+    }
+
+    PdfFileWriter writer{};
+    writer.base.version = 1;
+    writer.base.WriteBlock = WriteBlock; // Ensure your WriteBlock function is defined
+    writer.file = file;
+
+    int success = FPDF_SaveAsCopy(doc, (FPDF_FILEWRITE*)&writer, FPDF_NO_INCREMENTAL);
+    if (!success) LOGE("FPDF_SaveAsCopy failed!");
+
+    fclose(file);
+    FPDF_CloseDocument(doc);
+    env->ReleaseStringUTFChars(inputPath_, inputPath);
+    env->ReleaseStringUTFChars(outputPath_, outputPath);
+
+    return success ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_cv_lufick_compose_1editor_helper_PdfHighlightSaver_nativeSaveHighlights2(
+        JNIEnv* env,
+        jobject thiz,
+        jstring inputPath_,
+        jstring outputPath_,
+        jobjectArray highlightsArray) {
+
+    const char* inputPath = env->GetStringUTFChars(inputPath_, 0);
+    const char* outputPath = env->GetStringUTFChars(outputPath_, 0);
+
+    FPDF_DOCUMENT doc = FPDF_LoadDocument(inputPath, nullptr);
+    if (!doc) {
+        env->ReleaseStringUTFChars(inputPath_, inputPath);
+        env->ReleaseStringUTFChars(outputPath_, outputPath);
+        return JNI_FALSE;
+    }
+
+    int highlightCount = env->GetArrayLength(highlightsArray);
+    jclass highlightClass = env->FindClass("com/cv/lufick/compose_editor/data_class/PdfAnnotationNative");
+
+    // Cache Field IDs
+    jfieldID pageField = env->GetFieldID(highlightClass, "pageIndex", "I");
+    jfieldID leftField = env->GetFieldID(highlightClass, "left", "F");
+    jfieldID topField = env->GetFieldID(highlightClass, "top", "F");
+    jfieldID rightField = env->GetFieldID(highlightClass, "right", "F");
+    jfieldID bottomField = env->GetFieldID(highlightClass, "bottom", "F");
+    jfieldID rField = env->GetFieldID(highlightClass, "r", "I");
+    jfieldID gField = env->GetFieldID(highlightClass, "g", "I");
+    jfieldID bField = env->GetFieldID(highlightClass, "b", "I");
+
+    FPDF_PAGE currentPage = nullptr;
+    int lastPageIndex = -1;
+
+    for (int i = 0; i < highlightCount; i++) {
+        jobject obj = env->GetObjectArrayElement(highlightsArray, i);
+
+        int pageIndex = env->GetIntField(obj, pageField);
+        float pdfLeft = env->GetFloatField(obj, leftField);
+        float pdfTop = env->GetFloatField(obj, topField);
+        float pdfRight = env->GetFloatField(obj, rightField);
+        float pdfBottom = env->GetFloatField(obj, bottomField);
+        int r = env->GetIntField(obj, rField);
+        int g = env->GetIntField(obj, gField);
+        int b = env->GetIntField(obj, bField);
+
+        if (pageIndex != lastPageIndex) {
+            if (currentPage != nullptr) {
+                FPDFPage_GenerateContent(currentPage);
+                FPDF_ClosePage(currentPage);
+            }
+            currentPage = FPDF_LoadPage(doc, pageIndex);
+            lastPageIndex = pageIndex;
+        }
+
+        if (currentPage) {
+            // Normalize ordering
+            if (pdfLeft > pdfRight) std::swap(pdfLeft, pdfRight);
+            if (pdfBottom > pdfTop) std::swap(pdfBottom, pdfTop);
+
+            FS_RECTF rect = {pdfLeft, pdfTop, pdfRight, pdfBottom};
+
+            // ✅ Create specific HIGHLIGHT annotation
+            FPDF_ANNOTATION annot = FPDFPage_CreateAnnot(currentPage, FPDF_ANNOT_HIGHLIGHT);
+
+            if (annot) {
+                // Set the bounding box
+                FPDFAnnot_SetRect(annot, &rect);
+
+                // ✅ Define QuadPoints (8 coordinates)
+                // Order: top-left, top-right, bottom-left, bottom-right
+                FS_QUADPOINTSF quad;
+                quad.x1 = rect.left;  quad.y1 = rect.top;    // Point 1
+                quad.x2 = rect.right; quad.y2 = rect.top;    // Point 2
+                quad.x3 = rect.left;  quad.y3 = rect.bottom; // Point 3
+                quad.x4 = rect.right; quad.y4 = rect.bottom; // Point 4
+
+                // Apply the points to the annotation
+                FPDFAnnot_SetAttachmentPoints(annot, 0, &quad);
+
+                // ✅ Set Color. For standard Highlights, viewers handle transparency.
+                // We use 255 alpha here; if it's too dark, change to 120-150.
+                FPDFAnnot_SetColor(annot, FPDFANNOT_COLORTYPE_Color, r, g, b, 255);
+
+                FPDFAnnot_SetFlags(annot, FPDF_ANNOT_FLAG_PRINT);
+                FPDFPage_CloseAnnot(annot);
+            }
+        }
+        env->DeleteLocalRef(obj);
+    }
+
+    if (currentPage != nullptr) {
+        FPDFPage_GenerateContent(currentPage);
+        FPDF_ClosePage(currentPage);
+    }
+
+    // Save logic
+    FILE* file = fopen(outputPath, "wb");
+    int success = 0;
+    if (file) {
+        PdfFileWriter writer{};
+        writer.base.version = 1;
+        writer.base.WriteBlock = WriteBlock;
+        writer.file = file;
+        success = FPDF_SaveAsCopy(doc, (FPDF_FILEWRITE*)&writer, FPDF_NO_INCREMENTAL);
+        fclose(file);
+    }
+
+    FPDF_CloseDocument(doc);
+    env->ReleaseStringUTFChars(inputPath_, inputPath);
+    env->ReleaseStringUTFChars(outputPath_, outputPath);
+
+    return success ? JNI_TRUE : JNI_FALSE;
+}
+
+// dummy native save testing
+JNIEXPORT jboolean JNICALL
+Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeDummySave(
+        JNIEnv* env,
+        jobject thiz,
+        jstring inputPath_,
+        jstring outputPath_) {
+
+    const char* inputPath = env->GetStringUTFChars(inputPath_, 0);
+    const char* outputPath = env->GetStringUTFChars(outputPath_, 0);
+
+    LOGD("DUMMY SAVE - Opening PDF: %s", inputPath);
+
+    FPDF_DOCUMENT doc = FPDF_LoadDocument(inputPath, nullptr);
+    if (!doc) {
+        LOGE("Failed to load PDF");
+        return JNI_FALSE;
+    }
+
+    // Load first page
+    FPDF_PAGE page = FPDF_LoadPage(doc, 0);
+    if (!page) {
+        LOGE("Failed to load page 0");
+        FPDF_CloseDocument(doc);
+        return JNI_FALSE;
+    }
+
+    float pageWidth = FPDF_GetPageWidth(page);
+    float pageHeight = FPDF_GetPageHeight(page);
+
+    LOGD("Page size W=%f H=%f", pageWidth, pageHeight);
+
+    // Create annotation (TRY SQUARE FIRST - 100% visible)
+    FPDF_ANNOTATION annot =
+            FPDFPage_CreateAnnot(page, FPDF_ANNOT_SQUARE);
+
+    if (!annot) {
+        LOGE("Failed to create annotation");
+        FPDF_ClosePage(page);
+        FPDF_CloseDocument(doc);
+        return JNI_FALSE;
+    }
+
+    // Big center rectangle
+    float left = pageWidth * 0.25f;
+    float right = pageWidth * 0.75f;
+    float bottom = pageHeight * 0.25f;
+    float top = pageHeight * 0.75f;
+
+    LOGD("DUMMY RECT L=%f R=%f T=%f B=%f", left, right, top, bottom);
+
+    FS_RECTF rect;
+    rect.left = left;
+    rect.right = right;
+    rect.top = top;
+    rect.bottom = bottom;
+
+    FPDFAnnot_SetRect(annot, &rect);
+
+    // Bright red color
+    FPDFAnnot_SetColor(
+            annot,
+            FPDFANNOT_COLORTYPE_Color,
+            255, 0, 0,
+            255
+    );
+
+    FPDFAnnot_SetFlags(annot, FPDF_ANNOT_FLAG_PRINT);
+
+    FPDFPage_GenerateContent(page);
+    FPDF_ClosePage(page);
+
+    // Save
+    FILE* file = fopen(outputPath, "wb");
+    if (!file) {
+        LOGE("Failed to open output file");
+        FPDF_CloseDocument(doc);
+        return JNI_FALSE;
+    }
+
+    PdfFileWriter writer;
+    memset(&writer, 0, sizeof(writer));
+    writer.base.version = 1;
+    writer.base.WriteBlock = WriteBlock;
+    writer.file = file;
+
+    int success = FPDF_SaveAsCopy(
+            doc,
+            (FPDF_FILEWRITE*)&writer,
+            FPDF_NO_INCREMENTAL
+    );
+
+    fclose(file);
+    FPDF_CloseDocument(doc);
+
+    LOGD("DUMMY SAVE result: %d", success);
+
+    env->ReleaseStringUTFChars(inputPath_, inputPath);
+    env->ReleaseStringUTFChars(outputPath_, outputPath);
+
+    return success ? JNI_TRUE : JNI_FALSE;
+}
+
+
 
 }//extern C
