@@ -1145,7 +1145,7 @@ Java_com_shockwave_pdfium_PdfiumCore_nativeDeviceRectToPageRect(
 
 
 JNIEXPORT jboolean JNICALL
-Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeSaveAnnotations( // todo main annotation block
+Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeSaveAnnotations1( // todo old main annotation block
         JNIEnv* env,
         jobject thiz,
         jstring inputPath_,
@@ -1177,6 +1177,31 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeSaveAnnotat
     jfieldID bField = env->GetFieldID(highlightClass, "b", "I");
     jfieldID urlField = env->GetFieldID(highlightClass, "linkUrl", "Ljava/lang/String;");
 
+    // add text annotaton
+    jfieldID textPropsField = env->GetFieldID(highlightClass, "textProperties", "Ljava/lang/String;");
+
+    // IDs for Java JSONObject parsing via JNI
+    jclass jsonClass = env->FindClass("org/json/JSONObject");
+    jmethodID jsonInit = env->GetMethodID(jsonClass, "<init>", "(Ljava/lang/String;)V");
+    jmethodID jsonGetString = env->GetMethodID(jsonClass, "getString", "(Ljava/lang/String;)Ljava/lang/String;");
+    jmethodID jsonGetDouble = env->GetMethodID(jsonClass, "getDouble", "(Ljava/lang/String;)D");
+    jmethodID jsonGetBoolean = env->GetMethodID(jsonClass, "getBoolean", "(Ljava/lang/String;)Z");
+
+    jmethodID jsonGetInt = env->GetMethodID(jsonClass, "getInt", "(Ljava/lang/String;)I");
+
+    // free hand drawing
+    // JSON Array Methods
+    // Get the JSON classes
+    jclass jsonArrayClass = env->FindClass("org/json/JSONArray");
+
+// Method IDs for JSONObject
+    jmethodID jsonGetArray = env->GetMethodID(jsonClass, "getJSONArray", "(Ljava/lang/String;)Lorg/json/JSONArray;");
+
+// Method IDs for JSONArray
+    jmethodID jsonArrayLength = env->GetMethodID(jsonArrayClass, "length", "()I");
+    jmethodID jsonArrayGet = env->GetMethodID(jsonArrayClass, "getJSONObject", "(I)Lorg/json/JSONObject;");
+
+    jfieldID fhDrawingProperties = env->GetFieldID(highlightClass, "fhDrawingProperties", "Ljava/lang/String;");
     FPDF_PAGE currentPage = nullptr;
     int lastPageIndex = -1;
 
@@ -1202,55 +1227,6 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeSaveAnnotat
             currentPage = FPDF_LoadPage(doc, pageIndex);
             lastPageIndex = pageIndex;
         }
-
-//        if (currentPage) {
-//            // Create a HIGHLIGHT annotation
-////            FPDF_ANNOTATION annot = FPDFPage_CreateAnnot(currentPage, FPDF_ANNOT_HIGHLIGHT);
-//
-//            int pdfAnnotType;
-//            if (typeInt == 1) {
-//                pdfAnnotType = FPDF_ANNOT_UNDERLINE;
-//            } else if (typeInt == 2) {
-//                pdfAnnotType = FPDF_ANNOT_STRIKEOUT;
-//            } else if (typeInt == 3) {
-//                pdfAnnotType = FPDF_ANNOT_LINK;
-//            } else if (typeInt == 4) {
-//                pdfAnnotType = FPDF_ANNOT_REDACT;
-//            } else {
-//                pdfAnnotType = FPDF_ANNOT_HIGHLIGHT;
-//            }
-//
-//            LOGE("Creating Annot: Type %d at L:%.1f T:%.1f R:%.1f B:%.1f", typeInt, left, top, right, bottom);
-//
-//            FPDF_ANNOTATION annot = FPDFPage_CreateAnnot(currentPage, pdfAnnotType);
-//            if (!annot) {
-//                LOGE("ANNOT CREATION FAILED for type %d", pdfAnnotType);
-//            }
-//            if (annot) {
-//                // Define the Bounding Box (Rect)
-//                FS_RECTF rect;
-//                rect.left = fmin(left, right);
-//                rect.right = fmax(left, right);
-//                rect.bottom = fmin(top, bottom);
-//                rect.top = fmax(top, bottom);
-//                FPDFAnnot_SetRect(annot, &rect);
-//
-//                // Set QuadPoints
-//                // Order: Top-Left, Top-Right, Bottom-Left, Bottom-Right
-//                FS_QUADPOINTSF quadPoints;
-//                quadPoints.x1 = rect.left;  quadPoints.y1 = rect.top;    // Top-Left
-//                quadPoints.x2 = rect.right; quadPoints.y2 = rect.top;    // Top-Right
-//                quadPoints.x3 = rect.left;  quadPoints.y3 = rect.bottom; // Bottom-Left
-//                quadPoints.x4 = rect.right; quadPoints.y4 = rect.bottom; // Bottom-Right
-//
-//                // Use the function to attach these points to the annotation
-//                FPDFAnnot_AppendAttachmentPoints(annot, &quadPoints);
-//                FPDFAnnot_SetColor(annot, FPDFANNOT_COLORTYPE_Color, r, g, b, 255);
-//
-//                FPDFAnnot_SetFlags(annot, FPDF_ANNOT_FLAG_PRINT);
-//                FPDFPage_CloseAnnot(annot);
-//            }
-//        }
 
         if (currentPage) {
             int pdfAnnotType;
@@ -1295,12 +1271,12 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeSaveAnnotat
                     for (int j = 0; j < objCount; j++) {
                         FPDF_PAGEOBJECT pageObj = FPDFPage_GetObject(currentPage, j);
                         if (FPDFPageObj_GetType(pageObj) == FPDF_PAGEOBJ_TEXT) {
-                            float l, b, r, t;
-                            if (FPDFPageObj_GetBounds(pageObj, &l, &b, &r, &t)) {
+                            float l, bot, rig, t;
+                            if (FPDFPageObj_GetBounds(pageObj, &l, &bot, &rig, &t)) {
                                 // INCREASED TOLERANCE: Use 2.0f instead of 1.0f
                                 // PDF text often floats slightly outside the selection rect
-                                if (l >= (rect.left - 2.0f) && r <= (rect.right + 2.0f) &&
-                                    b >= (rect.bottom - 2.0f) && t <= (rect.top + 2.0f)) {
+                                if (l >= (rect.left - 2.0f) && rig <= (rect.right + 2.0f) &&
+                                    bot >= (rect.bottom - 2.0f) && t <= (rect.top + 2.0f)) {
 
                                     FPDFPageObj_SetFillColor(pageObj, 0, 0, 255, 255); // Blue
                                 }
@@ -1321,7 +1297,249 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeSaveAnnotat
                     FPDFAnnot_SetColor(annot, FPDFANNOT_COLORTYPE_InteriorColor, 0, 0, 0, 255);
 
                     LOGE("Redaction created successfully using SQUARE type");
-                } else {
+                }
+                else if (typeInt == 5) {
+                    jstring jJsonStr = (jstring)env->GetObjectField(obj, textPropsField);
+                    if (!jJsonStr) continue;
+
+                    // Use the base r, g, b passed into the function as the source of truth
+                    int textRedColor = r;
+                    int textGreenColor = g;
+                    int textBlueColor = b;
+
+                    jobject jsonObject = env->NewObject(jsonClass, jsonInit, jJsonStr);
+                    jstring jText = (jstring)env->CallObjectMethod(jsonObject, jsonGetString, env->NewStringUTF("text"));
+                    jstring jFont = (jstring)env->CallObjectMethod(jsonObject, jsonGetString, env->NewStringUTF("font"));
+                    jstring jAlign = (jstring)env->CallObjectMethod(jsonObject, jsonGetString, env->NewStringUTF("alignment"));
+                    jstring jFontPath = (jstring)env->CallObjectMethod(jsonObject, jsonGetString, env->NewStringUTF("fontPath"));
+
+                    jboolean hasUnderline = env->CallBooleanMethod(jsonObject, jsonGetBoolean, env->NewStringUTF("underline"));
+                    jboolean hasStrikeout = env->CallBooleanMethod(jsonObject, jsonGetBoolean, env->NewStringUTF("strikeout"));
+                    jboolean isBold = env->CallBooleanMethod(jsonObject, jsonGetBoolean, env->NewStringUTF("bold"));
+                    jboolean isItalic = env->CallBooleanMethod(jsonObject, jsonGetBoolean, env->NewStringUTF("italic"));
+                    jboolean hasBg = env->CallBooleanMethod(jsonObject, jsonGetBoolean, env->NewStringUTF("hasBackground"));
+
+                    // Extract New Size and Dimension Data
+                    double jsonSize = 0, jsonWidth = 0, jsonHeight = 0, rotation = 0;
+                    try {
+                        jsonSize = env->CallDoubleMethod(jsonObject, jsonGetDouble, env->NewStringUTF("size"));
+                        jsonWidth = env->CallDoubleMethod(jsonObject, jsonGetDouble, env->NewStringUTF("width"));
+                        jsonHeight = env->CallDoubleMethod(jsonObject, jsonGetDouble, env->NewStringUTF("height"));
+                        rotation = env->CallDoubleMethod(jsonObject, jsonGetDouble, env->NewStringUTF("rotation"));
+                    } catch (...) {}
+
+                    const char16_t* textContent = (const char16_t*)env->GetStringChars(jText, nullptr);
+                    const char* fontName = env->GetStringUTFChars(jFont, nullptr);
+                    const char* alignStr = env->GetStringUTFChars(jAlign, nullptr);
+                    const char* fontPath = jFontPath ? env->GetStringUTFChars(jFontPath, nullptr) : nullptr;
+
+                    FPDF_ANNOTATION drawAnnot = FPDFPage_CreateAnnot(currentPage, FPDF_ANNOT_STAMP);
+
+                    if (drawAnnot) {
+                        // 1. CALCULATE EXPANDED BOUNDING BOX
+                        // This prevents the "cut off" issue when rotating long text
+                        float initialWidth = (jsonWidth > 0) ? (float)jsonWidth : fabs(right - left);
+                        float initialHeight = (jsonHeight > 0) ? (float)jsonHeight : fabs(top - bottom);
+
+                        double angleRad = rotation * M_PI / 180.0;
+                        double absCos = fabs(cos(angleRad));
+                        double absSin = fabs(sin(angleRad));
+
+                        // Calculate new dimensions to contain the rotated rectangle
+                        float expandedWidth = (float)(initialWidth * absCos + initialHeight * absSin);
+                        float expandedHeight = (float)(initialHeight * absCos + initialWidth * absSin);
+
+                        float origCenterX = (left + right) / 2.0f;
+                        float origCenterY = (top + bottom) / 2.0f;
+
+                        FS_RECTF drawRect;
+                        drawRect.left = origCenterX - (expandedWidth / 2.0f);
+                        drawRect.right = origCenterX + (expandedWidth / 2.0f);
+                        drawRect.bottom = origCenterY - (expandedHeight / 2.0f);
+                        drawRect.top = origCenterY + (expandedHeight / 2.0f);
+
+                        FPDFAnnot_SetRect(drawAnnot, &drawRect);
+
+                        // Internal logic uses the center and initial sizes for drawing
+                        float rectWidth = initialWidth;
+                        float rectHeight = initialHeight;
+                        float centerX = origCenterX;
+//                        float centerY = origCenterY;
+                        float upwardShift = rectHeight * 0.10f;
+                        float centerY = origCenterY + upwardShift;
+
+                        double cosA = cos(angleRad);
+                        double sinA = sin(angleRad);
+
+                        // -------- BACKGROUND ----------
+                        if (hasBg) {
+                            int bgR = env->CallIntMethod(jsonObject, jsonGetInt, env->NewStringUTF("bgColorR"));
+                            int bgG = env->CallIntMethod(jsonObject, jsonGetInt, env->NewStringUTF("bgColorG"));
+                            int bgB = env->CallIntMethod(jsonObject, jsonGetInt, env->NewStringUTF("bgColorB"));
+                            double bgOpacity = env->CallDoubleMethod(jsonObject, jsonGetDouble, env->NewStringUTF("bgOpacity"));
+
+                            FPDF_PAGEOBJECT bg = FPDFPageObj_CreateNewRect(-rectWidth/2.0f, -rectHeight/2.0f, rectWidth, rectHeight);
+                            FPDFPageObj_SetFillColor(bg, bgR, bgG, bgB, (int)(bgOpacity * 255));
+                            FPDFPath_SetDrawMode(bg, 1, JNI_FALSE);
+                            FPDFPageObj_Transform(bg, cosA, sinA, -sinA, cosA, centerX, centerY);
+                            FPDFAnnot_AppendObject(drawAnnot, bg);
+                        }
+
+                        // -------- FONT LOADING ----------
+                        FPDF_FONT loadedFont = nullptr;
+                        if (fontPath) {
+                            FILE* fontFile = fopen(fontPath, "rb");
+                            if (fontFile) {
+                                fseek(fontFile, 0, SEEK_END);
+                                long fontSize = ftell(fontFile);
+                                rewind(fontFile);
+                                std::vector<uint8_t> fontBuffer(fontSize);
+                                fread(fontBuffer.data(), 1, fontSize, fontFile);
+                                fclose(fontFile);
+                                loadedFont = FPDFText_LoadFont(doc, fontBuffer.data(), fontSize, FPDF_FONT_TRUETYPE, true);
+                            }
+                        }
+                        if (!loadedFont) loadedFont = FPDFText_LoadStandardFont(doc, "Helvetica");
+
+                        // -------- TEXT OBJECT ----------
+                        FPDF_PAGEOBJECT textObj = FPDFPageObj_CreateTextObj(doc, loadedFont, 1.0f);
+                        if (textObj) {
+                            FPDFText_SetText(textObj, (FPDF_WIDESTRING)textContent);
+                            FPDFPageObj_SetFillColor(textObj, textRedColor, textGreenColor, textBlueColor, 255);
+
+                            float tL, tB, tR, tT;
+                            FPDFPageObj_GetBounds(textObj, &tL, &tB, &tR, &tT);
+                            float baseWidth = tR - tL;
+                            float baseHeight = tT - tB;
+
+                            // Prioritize requested 'size' while ensuring it fits the box
+                            float scale = (float)jsonSize;
+                            float autoScaleX = rectWidth / baseWidth;
+                            float autoScaleY = rectHeight / baseHeight;
+
+                            if ((baseWidth * scale) > rectWidth || (baseHeight * scale) > rectHeight) {
+                                scale = fmin(autoScaleX, autoScaleY) * 0.95f;
+                            }
+
+                            float textWidth = baseWidth * scale;
+                            float textHeight = baseHeight * scale;
+
+                            float localX = -textWidth / 2.0f;
+                            if (strcmp(alignStr, "left") == 0) localX = -rectWidth / 2.0f;
+                            else if (strcmp(alignStr, "right") == 0) localX = (rectWidth / 2.0f) - textWidth;
+
+                            float localY = -textHeight / 2.0f;
+                            float skewX = isItalic ? 0.25f : 0.0f;
+
+                            double a = cosA * scale;
+                            double b = sinA * scale;
+                            double c = (-sinA + skewX) * scale;
+                            double d = cosA * scale;
+                            double e = centerX + (localX * cosA - localY * sinA);
+                            double f = centerY + (localX * sinA + localY * cosA);
+
+                            FPDFPageObj_Transform(textObj, a, b, c, d, e, f);
+
+                            if (isBold) {
+                                FPDFPageObj_SetStrokeColor(textObj, textRedColor, textGreenColor, textBlueColor, 255);
+                                FPDFPageObj_SetStrokeWidth(textObj, textHeight * 0.05f);
+                                FPDFPath_SetDrawMode(textObj, 2, JNI_TRUE);
+                            }
+                            FPDFAnnot_AppendObject(drawAnnot, textObj);
+
+                            // -------- LINES (Underline & Strikeout) --------
+                            auto drawLine = [&](float offsetPercent) {
+                                float localLineY = localY + textHeight * offsetPercent;
+                                FPDF_PAGEOBJECT line = FPDFPageObj_CreateNewPath(0, 0);
+                                FPDFPath_LineTo(line, textWidth, 0);
+
+                                double le = centerX + (localX * cosA - localLineY * sinA);
+                                double lf = centerY + (localX * sinA + localLineY * cosA);
+                                FPDFPageObj_Transform(line, cosA, sinA, -sinA, cosA, le, lf);
+
+                                // Use captured colors to ensure exact match with text
+                                FPDFPageObj_SetStrokeColor(line, textRedColor, textGreenColor, textBlueColor, 255);
+                                FPDFPageObj_SetFillColor(line, textRedColor, textGreenColor, textBlueColor, 255);
+                                FPDFPageObj_SetStrokeWidth(line, textHeight * 0.05f);
+                                FPDFPath_SetDrawMode(line, 0, JNI_TRUE);
+
+                                FPDFAnnot_AppendObject(drawAnnot, line);
+                            };
+
+                            if (hasUnderline) drawLine(-0.15f);
+                            if (hasStrikeout) drawLine(0.35f);
+                        }
+
+                        FPDFAnnot_SetFlags(drawAnnot, FPDF_ANNOT_FLAG_PRINT | FPDF_ANNOT_FLAG_READONLY);
+                        FPDFPage_CloseAnnot(drawAnnot);
+                    }
+
+                    // Cleanup
+                    env->ReleaseStringChars(jText, (const jchar*)textContent);
+                    env->ReleaseStringUTFChars(jFont, fontName);
+                    env->ReleaseStringUTFChars(jAlign, alignStr);
+                    if (jFontPath) env->ReleaseStringUTFChars(jFontPath, fontPath);
+                    env->DeleteLocalRef(jsonObject);
+                }
+                else if (typeInt == 6) {
+                    jstring jJsonStr = (jstring)env->GetObjectField(obj, fhDrawingProperties);
+                    if (!jJsonStr) continue;
+
+                    jobject jsonObject = env->NewObject(jsonClass, jsonInit, jJsonStr);
+                    jstring jMode = (jstring)env->CallObjectMethod(jsonObject, jsonGetString, env->NewStringUTF("mode"));
+                    const char* modeStr = env->GetStringUTFChars(jMode, nullptr);
+
+                    jobject pointsArray = (jobject)env->CallObjectMethod(jsonObject, jsonGetArray, env->NewStringUTF("points"));
+                    int pointsCount = env->CallIntMethod(pointsArray, jsonArrayLength);
+
+                    double strokeWidth = 1.0;
+                    int alphaValue = 255;
+                    try {
+                        strokeWidth = env->CallDoubleMethod(jsonObject, jsonGetDouble, env->NewStringUTF("strokeWidth"));
+                        alphaValue = env->CallIntMethod(jsonObject, jsonGetInt, env->NewStringUTF("alpha"));
+                    } catch (...) {}
+
+                    if (pointsCount >= 2) {
+                        jobject ptStart = (jobject)env->CallObjectMethod(pointsArray, jsonArrayGet, 0);
+                        float startX = (float)env->CallDoubleMethod(ptStart, jsonGetDouble, env->NewStringUTF("x"));
+                        float startY = (float)env->CallDoubleMethod(ptStart, jsonGetDouble, env->NewStringUTF("y"));
+
+                        FPDF_PAGEOBJECT pathObj = FPDFPageObj_CreateNewPath(startX, startY);
+                        env->DeleteLocalRef(ptStart);
+
+                        for (int i = 1; i < pointsCount; i++) {
+                            jobject pt = (jobject)env->CallObjectMethod(pointsArray, jsonArrayGet, i);
+                            float px = (float)env->CallDoubleMethod(pt, jsonGetDouble, env->NewStringUTF("x"));
+                            float py = (float)env->CallDoubleMethod(pt, jsonGetDouble, env->NewStringUTF("y"));
+                            FPDFPath_LineTo(pathObj, px, py);
+                            env->DeleteLocalRef(pt);
+                        }
+
+                        // --- ENHANCED VISUALS ---
+                        FPDFPageObj_SetStrokeWidth(pathObj, (float)strokeWidth);
+
+                        // Handle Line Join and Cap (Makes it look smoother/less "jagged")
+                        FPDFPageObj_SetLineJoin(pathObj, FPDF_LINEJOIN_ROUND);
+                        FPDFPageObj_SetLineCap(pathObj, FPDF_LINECAP_ROUND);
+
+                        if (strcmp(modeStr, "HIGHLIGHTER") == 0) {
+                            // Highlighter: Force lower alpha and semi-transparent mode
+                            FPDFPageObj_SetStrokeColor(pathObj, r, g, b, 125);
+                            // Optional: If your PDFium build supports it, you can set Blend Mode to Multiply
+                             FPDFPageObj_SetBlendMode(pathObj, "Multiply");
+                        } else {
+                            FPDFPageObj_SetStrokeColor(pathObj, r, g, b, alphaValue);
+                        }
+
+                        FPDFPath_SetDrawMode(pathObj, 0, JNI_TRUE);
+                        FPDFPage_InsertObject(currentPage, pathObj);
+                    }
+
+                    env->ReleaseStringUTFChars(jMode, modeStr);
+                    env->DeleteLocalRef(pointsArray);
+                    env->DeleteLocalRef(jsonObject);
+                }
+                else {
                     // HIGHLIGHT/UNDERLINE LOGIC
                     FPDFAnnot_SetColor(annot, FPDFANNOT_COLORTYPE_Color, r, g, b, 255);
 
@@ -1373,13 +1591,202 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeSaveAnnotat
     return success ? JNI_TRUE : JNI_FALSE;
 }
 
-JNIEXPORT jboolean JNICALL
-Java_com_cv_lufick_compose_1editor_helper_PdfHighlightSaver_nativeSaveHighlights2(
-        JNIEnv* env,
-        jobject thiz,
-        jstring inputPath_,
-        jstring outputPath_,
-        jobjectArray highlightsArray) {
+// --- Helper Function Signatures --- Main Code for saving
+static void processLink(JNIEnv* env, jobject obj, FPDF_PAGE page, FPDF_ANNOTATION annot, FS_RECTF rect, jfieldID urlField);
+static void processTextStamp(JNIEnv* env, jobject obj, FPDF_DOCUMENT doc, FPDF_PAGE page, FPDF_ANNOTATION annot, FS_RECTF rect, jfieldID textPropsField, int r, int g, int b, jclass jsonClass, jmethodID jsonInit);
+static void processFreeHand(JNIEnv* env, jobject obj, FPDF_PAGE page, jfieldID fhDrawingProperties, int r, int g, int b, jclass jsonClass, jmethodID jsonInit);
+
+// --- HELPER 1: LINK LOGIC ---
+static void processLink(JNIEnv* env, jobject obj, FPDF_PAGE page, FPDF_ANNOTATION annot, FS_RECTF rect, jfieldID urlField) {
+    jstring jUrl = (jstring)env->GetObjectField(obj, urlField);
+    if (jUrl) {
+        const char* url = env->GetStringUTFChars(jUrl, 0);
+        FPDFAnnot_SetURI(annot, url);
+        env->ReleaseStringUTFChars(jUrl, url);
+    }
+
+    int objCount = FPDFPage_CountObjects(page);
+    for (int j = 0; j < objCount; j++) {
+        FPDF_PAGEOBJECT pageObj = FPDFPage_GetObject(page, j);
+        if (FPDFPageObj_GetType(pageObj) == FPDF_PAGEOBJ_TEXT) {
+            float l, bot, rig, t;
+            if (FPDFPageObj_GetBounds(pageObj, &l, &bot, &rig, &t)) {
+                if (l >= (rect.left - 2.0f) && rig <= (rect.right + 2.0f) &&
+                    bot >= (rect.bottom - 2.0f) && t <= (rect.top + 2.0f)) {
+                    FPDFPageObj_SetFillColor(pageObj, 0, 0, 255, 255);
+                }
+            }
+        }
+    }
+    FS_QUADPOINTSF qp = {rect.left, rect.top, rect.right, rect.top, rect.left, rect.bottom, rect.right, rect.bottom};
+    FPDFAnnot_AppendAttachmentPoints(annot, &qp);
+}
+
+// --- HELPER 2: TEXT STAMP LOGIC ---
+static void processTextStamp(JNIEnv* env, jobject obj, FPDF_DOCUMENT doc, FPDF_PAGE page, FPDF_ANNOTATION annot, FS_RECTF rect, jfieldID textPropsField, int r, int g, int b, jclass jsonClass, jmethodID jsonInit) {
+    jstring jJsonStr = (jstring)env->GetObjectField(obj, textPropsField);
+    if (!jJsonStr) return;
+
+    jobject json = env->NewObject(jsonClass, jsonInit, jJsonStr);
+    jmethodID getS = env->GetMethodID(jsonClass, "getString", "(Ljava/lang/String;)Ljava/lang/String;");
+    jmethodID getD = env->GetMethodID(jsonClass, "getDouble", "(Ljava/lang/String;)D");
+    jmethodID getB = env->GetMethodID(jsonClass, "getBoolean", "(Ljava/lang/String;)Z");
+    jmethodID getI = env->GetMethodID(jsonClass, "getInt", "(Ljava/lang/String;)I");
+
+    jstring jText = (jstring)env->CallObjectMethod(json, getS, env->NewStringUTF("text"));
+    jstring jFont = (jstring)env->CallObjectMethod(json, getS, env->NewStringUTF("font"));
+    jstring jAlign = (jstring)env->CallObjectMethod(json, getS, env->NewStringUTF("alignment"));
+    jstring jFontPath = (jstring)env->CallObjectMethod(json, getS, env->NewStringUTF("fontPath"));
+
+    jboolean hasUnderline = env->CallBooleanMethod(json, getB, env->NewStringUTF("underline"));
+    jboolean hasStrikeout = env->CallBooleanMethod(json, getB, env->NewStringUTF("strikeout"));
+    jboolean isBold = env->CallBooleanMethod(json, getB, env->NewStringUTF("bold"));
+    jboolean isItalic = env->CallBooleanMethod(json, getB, env->NewStringUTF("italic"));
+    jboolean hasBg = env->CallBooleanMethod(json, getB, env->NewStringUTF("hasBackground"));
+
+    double rotation = 0, jsonSize = 0, jsonWidth = 0, jsonHeight = 0;
+    try {
+        rotation = env->CallDoubleMethod(json, getD, env->NewStringUTF("rotation"));
+        jsonSize = env->CallDoubleMethod(json, getD, env->NewStringUTF("size"));
+        jsonWidth = env->CallDoubleMethod(json, getD, env->NewStringUTF("width"));
+        jsonHeight = env->CallDoubleMethod(json, getD, env->NewStringUTF("height"));
+    } catch (...) {}
+
+    const char16_t* textContent = (const char16_t*)env->GetStringChars(jText, nullptr);
+    const char* alignStr = env->GetStringUTFChars(jAlign, nullptr);
+    const char* fontPath = jFontPath ? env->GetStringUTFChars(jFontPath, nullptr) : nullptr;
+
+    float initialWidth = (jsonWidth > 0) ? (float)jsonWidth : fabs(rect.right - rect.left);
+    float initialHeight = (jsonHeight > 0) ? (float)jsonHeight : fabs(rect.top - rect.bottom);
+    double angleRad = rotation * M_PI / 180.0;
+
+    // Expanded Bounding Box Math
+    float expandedWidth = (float)(initialWidth * fabs(cos(angleRad)) + initialHeight * fabs(sin(angleRad)));
+    float expandedHeight = (float)(initialHeight * fabs(cos(angleRad)) + initialWidth * fabs(sin(angleRad)));
+    float origCenterX = (rect.left + rect.right) / 2.0f;
+    float origCenterY = (rect.bottom + rect.top) / 2.0f;
+
+    FS_RECTF drawRect = {origCenterX - (expandedWidth / 2.0f), origCenterY + (expandedHeight / 2.0f),
+                         origCenterX + (expandedWidth / 2.0f), origCenterY - (expandedHeight / 2.0f)};
+    FPDFAnnot_SetRect(annot, &drawRect);
+
+    float centerY = origCenterY + (initialHeight * 0.10f);
+    double cosA = cos(angleRad), sinA = sin(angleRad);
+
+    if (hasBg) {
+        FPDF_PAGEOBJECT bg = FPDFPageObj_CreateNewRect(-initialWidth/2.0f, -initialHeight/2.0f, initialWidth, initialHeight);
+        FPDFPageObj_SetFillColor(bg, env->CallIntMethod(json, getI, env->NewStringUTF("bgColorR")),
+                                 env->CallIntMethod(json, getI, env->NewStringUTF("bgColorG")),
+                                 env->CallIntMethod(json, getI, env->NewStringUTF("bgColorB")),
+                                 (int)(env->CallDoubleMethod(json, getD, env->NewStringUTF("bgOpacity")) * 255));
+        FPDFPath_SetDrawMode(bg, 1, JNI_FALSE);
+        FPDFPageObj_Transform(bg, cosA, sinA, -sinA, cosA, origCenterX, centerY);
+        FPDFAnnot_AppendObject(annot, bg);
+    }
+
+    FPDF_FONT loadedFont = nullptr;
+    if (fontPath) {
+        FILE* f = fopen(fontPath, "rb");
+        if (f) {
+            fseek(f, 0, SEEK_END); long fSize = ftell(f); rewind(f);
+            std::vector<uint8_t> buffer(fSize); fread(buffer.data(), 1, fSize, f); fclose(f);
+            loadedFont = FPDFText_LoadFont(doc, buffer.data(), fSize, FPDF_FONT_TRUETYPE, true);
+        }
+    }
+    if (!loadedFont) loadedFont = FPDFText_LoadStandardFont(doc, "Helvetica");
+
+    FPDF_PAGEOBJECT textObj = FPDFPageObj_CreateTextObj(doc, loadedFont, 1.0f);
+    if (textObj) {
+        FPDFText_SetText(textObj, (FPDF_WIDESTRING)textContent);
+        FPDFPageObj_SetFillColor(textObj, r, g, b, 255);
+        float tL, tB, tR, tT; FPDFPageObj_GetBounds(textObj, &tL, &tB, &tR, &tT);
+        float bW = tR - tL, bH = tT - tB, scale = (float)jsonSize;
+        if ((bW * scale) > initialWidth || (bH * scale) > initialHeight) scale = fmin(initialWidth/bW, initialHeight/bH) * 0.95f;
+
+        float textW = bW * scale, textH = bH * scale;
+        float lX = -textW / 2.0f;
+        if (strcmp(alignStr, "left") == 0) lX = -initialWidth / 2.0f;
+        else if (strcmp(alignStr, "right") == 0) lX = (initialWidth / 2.0f) - textW;
+
+        float lY = -textH / 2.0f, skewX = isItalic ? 0.25f : 0.0f;
+        FPDFPageObj_Transform(textObj, cosA * scale, sinA * scale, (-sinA + skewX) * scale, cosA * scale,
+                              origCenterX + (lX * cosA - lY * sinA), centerY + (lX * sinA + lY * cosA));
+
+        if (isBold) {
+            FPDFPageObj_SetStrokeColor(textObj, r, g, b, 255);
+            FPDFPageObj_SetStrokeWidth(textObj, textH * 0.05f);
+            FPDFPath_SetDrawMode(textObj, 2, JNI_TRUE);
+        }
+        FPDFAnnot_AppendObject(annot, textObj);
+
+        auto drawLine = [&](float off) {
+            float lineY = lY + textH * off;
+            FPDF_PAGEOBJECT line = FPDFPageObj_CreateNewPath(0, 0);
+            FPDFPath_LineTo(line, textW, 0);
+            FPDFPageObj_Transform(line, cosA, sinA, -sinA, cosA, origCenterX + (lX * cosA - lineY * sinA), centerY + (lX * sinA + lineY * cosA));
+            FPDFPageObj_SetStrokeColor(line, r, g, b, 255); FPDFPageObj_SetStrokeWidth(line, textH * 0.05f);
+            FPDFPath_SetDrawMode(line, 0, JNI_TRUE); FPDFAnnot_AppendObject(annot, line);
+        };
+        if (hasUnderline) drawLine(-0.15f);
+        if (hasStrikeout) drawLine(0.35f);
+    }
+    FPDFAnnot_SetFlags(annot, FPDF_ANNOT_FLAG_PRINT | FPDF_ANNOT_FLAG_READONLY);
+    env->ReleaseStringChars(jText, (const jchar*)textContent);
+    env->ReleaseStringUTFChars(jAlign, alignStr);
+    if (fontPath) env->ReleaseStringUTFChars(jFontPath, fontPath);
+    env->DeleteLocalRef(json);
+}
+
+// --- HELPER 3: FREEHAND LOGIC ---
+static void processFreeHand(JNIEnv* env, jobject obj, FPDF_PAGE page, jfieldID fhField, int r, int g, int b, jclass jsonClass, jmethodID jsonInit) {
+    jstring jJsonStr = (jstring)env->GetObjectField(obj, fhField);
+    if (!jJsonStr) return;
+
+    jobject json = env->NewObject(jsonClass, jsonInit, jJsonStr);
+    jmethodID getS = env->GetMethodID(jsonClass, "getString", "(Ljava/lang/String;)Ljava/lang/String;");
+    jmethodID getD = env->GetMethodID(jsonClass, "getDouble", "(Ljava/lang/String;)D");
+    jmethodID getI = env->GetMethodID(jsonClass, "getInt", "(Ljava/lang/String;)I");
+    jmethodID getA = env->GetMethodID(jsonClass, "getJSONArray", "(Ljava/lang/String;)Lorg/json/JSONArray;");
+
+    jstring jMode = (jstring)env->CallObjectMethod(json, getS, env->NewStringUTF("mode"));
+    const char* modeStr = env->GetStringUTFChars(jMode, nullptr);
+    jobject pointsArray = env->CallObjectMethod(json, getA, env->NewStringUTF("points"));
+
+    jclass arrayClass = env->FindClass("org/json/JSONArray");
+    jmethodID lenM = env->GetMethodID(arrayClass, "length", "()I");
+    jmethodID getObjM = env->GetMethodID(arrayClass, "getJSONObject", "(I)Lorg/json/JSONObject;");
+    int pointsCount = env->CallIntMethod(pointsArray, lenM);
+
+    if (pointsCount >= 2) {
+        jobject ptStart = env->CallObjectMethod(pointsArray, getObjM, 0);
+        FPDF_PAGEOBJECT path = FPDFPageObj_CreateNewPath((float)env->CallDoubleMethod(ptStart, getD, env->NewStringUTF("x")), (float)env->CallDoubleMethod(ptStart, getD, env->NewStringUTF("y")));
+        for (int i = 1; i < pointsCount; i++) {
+            jobject pt = env->CallObjectMethod(pointsArray, getObjM, i);
+            FPDFPath_LineTo(path, (float)env->CallDoubleMethod(pt, getD, env->NewStringUTF("x")), (float)env->CallDoubleMethod(pt, getD, env->NewStringUTF("y")));
+            env->DeleteLocalRef(pt);
+        }
+        FPDFPageObj_SetStrokeWidth(path, (float)env->CallDoubleMethod(json, getD, env->NewStringUTF("strokeWidth")));
+        FPDFPageObj_SetLineJoin(path, FPDF_LINEJOIN_ROUND);
+        FPDFPageObj_SetLineCap(path, FPDF_LINECAP_ROUND);
+
+        if (strcmp(modeStr, "HIGHLIGHTER") == 0) {
+            FPDFPageObj_SetStrokeColor(path, r, g, b, 125);
+            FPDFPageObj_SetBlendMode(path, "Multiply");
+        } else {
+            FPDFPageObj_SetStrokeColor(path, r, g, b, env->CallIntMethod(json, getI, env->NewStringUTF("alpha")));
+        }
+        FPDFPath_SetDrawMode(path, 0, JNI_TRUE);
+        FPDFPage_InsertObject(page, path);
+        env->DeleteLocalRef(ptStart);
+    }
+    env->ReleaseStringUTFChars(jMode, modeStr);
+    env->DeleteLocalRef(pointsArray);
+    env->DeleteLocalRef(json);
+}
+
+JNIEXPORT jboolean JNICALL //TODO Main Method of saving.
+Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeSaveAnnotations(
+        JNIEnv* env, jobject thiz, jstring inputPath_, jstring outputPath_, jobjectArray highlightsArray) {
 
     const char* inputPath = env->GetStringUTFChars(inputPath_, 0);
     const char* outputPath = env->GetStringUTFChars(outputPath_, 0);
@@ -1391,10 +1798,8 @@ Java_com_cv_lufick_compose_1editor_helper_PdfHighlightSaver_nativeSaveHighlights
         return JNI_FALSE;
     }
 
-    int highlightCount = env->GetArrayLength(highlightsArray);
     jclass highlightClass = env->FindClass("com/cv/lufick/compose_editor/data_class/PdfAnnotationNative");
-
-    // Cache Field IDs
+    jfieldID typeField = env->GetFieldID(highlightClass, "type", "I");
     jfieldID pageField = env->GetFieldID(highlightClass, "pageIndex", "I");
     jfieldID leftField = env->GetFieldID(highlightClass, "left", "F");
     jfieldID topField = env->GetFieldID(highlightClass, "top", "F");
@@ -1403,88 +1808,80 @@ Java_com_cv_lufick_compose_1editor_helper_PdfHighlightSaver_nativeSaveHighlights
     jfieldID rField = env->GetFieldID(highlightClass, "r", "I");
     jfieldID gField = env->GetFieldID(highlightClass, "g", "I");
     jfieldID bField = env->GetFieldID(highlightClass, "b", "I");
+    jfieldID urlField = env->GetFieldID(highlightClass, "linkUrl", "Ljava/lang/String;");
+    jfieldID textPropsField = env->GetFieldID(highlightClass, "textProperties", "Ljava/lang/String;");
+    jfieldID fhDrawingProperties = env->GetFieldID(highlightClass, "fhDrawingProperties", "Ljava/lang/String;");
+
+    jclass jsonClass = env->FindClass("org/json/JSONObject");
+    jmethodID jsonInit = env->GetMethodID(jsonClass, "<init>", "(Ljava/lang/String;)V");
 
     FPDF_PAGE currentPage = nullptr;
     int lastPageIndex = -1;
+    int highlightCount = env->GetArrayLength(highlightsArray);
 
     for (int i = 0; i < highlightCount; i++) {
         jobject obj = env->GetObjectArrayElement(highlightsArray, i);
-
+        int typeInt = env->GetIntField(obj, typeField);
         int pageIndex = env->GetIntField(obj, pageField);
-        float pdfLeft = env->GetFloatField(obj, leftField);
-        float pdfTop = env->GetFloatField(obj, topField);
-        float pdfRight = env->GetFloatField(obj, rightField);
-        float pdfBottom = env->GetFloatField(obj, bottomField);
-        int r = env->GetIntField(obj, rField);
-        int g = env->GetIntField(obj, gField);
-        int b = env->GetIntField(obj, bField);
 
         if (pageIndex != lastPageIndex) {
-            if (currentPage != nullptr) {
-                FPDFPage_GenerateContent(currentPage);
-                FPDF_ClosePage(currentPage);
-            }
+            if (currentPage) { FPDFPage_GenerateContent(currentPage); FPDF_ClosePage(currentPage); }
             currentPage = FPDF_LoadPage(doc, pageIndex);
             lastPageIndex = pageIndex;
         }
 
         if (currentPage) {
-            // Normalize ordering
-            if (pdfLeft > pdfRight) std::swap(pdfLeft, pdfRight);
-            if (pdfBottom > pdfTop) std::swap(pdfBottom, pdfTop);
+            float left = env->GetFloatField(obj, leftField);
+            float top = env->GetFloatField(obj, topField);
+            float right = env->GetFloatField(obj, rightField);
+            float bottom = env->GetFloatField(obj, bottomField);
+            int r = env->GetIntField(obj, rField);
+            int g = env->GetIntField(obj, gField);
+            int b = env->GetIntField(obj, bField);
 
-            FS_RECTF rect = {pdfLeft, pdfTop, pdfRight, pdfBottom};
+            FS_RECTF rect;
+            rect.left = fmin(left, right); rect.right = fmax(left, right);
+            rect.bottom = fmin(top, bottom); rect.top = fmax(top, bottom);
 
-            // ✅ Create specific HIGHLIGHT annotation
-            FPDF_ANNOTATION annot = FPDFPage_CreateAnnot(currentPage, FPDF_ANNOT_HIGHLIGHT);
+            if (typeInt == 6) { // Freehand is not a standard Annotation type in your logic
+                processFreeHand(env, obj, currentPage, fhDrawingProperties, r, g, b, jsonClass, jsonInit);
+            } else {
+                int pdfType = (typeInt == 1) ? FPDF_ANNOT_UNDERLINE : (typeInt == 2) ? FPDF_ANNOT_STRIKEOUT :
+                                                                      (typeInt == 3) ? FPDF_ANNOT_LINK : (typeInt == 4) ? FPDF_ANNOT_SQUARE : FPDF_ANNOT_HIGHLIGHT;
 
-            if (annot) {
-                // Set the bounding box
-                FPDFAnnot_SetRect(annot, &rect);
-
-                // ✅ Define QuadPoints (8 coordinates)
-                // Order: top-left, top-right, bottom-left, bottom-right
-                FS_QUADPOINTSF quad;
-                quad.x1 = rect.left;  quad.y1 = rect.top;    // Point 1
-                quad.x2 = rect.right; quad.y2 = rect.top;    // Point 2
-                quad.x3 = rect.left;  quad.y3 = rect.bottom; // Point 3
-                quad.x4 = rect.right; quad.y4 = rect.bottom; // Point 4
-
-                // Apply the points to the annotation
-                FPDFAnnot_SetAttachmentPoints(annot, 0, &quad);
-
-                // ✅ Set Color. For standard Highlights, viewers handle transparency.
-                // We use 255 alpha here; if it's too dark, change to 120-150.
-                FPDFAnnot_SetColor(annot, FPDFANNOT_COLORTYPE_Color, r, g, b, 255);
-
-                FPDFAnnot_SetFlags(annot, FPDF_ANNOT_FLAG_PRINT);
-                FPDFPage_CloseAnnot(annot);
+                FPDF_ANNOTATION annot = FPDFPage_CreateAnnot(currentPage, (typeInt == 5) ? FPDF_ANNOT_STAMP : pdfType);
+                if (annot) {
+                    FPDFAnnot_SetRect(annot, &rect);
+                    if (typeInt == 3) processLink(env, obj, currentPage, annot, rect, urlField);
+                    else if (typeInt == 4) { // Redaction
+                        FPDFAnnot_SetColor(annot, FPDFANNOT_COLORTYPE_Color, 0, 0, 0, 255);
+                        FPDFAnnot_SetColor(annot, FPDFANNOT_COLORTYPE_InteriorColor, 0, 0, 0, 255);
+                    }
+                    else if (typeInt == 5) processTextStamp(env, obj, doc, currentPage, annot, rect, textPropsField, r, g, b, jsonClass, jsonInit);
+                    else { // Highlight / Underline
+                        FPDFAnnot_SetColor(annot, FPDFANNOT_COLORTYPE_Color, r, g, b, 255);
+                        FS_QUADPOINTSF qp = {rect.left, rect.top, rect.right, rect.top, rect.left, rect.bottom, rect.right, rect.bottom};
+                        FPDFAnnot_AppendAttachmentPoints(annot, &qp);
+                    }
+                    FPDFAnnot_SetFlags(annot, FPDF_ANNOT_FLAG_PRINT);
+                    FPDFPage_CloseAnnot(annot);
+                }
             }
         }
         env->DeleteLocalRef(obj);
     }
 
-    if (currentPage != nullptr) {
-        FPDFPage_GenerateContent(currentPage);
-        FPDF_ClosePage(currentPage);
-    }
+    if (currentPage) { FPDFPage_GenerateContent(currentPage); FPDF_ClosePage(currentPage); }
 
-    // Save logic
+    // Save Logic
     FILE* file = fopen(outputPath, "wb");
-    int success = 0;
-    if (file) {
-        PdfFileWriter writer{};
-        writer.base.version = 1;
-        writer.base.WriteBlock = WriteBlock;
-        writer.file = file;
-        success = FPDF_SaveAsCopy(doc, (FPDF_FILEWRITE*)&writer, FPDF_NO_INCREMENTAL);
-        fclose(file);
-    }
+    PdfFileWriter writer{ {1, WriteBlock}, file };
+    int success = (file) ? FPDF_SaveAsCopy(doc, (FPDF_FILEWRITE*)&writer, FPDF_NO_INCREMENTAL) : JNI_FALSE;
+    if (file) fclose(file);
 
     FPDF_CloseDocument(doc);
     env->ReleaseStringUTFChars(inputPath_, inputPath);
     env->ReleaseStringUTFChars(outputPath_, outputPath);
-
     return success ? JNI_TRUE : JNI_FALSE;
 }
 
