@@ -610,4 +610,31 @@ public class PdfiumCore {
                 coords.right, coords.bottom);
         return new RectF(leftTop.x, leftTop.y, rightBottom.x, rightBottom.y);
     }
+
+    public native void nativeCloseTextPage(long textPtr);
+    public void closeText(long textPtr) {
+        synchronized (lock) {
+            nativeCloseTextPage(textPtr);
+        }
+    }
+
+    private native int nativeGetTextCount(long textPtr);
+
+    public int getTextCount(long textPtr){
+        synchronized(lock){
+            return nativeGetTextCount(textPtr);
+        }
+    }
+
+    // coordinates conversion
+    public native float[] nativeDeviceRectToPageRect(
+            long pagePtr,
+            int viewWidth,
+            int viewHeight,
+            float left,
+            float top,
+            float right,
+            float bottom
+    );
+
 }
