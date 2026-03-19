@@ -67,6 +67,8 @@ public:
     ~DocumentFile();
 };
 
+FPDF_BITMAP ConvertToFPDFBitmap(JNIEnv *pEnv, jobject pJobject);
+
 DocumentFile::~DocumentFile() {
     if (pdfDocument != NULL) {
         FPDF_CloseDocument(pdfDocument);
@@ -1784,6 +1786,26 @@ static void processFreeHand(JNIEnv* env, jobject obj, FPDF_PAGE page, jfieldID f
     env->DeleteLocalRef(json);
 }
 
+// --- HELPER 4: REGION HIGHLIGHT ---
+static void processRegionHighlight(
+        JNIEnv* env,
+        jobject obj,
+        FPDF_PAGE page,
+        FPDF_ANNOTATION annot,
+        FS_RECTF rect,
+        int r,
+        int g,
+        int b
+) {
+    FPDFAnnot_SetColor(annot, FPDFANNOT_COLORTYPE_Color, r, g, b, 255);
+    int alpha = 90;
+    FPDFAnnot_SetColor(annot,FPDFANNOT_COLORTYPE_InteriorColor,r, g, b, alpha);
+    const unsigned short blendMode[] = {'M','u','l','t','i','p','l','y',0};
+    FPDFAnnot_SetStringValue(annot,"BM",(FPDF_WIDESTRING)blendMode);
+    FPDFAnnot_SetBorder(annot, 0, 0, 0);
+    FPDFAnnot_SetFlags(annot, FPDF_ANNOT_FLAG_PRINT);
+}
+
 JNIEXPORT jboolean JNICALL //TODO Main Method of saving.
 Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeSaveAnnotations(
         JNIEnv* env, jobject thiz, jstring inputPath_, jstring outputPath_, jobjectArray highlightsArray) {
@@ -1847,7 +1869,7 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeSaveAnnotat
                 processFreeHand(env, obj, currentPage, fhDrawingProperties, r, g, b, jsonClass, jsonInit);
             } else {
                 int pdfType = (typeInt == 1) ? FPDF_ANNOT_UNDERLINE : (typeInt == 2) ? FPDF_ANNOT_STRIKEOUT :
-                                                                      (typeInt == 3) ? FPDF_ANNOT_LINK : (typeInt == 4) ? FPDF_ANNOT_SQUARE : FPDF_ANNOT_HIGHLIGHT;
+                                                                      (typeInt == 3) ? FPDF_ANNOT_LINK : (typeInt == 4 || typeInt == 7) ? FPDF_ANNOT_SQUARE : FPDF_ANNOT_HIGHLIGHT;
 
                 FPDF_ANNOTATION annot = FPDFPage_CreateAnnot(currentPage, (typeInt == 5) ? FPDF_ANNOT_STAMP : pdfType);
                 if (annot) {
@@ -1858,6 +1880,9 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeSaveAnnotat
                         FPDFAnnot_SetColor(annot, FPDFANNOT_COLORTYPE_InteriorColor, 0, 0, 0, 255);
                     }
                     else if (typeInt == 5) processTextStamp(env, obj, doc, currentPage, annot, rect, textPropsField, r, g, b, jsonClass, jsonInit);
+                    else if (typeInt == 7) {
+                        processRegionHighlight(env, obj, currentPage, annot, rect, r, g, b);
+                    }
                     else { // Highlight / Underline
                         FPDFAnnot_SetColor(annot, FPDFANNOT_COLORTYPE_Color, r, g, b, 255);
                         FS_QUADPOINTSF qp = {rect.left, rect.top, rect.right, rect.top, rect.left, rect.bottom, rect.right, rect.bottom};

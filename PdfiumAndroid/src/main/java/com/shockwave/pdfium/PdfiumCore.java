@@ -637,4 +637,14 @@ public class PdfiumCore {
             float bottom
     );
 
+//
+//    // 1. Load the text content of the page into memory for indexing
+//    public native long nativeOpenTextPage(long pagePtr);
+//
+//    // 3. Get the exact PDF-space coordinates for a specific character
+//    public native RectF nativeGetTextRect(long textPtr, int charIndex);
+//
+//    // 4. Extract the actual Unicode text for a range of indices
+//    public native String nativeGetTextUnicode(long textPtr, int startIndex, int count);
+
 }
