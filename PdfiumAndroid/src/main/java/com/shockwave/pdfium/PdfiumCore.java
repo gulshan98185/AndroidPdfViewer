@@ -647,4 +647,22 @@ public class PdfiumCore {
 //    // 4. Extract the actual Unicode text for a range of indices
 //    public native String nativeGetTextUnicode(long textPtr, int startIndex, int count);
 
+    public long reopenPage(PdfDocument doc, int pageIndex) { // todo added for testing purpose
+        synchronized (lock) {
+            Long textPtr = doc.mNativeTextPtr.remove(pageIndex);
+            if (textPtr != null && textPtr != 0L) {
+                nativeCloseTextPage(textPtr);
+            }
+
+            Long pagePtr = doc.mNativePagesPtr.remove(pageIndex);
+            if (pagePtr != null && pagePtr != 0L) {
+                nativeClosePage(pagePtr);
+            }
+
+            long reopenedPagePtr = nativeLoadPage(doc.mNativeDocPtr, pageIndex);
+            doc.mNativePagesPtr.put(pageIndex, reopenedPagePtr);
+            return reopenedPagePtr;
+        }
+    }
+
 }
