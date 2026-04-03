@@ -325,6 +325,21 @@ public class PdfiumCore {
     }
 
     /**
+     * Return an existing opened page pointer when available, otherwise open it once.
+     */
+    public long getOrOpenPage(PdfDocument doc, int pageIndex) {
+        synchronized (lock) {
+            Long pagePtr = doc.mNativePagesPtr.get(pageIndex);
+            if (pagePtr != null && pagePtr != 0L) {
+                return pagePtr;
+            }
+            pagePtr = nativeLoadPage(doc.mNativeDocPtr, pageIndex);
+            doc.mNativePagesPtr.put(pageIndex, pagePtr);
+            return pagePtr;
+        }
+    }
+
+    /**
      * Open range of pages and store native pointers in {@link PdfDocument}
      */
     public long[] openPage(PdfDocument doc, int fromIndex, int toIndex) {
