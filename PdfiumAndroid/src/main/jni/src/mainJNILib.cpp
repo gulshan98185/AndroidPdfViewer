@@ -5,6 +5,7 @@
 #define HAVE_PTHREADS true;
 extern "C" {
 #include <unistd.h>
+#include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <string.h>
@@ -19,6 +20,7 @@ extern "C" {
 using namespace android;
 
 #include <fpdf_doc.h>
+#include <fpdf_annot.h>
 #include <fpdfview.h>
 #include <fpdf_doc.h>
 #include <string>
@@ -193,6 +195,44 @@ static int getBlock(void *param, unsigned long position, unsigned char *outBuffe
         return 0;
     }
     return 1;
+}
+
+static std::u16string ReadAnnotStringValueUtf16(FPDF_ANNOTATION annot, FPDF_BYTESTRING key) {
+    const unsigned long valueLength = FPDFAnnot_GetStringValue(annot, key, nullptr, 0);
+    if (valueLength <= sizeof(FPDF_WCHAR)) {
+        return std::u16string();
+    }
+
+    std::vector<FPDF_WCHAR> valueBuffer(valueLength / sizeof(FPDF_WCHAR));
+    FPDFAnnot_GetStringValue(annot, key, valueBuffer.data(), valueLength);
+    const int valueCharCount = static_cast<int>(valueBuffer.size()) - 1;
+    if (valueCharCount <= 0) {
+        return std::u16string();
+    }
+
+    return std::u16string(
+            reinterpret_cast<const char16_t*>(valueBuffer.data()),
+            valueCharCount
+    );
+}
+
+static jstring ReadAnnotStringValueJString(JNIEnv* env, FPDF_ANNOTATION annot, FPDF_BYTESTRING key) {
+    const std::u16string value = ReadAnnotStringValueUtf16(annot, key);
+    if (value.empty()) {
+        return nullptr;
+    }
+    return env->NewString(reinterpret_cast<const jchar*>(value.data()), static_cast<jsize>(value.size()));
+}
+
+static void SetAnnotAsciiStringValue(FPDF_ANNOTATION annot, FPDF_BYTESTRING key, const char* value) {
+    if (!annot || !value) return;
+    const size_t valueLen = strlen(value);
+    std::vector<unsigned short> utf16Value(valueLen + 1);
+    for (size_t index = 0; index < valueLen; index++) {
+        utf16Value[index] = static_cast<unsigned short>(value[index]);
+    }
+    utf16Value[valueLen] = 0;
+    FPDFAnnot_SetStringValue(annot, key, (FPDF_WIDESTRING)utf16Value.data());
 }
 
 // once per document (store somewhere):
@@ -1587,6 +1627,7 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeSaveAnnotat
 // --- Helper Function Signatures --- Main Code for saving
 static void processLink(JNIEnv* env, jobject obj, FPDF_PAGE page, FPDF_ANNOTATION annot, FS_RECTF rect, jfieldID urlField);
 static void processTextStamp(JNIEnv* env, jobject obj, FPDF_DOCUMENT doc, FPDF_PAGE page, FPDF_ANNOTATION annot, FS_RECTF rect, jfieldID textPropsField, int r, int g, int b, int alpha, jclass jsonClass, jmethodID jsonInit);
+static bool processImageStamp(JNIEnv* env, jobject obj, FPDF_DOCUMENT doc, FPDF_PAGE page, FPDF_ANNOTATION annot, FS_RECTF rect, jfieldID imagePropsField, jclass jsonClass, jmethodID jsonInit);
 static void processFreeHand(JNIEnv* env, jobject obj, FPDF_PAGE page, jfieldID fhDrawingProperties, int r, int g, int b, jclass jsonClass, jmethodID jsonInit);
 
 // --- HELPER 1: LINK LOGIC ---
@@ -1758,6 +1799,7 @@ static void processTextStamp(JNIEnv* env, jobject obj, FPDF_DOCUMENT doc, FPDF_P
     }
     const jchar* rawJsonContent = env->GetStringChars(jJsonStr, nullptr);
     FPDFAnnot_SetStringValue(annot, "Contents", (FPDF_WIDESTRING)rawJsonContent);
+    SetAnnotAsciiStringValue(annot, "LufickStampKind", "text");
     env->ReleaseStringChars(jJsonStr, rawJsonContent);
     FPDFAnnot_SetFlags(annot, FPDF_ANNOT_FLAG_PRINT | FPDF_ANNOT_FLAG_READONLY);
     env->ReleaseStringChars(jText, (const jchar*)textContent);
@@ -1765,6 +1807,138 @@ static void processTextStamp(JNIEnv* env, jobject obj, FPDF_DOCUMENT doc, FPDF_P
     env->ReleaseStringUTFChars(jAlign, alignStr);
     if (fontPath) env->ReleaseStringUTFChars(jFontPath, fontPath);
     env->DeleteLocalRef(json);
+}
+
+static bool processImageStamp(
+        JNIEnv* env,
+        jobject obj,
+        FPDF_DOCUMENT doc,
+        FPDF_PAGE page,
+        FPDF_ANNOTATION annot,
+        FS_RECTF rect,
+        jfieldID imagePropsField,
+        jclass jsonClass,
+        jmethodID jsonInit
+) {
+    jstring jJsonStr = (jstring)env->GetObjectField(obj, imagePropsField);
+    if (!jJsonStr) return false;
+
+    jobject json = env->NewObject(jsonClass, jsonInit, jJsonStr);
+    if (!json) {
+        env->DeleteLocalRef(jJsonStr);
+        return false;
+    }
+
+    jmethodID optS = env->GetMethodID(jsonClass, "optString", "(Ljava/lang/String;)Ljava/lang/String;");
+    jmethodID optD = env->GetMethodID(jsonClass, "optDouble", "(Ljava/lang/String;D)D");
+
+    jstring jImagePath = (jstring)env->CallObjectMethod(json, optS, env->NewStringUTF("flattenedAssetPath"));
+    const char* imagePath = jImagePath ? env->GetStringUTFChars(jImagePath, nullptr) : nullptr;
+    if (!imagePath || strlen(imagePath) == 0) {
+        if (imagePath) env->ReleaseStringUTFChars(jImagePath, imagePath);
+        if (jImagePath) env->DeleteLocalRef(jImagePath);
+        env->DeleteLocalRef(json);
+        env->DeleteLocalRef(jJsonStr);
+        return false;
+    }
+
+    jstring jRotationKey = env->NewStringUTF("rotation");
+    jstring jBaseWidthKey = env->NewStringUTF("baseWidth");
+    jstring jBaseHeightKey = env->NewStringUTF("baseHeight");
+    const double rectWidth = fabs(rect.right - rect.left);
+    const double rectHeight = fabs(rect.top - rect.bottom);
+    const double rotation = env->CallDoubleMethod(json, optD, jRotationKey, 0.0);
+    const double baseWidth = env->CallDoubleMethod(json, optD, jBaseWidthKey, rectWidth);
+    const double baseHeight = env->CallDoubleMethod(json, optD, jBaseHeightKey, rectHeight);
+    env->DeleteLocalRef(jRotationKey);
+    env->DeleteLocalRef(jBaseWidthKey);
+    env->DeleteLocalRef(jBaseHeightKey);
+
+    const int imageFd = open(imagePath, O_RDONLY);
+    if (imageFd < 0) {
+        env->ReleaseStringUTFChars(jImagePath, imagePath);
+        env->DeleteLocalRef(jImagePath);
+        env->DeleteLocalRef(json);
+        env->DeleteLocalRef(jJsonStr);
+        return false;
+    }
+
+    const size_t fileLength = (size_t)getFileSize(imageFd);
+    if (fileLength == 0) {
+        close(imageFd);
+        env->ReleaseStringUTFChars(jImagePath, imagePath);
+        env->DeleteLocalRef(jImagePath);
+        env->DeleteLocalRef(json);
+        env->DeleteLocalRef(jJsonStr);
+        return false;
+    }
+
+    FPDF_PAGEOBJECT imageObj = FPDFPageObj_NewImageObj(doc);
+    if (!imageObj) {
+        close(imageFd);
+        env->ReleaseStringUTFChars(jImagePath, imagePath);
+        env->DeleteLocalRef(jImagePath);
+        env->DeleteLocalRef(json);
+        env->DeleteLocalRef(jJsonStr);
+        return false;
+    }
+
+    FPDF_FILEACCESS loader;
+    loader.m_FileLen = fileLength;
+    loader.m_Param = reinterpret_cast<void*>(intptr_t(imageFd));
+    loader.m_GetBlock = &getBlock;
+
+    const bool loaded = FPDFImageObj_LoadJpegFileInline(nullptr, 0, imageObj, &loader);
+    close(imageFd);
+    env->ReleaseStringUTFChars(jImagePath, imagePath);
+    env->DeleteLocalRef(jImagePath);
+
+    if (!loaded) {
+        FPDFPageObj_Destroy(imageObj);
+        env->DeleteLocalRef(json);
+        env->DeleteLocalRef(jJsonStr);
+        return false;
+    }
+
+    const double angleRad = rotation * M_PI / 180.0;
+    const double absCos = fabs(cos(angleRad));
+    const double absSin = fabs(sin(angleRad));
+    const double storedExpandedWidth = (baseWidth * absCos) + (baseHeight * absSin);
+    const double storedExpandedHeight = (baseWidth * absSin) + (baseHeight * absCos);
+    double fitScale = 1.0;
+    if (storedExpandedWidth > 0.0 && storedExpandedHeight > 0.0) {
+        fitScale = std::min(rectWidth / storedExpandedWidth, rectHeight / storedExpandedHeight);
+    }
+    const double drawWidth = std::max(baseWidth * fitScale, 1.0);
+    const double drawHeight = std::max(baseHeight * fitScale, 1.0);
+    const double centerX = (rect.left + rect.right) / 2.0;
+    const double centerY = (rect.top + rect.bottom) / 2.0;
+    const double cosA = cos(angleRad);
+    const double sinA = sin(angleRad);
+    const double a = cosA * drawWidth;
+    const double b = sinA * drawWidth;
+    const double c = -sinA * drawHeight;
+    const double d = cosA * drawHeight;
+    const double e = centerX - ((a + c) / 2.0);
+    const double f = centerY - ((b + d) / 2.0);
+
+    FPDFImageObj_SetMatrix(imageObj, a, b, c, d, e, f);
+    if (!FPDFAnnot_AppendObject(annot, imageObj)) {
+        FPDFPageObj_Destroy(imageObj);
+        env->DeleteLocalRef(json);
+        env->DeleteLocalRef(jJsonStr);
+        return false;
+    }
+
+    FPDFAnnot_UpdateObject(annot, imageObj);
+    const jchar* rawJsonContent = env->GetStringChars(jJsonStr, nullptr);
+    FPDFAnnot_SetStringValue(annot, "LufickImageMeta", (FPDF_WIDESTRING)rawJsonContent);
+    SetAnnotAsciiStringValue(annot, "LufickStampKind", "image");
+    env->ReleaseStringChars(jJsonStr, rawJsonContent);
+    FPDFAnnot_SetFlags(annot, FPDF_ANNOT_FLAG_PRINT | FPDF_ANNOT_FLAG_READONLY);
+    env->DeleteLocalRef(json);
+    env->DeleteLocalRef(jJsonStr);
+    return true;
 }
 
 // --- HELPER 3: FREEHAND LOGIC ---
@@ -1806,21 +1980,92 @@ static void processFreeHand(JNIEnv* env, jobject obj, FPDF_PAGE page, jfieldID f
     const int alphaValue = env->CallIntMethod(json, optI, jAlphaKey, 255);
     const int lineJoin = env->CallIntMethod(json, optI, jLineJoinKey, FPDF_LINEJOIN_ROUND);
     const int lineCap = env->CallIntMethod(json, optI, jLineCapKey, FPDF_LINECAP_ROUND);
+    const bool isHighlighter = strcmp(modeStr, "HIGHLIGHTER") == 0;
+    auto appendInkPoint = [](std::vector<FS_POINTF>& inkPoints, float x, float y) {
+        if (inkPoints.empty() ||
+            fabs(inkPoints.back().x - x) > 0.01f ||
+            fabs(inkPoints.back().y - y) > 0.01f) {
+            inkPoints.push_back({x, y});
+        }
+    };
 
-    auto finalizePath = [&](FPDF_PAGEOBJECT path) {
-        if (!path) return;
-        FPDFPageObj_SetStrokeWidth(path, strokeWidth > 0.0f ? strokeWidth : 1.0f);
+    auto finalizeInkAnnot = [&](FPDF_PAGEOBJECT path, const std::vector<FS_POINTF>& inkPoints) {
+        if (!path || inkPoints.size() < 2) {
+            if (path) FPDFPageObj_Destroy(path);
+            return;
+        }
+
+        float minX = inkPoints[0].x;
+        float maxX = inkPoints[0].x;
+        float minY = inkPoints[0].y;
+        float maxY = inkPoints[0].y;
+        for (const auto& point : inkPoints) {
+            minX = fmin(minX, point.x);
+            maxX = fmax(maxX, point.x);
+            minY = fmin(minY, point.y);
+            maxY = fmax(maxY, point.y);
+        }
+
+        const float effectiveStrokeWidth = strokeWidth > 0.0f ? strokeWidth : 1.0f;
+
+        FPDFPageObj_SetStrokeWidth(path, effectiveStrokeWidth);
         FPDFPageObj_SetLineJoin(path, lineJoin);
         FPDFPageObj_SetLineCap(path, lineCap);
-
-        if (strcmp(modeStr, "HIGHLIGHTER") == 0) {
+        if (isHighlighter) {
             FPDFPageObj_SetStrokeColor(path, r, g, b, 125);
             FPDFPageObj_SetBlendMode(path, "Multiply");
         } else {
             FPDFPageObj_SetStrokeColor(path, r, g, b, alphaValue);
         }
         FPDFPath_SetDrawMode(path, 0, JNI_TRUE);
-        FPDFPage_InsertObject(page, path);
+
+        const float rectMargin = fmax((effectiveStrokeWidth * 0.5f) + 0.5f, 1.0f);
+        FS_RECTF rect = {
+                minX - rectMargin,
+                minY - rectMargin,
+                maxX + rectMargin,
+                maxY + rectMargin
+        };
+
+        FPDF_ANNOTATION annot = FPDFPage_CreateAnnot(page, FPDF_ANNOT_INK);
+        if (!annot) {
+            FPDFPageObj_Destroy(path);
+            return;
+        }
+
+        FPDFAnnot_SetBorder(annot, 0, 0, effectiveStrokeWidth);
+        FPDFAnnot_SetRect(annot, &rect);
+        const int inkStrokeIndex = FPDFAnnot_AddInkStroke(annot, inkPoints.data(), inkPoints.size());
+        FPDFAnnot_SetColor(annot, FPDFANNOT_COLORTYPE_Color, r, g, b, isHighlighter ? 125 : alphaValue);
+        bool appendedObject = false;
+        if (!isHighlighter) {
+            FPDFPageObj_Destroy(path);
+        } else {
+            appendedObject = FPDFAnnot_AppendObject(annot, path);
+            if (!appendedObject) {
+                FPDFPageObj_Destroy(path);
+            } else {
+                const int objectCount = FPDFAnnot_GetObjectCount(annot);
+                if (objectCount > 0) {
+                    FPDF_PAGEOBJECT annotObject = FPDFAnnot_GetObject(annot, objectCount - 1);
+                    if (annotObject) {
+                        FPDFAnnot_UpdateObject(annot, annotObject);
+                    }
+                }
+            }
+        }
+
+        if (inkStrokeIndex < 0 || (isHighlighter && !appendedObject)) {
+            const int annotIndex = FPDFPage_GetAnnotIndex(page, annot);
+            FPDFPage_CloseAnnot(annot);
+            if (annotIndex >= 0) {
+                FPDFPage_RemoveAnnot(page, annotIndex);
+            }
+            return;
+        }
+
+        FPDFAnnot_SetFlags(annot, FPDF_ANNOT_FLAG_PRINT);
+        FPDFPage_CloseAnnot(annot);
     };
 
     jobject segmentsArray = optA ? env->CallObjectMethod(json, optA, jSegmentsKey) : nullptr;
@@ -1832,7 +2077,10 @@ static void processFreeHand(JNIEnv* env, jobject obj, FPDF_PAGE page, jfieldID f
                 const float startX = (float)env->CallDoubleMethod(firstSegment, getD, jXKey);
                 const float startY = (float)env->CallDoubleMethod(firstSegment, getD, jYKey);
                 FPDF_PAGEOBJECT path = FPDFPageObj_CreateNewPath(startX, startY);
-                bool hasVisibleSegments = false;
+                std::vector<FS_POINTF> inkPoints;
+                inkPoints.push_back({startX, startY});
+                float currentX = startX;
+                float currentY = startY;
 
                 for (int index = 1; index < segmentCount; index++) {
                     jobject segment = env->CallObjectMethod(segmentsArray, getObjM, index);
@@ -1845,6 +2093,13 @@ static void processFreeHand(JNIEnv* env, jobject obj, FPDF_PAGE page, jfieldID f
 
                     if (type == FPDF_SEGMENT_MOVETO) {
                         FPDFPath_MoveTo(path, x, y);
+                        if (inkPoints.empty() ||
+                            fabs(inkPoints.back().x - x) > 0.01f ||
+                            fabs(inkPoints.back().y - y) > 0.01f) {
+                            inkPoints.push_back({x, y});
+                        }
+                        currentX = x;
+                        currentY = y;
                     } else if (type == FPDF_SEGMENT_BEZIERTO && index + 2 < segmentCount) {
                         jobject control2 = env->CallObjectMethod(segmentsArray, getObjM, index + 1);
                         jobject endPoint = env->CallObjectMethod(segmentsArray, getObjM, index + 2);
@@ -1854,15 +2109,37 @@ static void processFreeHand(JNIEnv* env, jobject obj, FPDF_PAGE page, jfieldID f
                                 env->CallIntMethod(endPoint, optI, jTypeKey, FPDF_SEGMENT_UNKNOWN) == FPDF_SEGMENT_BEZIERTO;
 
                         if (hasBezierGroup) {
+                            const float cp1X = x;
+                            const float cp1Y = y;
                             const float cp2X = (float)env->CallDoubleMethod(control2, getD, jXKey);
                             const float cp2Y = (float)env->CallDoubleMethod(control2, getD, jYKey);
                             const float endX = (float)env->CallDoubleMethod(endPoint, getD, jXKey);
                             const float endY = (float)env->CallDoubleMethod(endPoint, getD, jYKey);
-                            FPDFPath_BezierTo(path, x, y, cp2X, cp2Y, endX, endY);
+                            FPDFPath_BezierTo(path, cp1X, cp1Y, cp2X, cp2Y, endX, endY);
+                            for (int sampleIndex = 1; sampleIndex <= 8; sampleIndex++) {
+                                const float t = sampleIndex / 8.0f;
+                                const float omt = 1.0f - t;
+                                const float sampleX =
+                                        omt * omt * omt * currentX +
+                                        3.0f * omt * omt * t * cp1X +
+                                        3.0f * omt * t * t * cp2X +
+                                        t * t * t * endX;
+                                const float sampleY =
+                                        omt * omt * omt * currentY +
+                                        3.0f * omt * omt * t * cp1Y +
+                                        3.0f * omt * t * t * cp2Y +
+                                        t * t * t * endY;
+                                if (inkPoints.empty() ||
+                                    fabs(inkPoints.back().x - sampleX) > 0.01f ||
+                                    fabs(inkPoints.back().y - sampleY) > 0.01f) {
+                                    inkPoints.push_back({sampleX, sampleY});
+                                }
+                            }
                             if (env->CallIntMethod(endPoint, optI, jCloseKey, 0) != 0) {
                                 FPDFPath_Close(path);
                             }
-                            hasVisibleSegments = true;
+                            currentX = endX;
+                            currentY = endY;
                             env->DeleteLocalRef(control2);
                             env->DeleteLocalRef(endPoint);
                             env->DeleteLocalRef(segment);
@@ -1873,22 +2150,30 @@ static void processFreeHand(JNIEnv* env, jobject obj, FPDF_PAGE page, jfieldID f
                         if (control2) env->DeleteLocalRef(control2);
                         if (endPoint) env->DeleteLocalRef(endPoint);
                         FPDFPath_LineTo(path, x, y);
+                        if (inkPoints.empty() ||
+                            fabs(inkPoints.back().x - x) > 0.01f ||
+                            fabs(inkPoints.back().y - y) > 0.01f) {
+                            inkPoints.push_back({x, y});
+                        }
+                        currentX = x;
+                        currentY = y;
                         if (close) FPDFPath_Close(path);
-                        hasVisibleSegments = true;
                     } else {
                         FPDFPath_LineTo(path, x, y);
+                        if (inkPoints.empty() ||
+                            fabs(inkPoints.back().x - x) > 0.01f ||
+                            fabs(inkPoints.back().y - y) > 0.01f) {
+                            inkPoints.push_back({x, y});
+                        }
+                        currentX = x;
+                        currentY = y;
                         if (close) FPDFPath_Close(path);
-                        hasVisibleSegments = true;
                     }
 
                     env->DeleteLocalRef(segment);
                 }
 
-                if (hasVisibleSegments) {
-                    finalizePath(path);
-                } else if (path) {
-                    FPDFPageObj_Destroy(path);
-                }
+                finalizeInkAnnot(path, inkPoints);
                 env->DeleteLocalRef(firstSegment);
             }
         }
@@ -1902,6 +2187,8 @@ static void processFreeHand(JNIEnv* env, jobject obj, FPDF_PAGE page, jfieldID f
                 const float startX = (float)env->CallDoubleMethod(ptStart, getD, jXKey);
                 const float startY = (float)env->CallDoubleMethod(ptStart, getD, jYKey);
                 FPDF_PAGEOBJECT path = FPDFPageObj_CreateNewPath(startX, startY);
+                std::vector<FS_POINTF> inkPoints;
+                appendInkPoint(inkPoints, startX, startY);
                 float segmentStartX = startX;
                 float segmentStartY = startY;
                 float prevX = startX;
@@ -1915,6 +2202,7 @@ static void processFreeHand(JNIEnv* env, jobject obj, FPDF_PAGE page, jfieldID f
 
                     if (i == pointsCount - 1) {
                         FPDFPath_LineTo(path, curX, curY);
+                        appendInkPoint(inkPoints, curX, curY);
                     } else {
                         const float midX = (prevX + curX) * 0.5f;
                         const float midY = (prevY + curY) * 0.5f;
@@ -1925,15 +2213,29 @@ static void processFreeHand(JNIEnv* env, jobject obj, FPDF_PAGE page, jfieldID f
                         const float cp2Y = midY + (2.0f / 3.0f) * (prevY - midY);
 
                         FPDFPath_BezierTo(path, cp1X, cp1Y, cp2X, cp2Y, midX, midY);
+                        for (int sampleIndex = 1; sampleIndex <= 8; sampleIndex++) {
+                            const float t = sampleIndex / 8.0f;
+                            const float omt = 1.0f - t;
+                            const float sampleX =
+                                    omt * omt * omt * segmentStartX +
+                                    3.0f * omt * omt * t * cp1X +
+                                    3.0f * omt * t * t * cp2X +
+                                    t * t * t * midX;
+                            const float sampleY =
+                                    omt * omt * omt * segmentStartY +
+                                    3.0f * omt * omt * t * cp1Y +
+                                    3.0f * omt * t * t * cp2Y +
+                                    t * t * t * midY;
+                            appendInkPoint(inkPoints, sampleX, sampleY);
+                        }
                         segmentStartX = midX;
                         segmentStartY = midY;
                     }
-
                     prevX = curX;
                     prevY = curY;
                     env->DeleteLocalRef(pt);
                 }
-                finalizePath(path);
+                finalizeInkAnnot(path, inkPoints);
                 env->DeleteLocalRef(ptStart);
             }
         }
@@ -2232,6 +2534,249 @@ static void ApplyExistingAnnotationColor(
     }
 }
 
+static bool BuildFreehandPropsFromPathObject(
+        FPDF_PAGEOBJECT pathObj,
+        std::string* outProps,
+        unsigned int* outR = nullptr,
+        unsigned int* outG = nullptr,
+        unsigned int* outB = nullptr,
+        unsigned int* outA = nullptr
+) {
+    if (!pathObj || !outProps || FPDFPageObj_GetType(pathObj) != FPDF_PAGEOBJ_PATH) {
+        return false;
+    }
+
+    const int segmentCount = FPDFPath_CountSegments(pathObj);
+    if (segmentCount <= 0) return false;
+
+    std::ostringstream freehandProps;
+    freehandProps << "{\"segments\":[";
+    bool wroteSegment = false;
+    for (int segmentIndex = 0; segmentIndex < segmentCount; segmentIndex++) {
+        FPDF_PATHSEGMENT segment = FPDFPath_GetPathSegment(pathObj, segmentIndex);
+        if (!segment) continue;
+
+        float segmentX = 0.0f;
+        float segmentY = 0.0f;
+        if (!FPDFPathSegment_GetPoint(segment, &segmentX, &segmentY)) continue;
+
+        const int segmentType = FPDFPathSegment_GetType(segment);
+        if (segmentType == FPDF_SEGMENT_UNKNOWN) continue;
+
+        if (wroteSegment) freehandProps << ",";
+        freehandProps << "{"
+                      << "\"type\":" << segmentType << ","
+                      << "\"x\":" << segmentX << ","
+                      << "\"y\":" << segmentY;
+        if (FPDFPathSegment_GetClose(segment)) {
+            freehandProps << ",\"close\":1";
+        }
+        freehandProps << "}";
+        wroteSegment = true;
+    }
+    if (!wroteSegment) return false;
+
+    float strokeWidth = 1.0f;
+    FPDFPageObj_GetStrokeWidth(pathObj, &strokeWidth);
+    unsigned int r = outR ? *outR : 0;
+    unsigned int g = outG ? *outG : 0;
+    unsigned int b = outB ? *outB : 0;
+    unsigned int a = outA ? *outA : 255;
+    FPDFPageObj_GetStrokeColor(pathObj, &r, &g, &b, &a);
+    const int lineJoin = FPDFPageObj_GetLineJoin(pathObj);
+    const int lineCap = FPDFPageObj_GetLineCap(pathObj);
+    freehandProps << "],"
+                  << "\"strokeWidth\":" << strokeWidth << ","
+                  << "\"alpha\":" << a << ","
+                  << "\"mode\":\"" << (a == 125 ? "HIGHLIGHTER" : "BRUSH_PENS") << "\","
+                  << "\"lineJoin\":" << lineJoin << ","
+                  << "\"lineCap\":" << lineCap
+                  << "}";
+
+    *outProps = freehandProps.str();
+    if (outR) *outR = r;
+    if (outG) *outG = g;
+    if (outB) *outB = b;
+    if (outA) *outA = a;
+    return true;
+}
+
+static void ResolveInkAnnotStrokeStyle(
+        FPDF_ANNOTATION annot,
+        float* outStrokeWidth,
+        int* outLineJoin,
+        int* outLineCap
+) {
+    if (outStrokeWidth) *outStrokeWidth = 1.0f;
+    if (outLineJoin) *outLineJoin = FPDF_LINEJOIN_ROUND;
+    if (outLineCap) *outLineCap = FPDF_LINECAP_ROUND;
+    if (!annot) return;
+
+    const int annotObjectCount = FPDFAnnot_GetObjectCount(annot);
+    for (int objectIndex = 0; objectIndex < annotObjectCount; objectIndex++) {
+        FPDF_PAGEOBJECT pageObject = FPDFAnnot_GetObject(annot, objectIndex);
+        if (!pageObject || FPDFPageObj_GetType(pageObject) != FPDF_PAGEOBJ_PATH) continue;
+
+        if (outStrokeWidth) {
+            float strokeWidth = 1.0f;
+            if (FPDFPageObj_GetStrokeWidth(pageObject, &strokeWidth) && strokeWidth > 0.0f) {
+                *outStrokeWidth = strokeWidth;
+            }
+        }
+        if (outLineJoin) *outLineJoin = FPDFPageObj_GetLineJoin(pageObject);
+        if (outLineCap) *outLineCap = FPDFPageObj_GetLineCap(pageObject);
+        return;
+    }
+
+    if (outStrokeWidth) {
+        float horizontalRadius = 0.0f;
+        float verticalRadius = 0.0f;
+        float borderWidth = 1.0f;
+        if (FPDFAnnot_GetBorder(annot, &horizontalRadius, &verticalRadius, &borderWidth) &&
+            borderWidth > 0.0f) {
+            *outStrokeWidth = borderWidth;
+        }
+    }
+}
+
+static bool GetInkAnnotPageBounds(
+        FPDF_ANNOTATION annot,
+        float* outLeft,
+        float* outBottom,
+        float* outRight,
+        float* outTop
+) {
+    if (!annot || !outLeft || !outBottom || !outRight || !outTop) return false;
+
+    const unsigned long inkPathCount = FPDFAnnot_GetInkListCount(annot);
+    if (inkPathCount == 0) return false;
+
+    bool hasPoint = false;
+    float minX = 0.0f;
+    float maxX = 0.0f;
+    float minY = 0.0f;
+    float maxY = 0.0f;
+
+    for (unsigned long pathIndex = 0; pathIndex < inkPathCount; pathIndex++) {
+        const unsigned long pointCount = FPDFAnnot_GetInkListPath(annot, pathIndex, nullptr, 0);
+        if (pointCount == 0) continue;
+
+        std::vector<FS_POINTF> points(pointCount);
+        if (FPDFAnnot_GetInkListPath(annot, pathIndex, points.data(), pointCount) != pointCount) {
+            continue;
+        }
+
+        for (const auto& point : points) {
+            if (!hasPoint) {
+                minX = maxX = point.x;
+                minY = maxY = point.y;
+                hasPoint = true;
+            } else {
+                minX = fmin(minX, point.x);
+                maxX = fmax(maxX, point.x);
+                minY = fmin(minY, point.y);
+                maxY = fmax(maxY, point.y);
+            }
+        }
+    }
+
+    if (!hasPoint) return false;
+
+    float strokeWidth = 1.0f;
+    ResolveInkAnnotStrokeStyle(annot, &strokeWidth, nullptr, nullptr);
+    const float effectiveStrokeWidth = strokeWidth > 0.0f ? strokeWidth : 1.0f;
+    const float padding = fmax((effectiveStrokeWidth * 0.5f) + 1.0f, 1.5f);
+
+    *outLeft = minX - padding;
+    *outBottom = minY - padding;
+    *outRight = maxX + padding;
+    *outTop = maxY + padding;
+    return true;
+}
+
+static bool BuildFreehandPropsFromInkAnnot(
+        FPDF_ANNOTATION annot,
+        std::string* outProps,
+        unsigned int* outR = nullptr,
+        unsigned int* outG = nullptr,
+        unsigned int* outB = nullptr,
+        unsigned int* outA = nullptr
+) {
+    if (!annot || !outProps) return false;
+
+    unsigned int r = outR ? *outR : 0;
+    unsigned int g = outG ? *outG : 0;
+    unsigned int b = outB ? *outB : 0;
+    unsigned int a = outA ? *outA : 255;
+    bool hasStrokeColor = FPDFAnnot_GetColor(annot, FPDFANNOT_COLORTYPE_Color, &r, &g, &b, &a);
+    unsigned int fillR = 0;
+    unsigned int fillG = 0;
+    unsigned int fillB = 0;
+    unsigned int fillA = 0;
+    bool hasFillColor = false;
+    ResolveAnnotAppearanceColors(
+            annot,
+            &hasStrokeColor,
+            &r,
+            &g,
+            &b,
+            &a,
+            &hasFillColor,
+            &fillR,
+            &fillG,
+            &fillB,
+            &fillA
+    );
+    float strokeWidth = 1.0f;
+    int lineJoin = FPDF_LINEJOIN_ROUND;
+    int lineCap = FPDF_LINECAP_ROUND;
+    ResolveInkAnnotStrokeStyle(annot, &strokeWidth, &lineJoin, &lineCap);
+
+    const unsigned long inkPathCount = FPDFAnnot_GetInkListCount(annot);
+    if (inkPathCount > 0) {
+        const unsigned long pointCount = FPDFAnnot_GetInkListPath(annot, 0, nullptr, 0);
+        if (pointCount >= 2) {
+            std::vector<FS_POINTF> points(pointCount);
+            if (FPDFAnnot_GetInkListPath(annot, 0, points.data(), pointCount) == pointCount) {
+                std::ostringstream freehandProps;
+                freehandProps << "{\"points\":[";
+                for (unsigned long pointIndex = 0; pointIndex < pointCount; pointIndex++) {
+                    if (pointIndex > 0) freehandProps << ",";
+                    freehandProps << "{"
+                                  << "\"x\":" << points[pointIndex].x << ","
+                                  << "\"y\":" << points[pointIndex].y
+                                  << "}";
+                }
+                freehandProps << "],"
+                              << "\"strokeWidth\":" << (strokeWidth > 0.0f ? strokeWidth : 1.0f) << ","
+                              << "\"alpha\":" << a << ","
+                              << "\"mode\":\"" << (a == 125 ? "HIGHLIGHTER" : "BRUSH_PENS") << "\","
+                              << "\"lineJoin\":" << lineJoin << ","
+                              << "\"lineCap\":" << lineCap
+                              << "}";
+
+                *outProps = freehandProps.str();
+                if (outR) *outR = r;
+                if (outG) *outG = g;
+                if (outB) *outB = b;
+                if (outA) *outA = a;
+                return true;
+            }
+        }
+    }
+
+    const int annotObjectCount = FPDFAnnot_GetObjectCount(annot);
+    for (int objectIndex = 0; objectIndex < annotObjectCount; objectIndex++) {
+        FPDF_PAGEOBJECT pageObject = FPDFAnnot_GetObject(annot, objectIndex);
+        if (!pageObject || FPDFPageObj_GetType(pageObject) != FPDF_PAGEOBJ_PATH) continue;
+        if (BuildFreehandPropsFromPathObject(pageObject, outProps, outR, outG, outB, outA)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 static void ApplyExistingTextMarkupStyle(
         JNIEnv* env,
         FPDF_ANNOTATION annot,
@@ -2268,7 +2813,7 @@ static void ApplyExistingTextMarkupStyle(
 
     const jchar* rawMarkupMeta = env->GetStringChars(jMarkupRects, nullptr);
     if (rawMarkupMeta) {
-        FPDFAnnot_SetStringValue(annot, "LufickMarkupMeta", (FPDF_WIDESTRING)rawMarkupMeta);
+//        FPDFAnnot_SetStringValue(annot, "LufickMarkupMeta", (FPDF_WIDESTRING)rawMarkupMeta);
         env->ReleaseStringChars(jMarkupRects, rawMarkupMeta);
     }
 
@@ -2424,6 +2969,7 @@ static bool ApplyNativeAnnotationEditActions(
     jfieldID markupRectsField = env->GetFieldID(highlightClass, "markupRectsJson", "Ljava/lang/String;");
     jfieldID textPropsField = env->GetFieldID(highlightClass, "textProperties", "Ljava/lang/String;");
     jfieldID fhDrawingProperties = env->GetFieldID(highlightClass, "fhDrawingProperties", "Ljava/lang/String;");
+    jfieldID imagePropsField = env->GetFieldID(highlightClass, "imageProperties", "Ljava/lang/String;");
     jfieldID nativeSourceIdField = env->GetFieldID(highlightClass, "nativeSourceId", "I");
     jfieldID nativeEditActionField = env->GetFieldID(highlightClass, "nativeEditAction", "I");
 
@@ -2459,6 +3005,14 @@ static bool ApplyNativeAnnotationEditActions(
         std::string markupRectsJson;
     };
     std::map<int, std::vector<AnnotColorUpdate>> colorUpdateMap;
+    struct AnnotRectUpdate {
+        int annotIndex;
+        float left;
+        float top;
+        float right;
+        float bottom;
+    };
+    std::map<int, std::vector<AnnotRectUpdate>> rectUpdateMap;
 
     int highlightCount = env->GetArrayLength(highlightsArray);
     for (int i = 0; i < highlightCount; i++) {
@@ -2501,9 +3055,17 @@ static bool ApplyNativeAnnotationEditActions(
                                                         env->GetIntField(obj, rField),
                                                         env->GetIntField(obj, gField),
                                                         env->GetIntField(obj, bField),
-                                                        env->GetIntField(obj, alphaField),
-                                                        markupRectsJson
-                                                });
+                                                         env->GetIntField(obj, alphaField),
+                                                         markupRectsJson
+                                                 });
+        } else if (nativeSourceId >= 0 && nativeEditAction == 3) {
+            rectUpdateMap[pageIndex].push_back({
+                nativeSourceId,
+                env->GetFloatField(obj, leftField),
+                env->GetFloatField(obj, topField),
+                env->GetFloatField(obj, rightField),
+                env->GetFloatField(obj, bottomField)
+            });
         }
         env->DeleteLocalRef(obj);
     }
@@ -2512,6 +3074,7 @@ static bool ApplyNativeAnnotationEditActions(
     for (const auto& entry : removalMap) touchedPages[entry.first] = true;
     for (const auto& entry : objectRemovalMap) touchedPages[entry.first] = true;
     for (const auto& entry : colorUpdateMap) touchedPages[entry.first] = true;
+    for (const auto& entry : rectUpdateMap) touchedPages[entry.first] = true;
 
     for (const auto& pageEntry : touchedPages) {
         int pageIndex = pageEntry.first;
@@ -2550,6 +3113,22 @@ static bool ApplyNativeAnnotationEditActions(
             }
         }
 
+        auto rectUpdatesIt = rectUpdateMap.find(pageIndex);
+        if (rectUpdatesIt != rectUpdateMap.end()) {
+            for (const auto& update : rectUpdatesIt->second) {
+                if (update.annotIndex < 0 || update.annotIndex >= FPDFPage_GetAnnotCount(page)) continue;
+                FPDF_ANNOTATION annot = FPDFPage_GetAnnot(page, update.annotIndex);
+                if (!annot) continue;
+                FS_RECTF rect;
+                rect.left = fmin(update.left, update.right);
+                rect.right = fmax(update.left, update.right);
+                rect.bottom = fmin(update.top, update.bottom);
+                rect.top = fmax(update.top, update.bottom);
+                FPDFAnnot_SetRect(annot, &rect);
+                FPDFPage_CloseAnnot(annot);
+            }
+        }
+
         auto removalsIt = removalMap.find(pageIndex);
         if (removalsIt != removalMap.end()) {
             auto ids = removalsIt->second;
@@ -2573,7 +3152,49 @@ static bool ApplyNativeAnnotationEditActions(
             }), targets.end());
             for (const auto& target : targets) {
                 bool removed = false;
-                if (target.objectIndex >= 0 && target.objectIndex < FPDFPage_CountObjects(page)) {
+                const float targetLeft = fmin(target.left, target.right);
+                const float targetRight = fmax(target.left, target.right);
+                const float targetBottom = fmin(target.top, target.bottom);
+                const float targetTop = fmax(target.top, target.bottom);
+
+                if (target.objectIndex >= 0 && target.objectIndex < FPDFPage_GetAnnotCount(page)) {
+                    FPDF_ANNOTATION annot = FPDFPage_GetAnnot(page, target.objectIndex);
+                    if (annot) {
+                        const int subtype = FPDFAnnot_GetSubtype(annot);
+                        if (subtype == FPDF_ANNOT_INK) {
+                            unsigned int annotR = 0, annotG = 0, annotB = 0, annotA = 255;
+                            FPDFAnnot_GetColor(annot, FPDFANNOT_COLORTYPE_Color, &annotR, &annotG, &annotB, &annotA);
+
+                            FS_RECTF annotRect = {0.0f, 0.0f, 0.0f, 0.0f};
+                            const bool hasRect = FPDFAnnot_GetRect(annot, &annotRect);
+                            const float annotLeft = fmin(annotRect.left, annotRect.right);
+                            const float annotRight = fmax(annotRect.left, annotRect.right);
+                            const float annotBottom = fmin(annotRect.bottom, annotRect.top);
+                            const float annotTop = fmax(annotRect.bottom, annotRect.top);
+                            const float overlapLeft = fmax(targetLeft, annotLeft);
+                            const float overlapBottom = fmax(targetBottom, annotBottom);
+                            const float overlapRight = fmin(targetRight, annotRight);
+                            const float overlapTop = fmin(targetTop, annotTop);
+                            const bool rectMatches = hasRect && overlapRight > overlapLeft && overlapTop > overlapBottom;
+                            const bool colorMatches =
+                                    static_cast<int>(annotR) == target.r &&
+                                    static_cast<int>(annotG) == target.g &&
+                                    static_cast<int>(annotB) == target.b;
+                            if (rectMatches || colorMatches) {
+                                FPDFPage_CloseAnnot(annot);
+                                if (FPDFPage_RemoveAnnot(page, target.objectIndex)) {
+                                    removed = true;
+                                }
+                            } else {
+                                FPDFPage_CloseAnnot(annot);
+                            }
+                        } else {
+                            FPDFPage_CloseAnnot(annot);
+                        }
+                    }
+                }
+
+                if (!removed && target.objectIndex >= 0 && target.objectIndex < FPDFPage_CountObjects(page)) {
                     FPDF_PAGEOBJECT pageObject = FPDFPage_GetObject(page, target.objectIndex);
                     if (pageObject && FPDFPageObj_GetType(pageObject) == FPDF_PAGEOBJ_PATH &&
                         FPDFPage_RemoveObject(page, pageObject)) {
@@ -2582,10 +3203,6 @@ static bool ApplyNativeAnnotationEditActions(
                     }
                 }
                 if (!removed) {
-                    const float targetLeft = fmin(target.left, target.right);
-                    const float targetRight = fmax(target.left, target.right);
-                    const float targetBottom = fmin(target.top, target.bottom);
-                    const float targetTop = fmax(target.top, target.bottom);
                     float bestScore = 0.0f;
                     int bestIndex = -1;
 
@@ -2669,7 +3286,7 @@ static bool ApplyNativeAnnotationEditActions(
                                   (typeInt == 3) ? FPDF_ANNOT_LINK :
                                   (typeInt == 4 || typeInt == 7) ? FPDF_ANNOT_SQUARE :
                                   FPDF_ANNOT_HIGHLIGHT;
-                    FPDF_ANNOTATION annot = FPDFPage_CreateAnnot(page, (typeInt == 5) ? FPDF_ANNOT_STAMP : pdfType);
+                    FPDF_ANNOTATION annot = FPDFPage_CreateAnnot(page, (typeInt == 5 || typeInt == 9) ? FPDF_ANNOT_STAMP : pdfType);
                     if (annot) {
                         FPDFAnnot_SetRect(annot, &rect);
                         if (typeInt == 3) processLink(env, obj, page, annot, rect, urlField);
@@ -2678,6 +3295,7 @@ static bool ApplyNativeAnnotationEditActions(
                             FPDFAnnot_SetColor(annot, FPDFANNOT_COLORTYPE_InteriorColor, 0, 0, 0, 255);
                         }
                         else if (typeInt == 5) processTextStamp(env, obj, doc, page, annot, rect, textPropsField, r, g, b, alpha, jsonClass, jsonInit);
+                        else if (typeInt == 9) processImageStamp(env, obj, doc, page, annot, rect, imagePropsField, jsonClass, jsonInit);
                         else if (typeInt == 7) {
                             processRegionHighlight(env, obj, page, annot, rect, r, g, b, alpha);
                         }
@@ -2778,7 +3396,7 @@ static bool ApplyNativeAnnotationEditActions(
                                 }
 
                                 const jchar* rawMarkupMeta = env->GetStringChars(jMarkupRects, nullptr);
-                                FPDFAnnot_SetStringValue(annot, "LufickMarkupMeta", (FPDF_WIDESTRING)rawMarkupMeta);
+//                                FPDFAnnot_SetStringValue(annot, "LufickMarkupMeta", (FPDF_WIDESTRING)rawMarkupMeta);
                                 env->ReleaseStringChars(jMarkupRects, rawMarkupMeta);
                             }
                             if (!appended) {
@@ -2840,6 +3458,7 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeSaveAnnotat
     jfieldID markupRectsField = env->GetFieldID(highlightClass, "markupRectsJson", "Ljava/lang/String;");
     jfieldID textPropsField = env->GetFieldID(highlightClass, "textProperties", "Ljava/lang/String;");
     jfieldID fhDrawingProperties = env->GetFieldID(highlightClass, "fhDrawingProperties", "Ljava/lang/String;");
+    jfieldID imagePropsField = env->GetFieldID(highlightClass, "imageProperties", "Ljava/lang/String;");
     jfieldID nativeSourceIdField = env->GetFieldID(highlightClass, "nativeSourceId", "I");
     jfieldID nativeEditActionField = env->GetFieldID(highlightClass, "nativeEditAction", "I");
 
@@ -2900,7 +3519,7 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeSaveAnnotat
                               (typeInt == 4 || typeInt == 7) ? FPDF_ANNOT_SQUARE :
                               FPDF_ANNOT_HIGHLIGHT;
 
-                FPDF_ANNOTATION annot = FPDFPage_CreateAnnot(currentPage, (typeInt == 5) ? FPDF_ANNOT_STAMP : pdfType);
+                FPDF_ANNOTATION annot = FPDFPage_CreateAnnot(currentPage, (typeInt == 5 || typeInt == 9) ? FPDF_ANNOT_STAMP : pdfType);
                 if (annot) {
                     FPDFAnnot_SetRect(annot, &rect);
                     if (typeInt == 3) processLink(env, obj, currentPage, annot, rect, urlField);
@@ -2909,6 +3528,7 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeSaveAnnotat
                         FPDFAnnot_SetColor(annot, FPDFANNOT_COLORTYPE_InteriorColor, 0, 0, 0, 255);
                     }
                     else if (typeInt == 5) processTextStamp(env, obj, doc, currentPage, annot, rect, textPropsField, r, g, b, alpha, jsonClass, jsonInit);
+                    else if (typeInt == 9) processImageStamp(env, obj, doc, currentPage, annot, rect, imagePropsField, jsonClass, jsonInit);
                     else if (typeInt == 7) {
                         processRegionHighlight(env, obj, currentPage, annot, rect, r, g, b, alpha);
                     }
@@ -3013,7 +3633,7 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeSaveAnnotat
                             }
 
                             const jchar* rawMarkupMeta = env->GetStringChars(jMarkupRects, nullptr);
-                            FPDFAnnot_SetStringValue(annot, "LufickMarkupMeta", (FPDF_WIDESTRING)rawMarkupMeta);
+//                            FPDFAnnot_SetStringValue(annot, "LufickMarkupMeta", (FPDF_WIDESTRING)rawMarkupMeta);
                             env->ReleaseStringChars(jMarkupRects, rawMarkupMeta);
                         }
                         if (!appended) {
@@ -3175,7 +3795,7 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeGetAnnotati
     jmethodID constructor = env->GetMethodID(
             annotClass,
             "<init>",
-            "(IIFFFFIIIILjava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Landroid/graphics/Bitmap;II)V"
+            "(IIFFFFIIIILjava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Landroid/graphics/Bitmap;II)V"
     );
 
     // Use a vector to prevent ArrayIndexOutOfBoundsException
@@ -3195,6 +3815,10 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeGetAnnotati
             case FPDF_ANNOT_STRIKEOUT: type = 2; break;
             case FPDF_ANNOT_SQUIGGLY:  type = 8; break;
             case FPDF_ANNOT_LINK:      type = 3; break;
+            case FPDF_ANNOT_INK:
+                type = 6;
+                usesRectOnly = true;
+                break;
             case FPDF_ANNOT_STAMP:
                 type = 5;
                 usesRectOnly = true;
@@ -3263,9 +3887,80 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeGetAnnotati
         }
         jstring jLinkUrl = nullptr;
         jstring jTextProps = nullptr;
+        jstring jImageProps = nullptr;
         jstring jStoredMarkupRects = nullptr;
         std::ostringstream markupRectsStream;
         bool hasMarkupRects = false;
+
+        if (type == 5) {
+            const std::u16string stampKind = ReadAnnotStringValueUtf16(annot, "LufickStampKind");
+            if (stampKind == u"image") {
+                type = 9;
+                r = 0;
+                g = 0;
+                b = 0;
+                a = 0;
+                jImageProps = ReadAnnotStringValueJString(env, annot, "LufickImageMeta");
+            }
+        }
+
+        if (type == 6) {
+            std::string freehandProps;
+            if (!BuildFreehandPropsFromInkAnnot(annot, &freehandProps, &r, &g, &b, &a)) {
+                FPDFPage_CloseAnnot(annot);
+                continue;
+            }
+
+            FS_RECTF rect;
+            const bool hasInkBounds = GetInkAnnotPageBounds(
+                    annot,
+                    &rect.left,
+                    &rect.bottom,
+                    &rect.right,
+                    &rect.top
+            );
+            if (!hasInkBounds && !FPDFAnnot_GetRect(annot, &rect)) {
+                FPDFPage_CloseAnnot(annot);
+                continue;
+            }
+
+            int dLeft, dTop, dRight, dBottom;
+            FPDF_PageToDevice(page, 0, 0, viewWidth, viewHeight, 0, rect.left, rect.top, &dLeft, &dTop);
+            FPDF_PageToDevice(page, 0, 0, viewWidth, viewHeight, 0, rect.right, rect.bottom, &dRight, &dBottom);
+            const float deviceLeft = static_cast<float>(std::min(dLeft, dRight));
+            const float deviceRight = static_cast<float>(std::max(dLeft, dRight));
+            const float deviceTop = static_cast<float>(std::min(dTop, dBottom));
+            const float deviceBottom = static_cast<float>(std::max(dTop, dBottom));
+            jstring jFhProps = env->NewStringUTF(freehandProps.c_str());
+
+            jobject annotObj = env->NewObject(
+                    annotClass,
+                    constructor,
+                    type,
+                    pageIndex,
+                    deviceLeft,
+                    deviceTop,
+                    deviceRight,
+                    deviceBottom,
+                    (int)r,
+                    (int)g,
+                    (int)b,
+                    (int)a,
+                    nullptr,
+                    nullptr,
+                    nullptr,
+                    jFhProps,
+                    nullptr,
+                    nullptr,
+                    i,
+                    0
+            );
+
+            if (annotObj) tempCollector.push_back(annotObj);
+            if (jFhProps) env->DeleteLocalRef(jFhProps);
+            FPDFPage_CloseAnnot(annot);
+            continue;
+        }
 
         if (type == 5) {
             auto escapeJson = [](const std::string& input) {
@@ -3374,26 +4069,26 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeGetAnnotati
             }
         }
 
-        const unsigned long markupMetaLength = FPDFAnnot_GetStringValue(annot, "LufickMarkupMeta", nullptr, 0);
-        if (markupMetaLength > sizeof(FPDF_WCHAR)) {
-            std::vector<FPDF_WCHAR> markupMetaBuffer(markupMetaLength / sizeof(FPDF_WCHAR));
-            FPDFAnnot_GetStringValue(annot, "LufickMarkupMeta", markupMetaBuffer.data(), markupMetaLength);
-            const int markupMetaCharCount = static_cast<int>(markupMetaBuffer.size()) - 1;
-            if (markupMetaCharCount > 0) {
-                std::u16string markupMetaValue(
-                        reinterpret_cast<const char16_t*>(markupMetaBuffer.data()),
-                        markupMetaCharCount
-                );
-                std::string markupMetaUtf8;
-                markupMetaUtf8.reserve(markupMetaValue.size());
-                for (char16_t ch : markupMetaValue) {
-                    markupMetaUtf8.push_back(ch <= 0x7F ? static_cast<char>(ch) : '?');
-                }
-                if (!markupMetaUtf8.empty()) {
-                    jStoredMarkupRects = env->NewStringUTF(markupMetaUtf8.c_str());
-                }
-            }
-        }
+//        const unsigned long markupMetaLength = FPDFAnnot_GetStringValue(annot, "LufickMarkupMeta", nullptr, 0);
+//        if (markupMetaLength > sizeof(FPDF_WCHAR)) {
+//            std::vector<FPDF_WCHAR> markupMetaBuffer(markupMetaLength / sizeof(FPDF_WCHAR));
+//            FPDFAnnot_GetStringValue(annot, "LufickMarkupMeta", markupMetaBuffer.data(), markupMetaLength);
+//            const int markupMetaCharCount = static_cast<int>(markupMetaBuffer.size()) - 1;
+//            if (markupMetaCharCount > 0) {
+//                std::u16string markupMetaValue(
+//                        reinterpret_cast<const char16_t*>(markupMetaBuffer.data()),
+//                        markupMetaCharCount
+//                );
+//                std::string markupMetaUtf8;
+//                markupMetaUtf8.reserve(markupMetaValue.size());
+//                for (char16_t ch : markupMetaValue) {
+//                    markupMetaUtf8.push_back(ch <= 0x7F ? static_cast<char>(ch) : '?');
+//                }
+//                if (!markupMetaUtf8.empty()) {
+//                    jStoredMarkupRects = env->NewStringUTF(markupMetaUtf8.c_str());
+//                }
+//            }
+//        }
 
         if (usesRectOnly) {
             // Logic for Redaction (Square) - Use the Bounding Box
@@ -3405,7 +4100,7 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeGetAnnotati
 
                 jobject annotObj = env->NewObject(annotClass, constructor,
                                                   type, pageIndex, (float)dLeft, (float)dTop, (float)dRight, (float)dBottom,
-                                                  (int)r, (int)g, (int)b, (int)a, jLinkUrl, nullptr, jTextProps, nullptr, nullptr, i, 0);
+                                                  (int)r, (int)g, (int)b, (int)a, jLinkUrl, nullptr, jTextProps, nullptr, jImageProps, nullptr, i, 0);
 
                 if (annotObj) tempCollector.push_back(annotObj);
             }
@@ -3457,7 +4152,7 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeGetAnnotati
 
                     jobject annotObj = env->NewObject(annotClass, constructor,
                                                       type, pageIndex, (float)dLeft, (float)dTop, (float)dRight, (float)dBottom,
-                                                      (int)r, (int)g, (int)b, (int)a, jLinkUrl, jMarkupRects, jTextProps, nullptr, nullptr, i, 0);
+                                                      (int)r, (int)g, (int)b, (int)a, jLinkUrl, jMarkupRects, jTextProps, nullptr, jImageProps, nullptr, i, 0);
 
                     if (annotObj) tempCollector.push_back(annotObj);
                 }
@@ -3494,63 +4189,27 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeGetAnnotati
         unsigned int r = 0, g = 170, b = 90, a = 255;
         FPDFPageObj_GetStrokeColor(pageObj, &r, &g, &b, &a);
         if (a == 0) continue;
-
-        const int segmentCount = FPDFPath_CountSegments(pageObj);
-        if (segmentCount <= 0) continue;
-
-        std::ostringstream freehandProps;
-        freehandProps << "{\"segments\":[";
-        bool wroteSegment = false;
-        for (int segmentIndex = 0; segmentIndex < segmentCount; segmentIndex++) {
-            FPDF_PATHSEGMENT segment = FPDFPath_GetPathSegment(pageObj, segmentIndex);
-            if (!segment) continue;
-
-            float segmentX = 0.0f;
-            float segmentY = 0.0f;
-            if (!FPDFPathSegment_GetPoint(segment, &segmentX, &segmentY)) continue;
-
-            const int segmentType = FPDFPathSegment_GetType(segment);
-            if (segmentType == FPDF_SEGMENT_UNKNOWN) continue;
-
-            if (wroteSegment) freehandProps << ",";
-            freehandProps << "{"
-                          << "\"type\":" << segmentType << ","
-                          << "\"x\":" << segmentX << ","
-                          << "\"y\":" << segmentY;
-            if (FPDFPathSegment_GetClose(segment)) {
-                freehandProps << ",\"close\":1";
-            }
-            freehandProps << "}";
-            wroteSegment = true;
-        }
-        if (!wroteSegment) continue;
-
-        float strokeWidth = 1.0f;
-        FPDFPageObj_GetStrokeWidth(pageObj, &strokeWidth);
-        const int lineJoin = FPDFPageObj_GetLineJoin(pageObj);
-        const int lineCap = FPDFPageObj_GetLineCap(pageObj);
-        freehandProps << "],"
-                      << "\"strokeWidth\":" << strokeWidth << ","
-                      << "\"alpha\":" << a << ","
-                      << "\"mode\":\"" << (a == 125 ? "HIGHLIGHTER" : "BRUSH_PENS") << "\","
-                      << "\"lineJoin\":" << lineJoin << ","
-                      << "\"lineCap\":" << lineCap
-                      << "}";
+        std::string freehandProps;
+        if (!BuildFreehandPropsFromPathObject(pageObj, &freehandProps, &r, &g, &b, &a)) continue;
 
         int dLeft, dTop, dRight, dBottom;
         FPDF_PageToDevice(page, 0, 0, viewWidth, viewHeight, 0, left, top, &dLeft, &dTop);
         FPDF_PageToDevice(page, 0, 0, viewWidth, viewHeight, 0, right, bottom, &dRight, &dBottom);
-        jstring jFhProps = env->NewStringUTF(freehandProps.str().c_str());
+        const float deviceLeft = static_cast<float>(std::min(dLeft, dRight));
+        const float deviceRight = static_cast<float>(std::max(dLeft, dRight));
+        const float deviceTop = static_cast<float>(std::min(dTop, dBottom));
+        const float deviceBottom = static_cast<float>(std::max(dTop, dBottom));
+        jstring jFhProps = env->NewStringUTF(freehandProps.c_str());
 
         jobject annotObj = env->NewObject(
                 annotClass,
                 constructor,
                 6,
                 pageIndex,
-                (float)dLeft,
-                (float)dTop,
-                (float)dRight,
-                (float)dBottom,
+                deviceLeft,
+                deviceTop,
+                deviceRight,
+                deviceBottom,
                 (int)r,
                 (int)g,
                 (int)b,
@@ -3559,6 +4218,7 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeGetAnnotati
                 nullptr,
                 nullptr,
                 jFhProps,
+                nullptr,
                 nullptr,
                 i,
                 0
