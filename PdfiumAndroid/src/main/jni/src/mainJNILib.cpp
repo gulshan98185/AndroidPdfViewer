@@ -28,7 +28,9 @@ using namespace android;
 #include <vector>
 #include <map>
 #include <algorithm>
+#include <cmath>
 #include <functional>
+#include <iomanip>
 #include <fpdf_text.h>
 
 static Mutex sLibraryLock;
@@ -1626,10 +1628,299 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeSaveAnnotat
 
 // --- Helper Function Signatures --- Main Code for saving
 static void processLink(JNIEnv* env, jobject obj, FPDF_PAGE page, FPDF_ANNOTATION annot, FS_RECTF rect, jfieldID urlField);
+static void processStickyNoteComment(JNIEnv* env, jobject obj, FPDF_ANNOTATION annot, jfieldID commentPropsField, int r, int g, int b, int alpha, jclass jsonClass, jmethodID jsonInit);
 static void processTextStamp(JNIEnv* env, jobject obj, FPDF_DOCUMENT doc, FPDF_PAGE page, FPDF_ANNOTATION annot, FS_RECTF rect, jfieldID textPropsField, int r, int g, int b, int alpha, jclass jsonClass, jmethodID jsonInit);
 static bool processImageStamp(JNIEnv* env, jobject obj, FPDF_DOCUMENT doc, FPDF_PAGE page, FPDF_ANNOTATION annot, FS_RECTF rect, jfieldID imagePropsField, jclass jsonClass, jmethodID jsonInit);
 static void processFreeHand(JNIEnv* env, jobject obj, FPDF_PAGE page, jfieldID fhDrawingProperties, int r, int g, int b, jclass jsonClass, jmethodID jsonInit);
 
+// helper for sticky note (to tell the native the name of the icon we want to set on the icon on note instead of default)
+static void SetAnnotWideStringValueFromJString(
+        JNIEnv* env,
+        FPDF_ANNOTATION annot,
+        FPDF_BYTESTRING key,
+        jstring value
+) {
+    if (!env || !annot || !value) return;
+    const jchar* rawValue = env->GetStringChars(value, nullptr);
+    if (!rawValue) return;
+    FPDFAnnot_SetStringValue(annot, key, reinterpret_cast<FPDF_WIDESTRING>(rawValue));
+    env->ReleaseStringChars(value, rawValue);
+}
+
+static void AppendEscapedJsonUtf16(std::u16string* target, const std::u16string& value) {
+    if (!target) return;
+    for (char16_t ch : value) {
+        switch (ch) {
+            case u'\\':
+                target->append(u"\\\\");
+                break;
+            case u'"':
+                target->append(u"\\\"");
+                break;
+            case u'\n':
+                target->append(u"\\n");
+                break;
+            case u'\r':
+                break;
+            case u'\t':
+                target->append(u"\\t");
+                break;
+            default:
+                if (ch < 0x20) {
+                    static const char16_t hexDigits[] = u"0123456789ABCDEF";
+                    target->append(u"\\u00");
+                    target->push_back(hexDigits[(ch >> 4) & 0xF]);
+                    target->push_back(hexDigits[ch & 0xF]);
+                } else {
+                    target->push_back(ch);
+                }
+                break;
+        }
+    }
+}
+
+static std::u16string AsciiToUtf16(const char* value) {
+    std::u16string result;
+    if (!value) return result;
+    while (*value != '\0') {
+        result.push_back(static_cast<char16_t>(*value));
+        value++;
+    }
+    return result;
+}
+
+static std::u16string AsciiToUtf16(const std::string& value) {
+    std::u16string result;
+    result.reserve(value.size());
+    for (char ch : value) {
+        result.push_back(static_cast<char16_t>(ch));
+    }
+    return result;
+}
+
+static const char* MapStickyNoteIconKeyToPdfCommentName(const std::string& iconKey) {
+    if (iconKey == "check") return "Check";
+    if (iconKey == "circle") return "Circle";
+    if (iconKey == "comment") return "Comment";
+    if (iconKey == "cross") return "Cross";
+    if (iconKey == "help") return "Help";
+    if (iconKey == "flag") return "Key";
+    if (iconKey == "arrow_right") return "RightArrow";
+    if (iconKey == "right_pointer") return "RightPointer";
+    if (iconKey == "star") return "Star";
+    if (iconKey == "insert") return "Insert";
+    return "Note";
+}
+
+static const char* MapPdfCommentNameToStickyNoteIconKey(const std::u16string& pdfName) {
+    if (pdfName == u"Check") return "check";
+    if (pdfName == u"Circle") return "circle";
+    if (pdfName == u"Comment") return "comment";
+    if (pdfName == u"Cross") return "cross";
+    if (pdfName == u"Help") return "help";
+    if (pdfName == u"Key") return "flag";
+    if (pdfName == u"Insert") return "arrow_right";
+    if (pdfName == u"RightArrow") return "arrow_right";
+    if (pdfName == u"RightPointer") return "right_pointer";
+    if (pdfName == u"Star") return "star";
+    if (pdfName == u"Note" || pdfName.empty()) return "comment";
+    return "right_pointer";
+}
+
+static void AppendPdfCirclePath(std::ostringstream& stream, float cx, float cy, float radius) {
+    const float kappa = 0.5522847498f;
+    const float control = radius * kappa;
+    stream << (cx + radius) << ' ' << cy << " m ";
+    stream << (cx + radius) << ' ' << (cy + control) << ' '
+           << (cx + control) << ' ' << (cy + radius) << ' '
+           << cx << ' ' << (cy + radius) << " c ";
+    stream << (cx - control) << ' ' << (cy + radius) << ' '
+           << (cx - radius) << ' ' << (cy + control) << ' '
+           << (cx - radius) << ' ' << cy << " c ";
+    stream << (cx - radius) << ' ' << (cy - control) << ' '
+           << (cx - control) << ' ' << (cy - radius) << ' '
+           << cx << ' ' << (cy - radius) << " c ";
+    stream << (cx + control) << ' ' << (cy - radius) << ' '
+           << (cx + radius) << ' ' << (cy - control) << ' '
+           << (cx + radius) << ' ' << cy << " c ";
+}
+
+static void AppendPdfRoundedRectPath(
+        std::ostringstream& stream,
+        float left,
+        float bottom,
+        float right,
+        float top,
+        float radius
+) {
+    const float clampedRadius = std::max(0.0f, std::min(radius, std::min((right - left) * 0.5f, (top - bottom) * 0.5f)));
+    const float kappa = 0.5522847498f;
+    const float control = clampedRadius * kappa;
+    stream << (left + clampedRadius) << ' ' << top << " m ";
+    stream << (right - clampedRadius) << ' ' << top << " l ";
+    stream << (right - clampedRadius + control) << ' ' << top << ' '
+           << right << ' ' << (top - clampedRadius + control) << ' '
+           << right << ' ' << (top - clampedRadius) << " c ";
+    stream << right << ' ' << (bottom + clampedRadius) << " l ";
+    stream << right << ' ' << (bottom + clampedRadius - control) << ' '
+           << (right - clampedRadius + control) << ' ' << bottom << ' '
+           << (right - clampedRadius) << ' ' << bottom << " c ";
+    stream << (left + clampedRadius) << ' ' << bottom << " l ";
+    stream << (left + clampedRadius - control) << ' ' << bottom << ' '
+           << left << ' ' << (bottom + clampedRadius - control) << ' '
+           << left << ' ' << (bottom + clampedRadius) << " c ";
+    stream << left << ' ' << (top - clampedRadius) << " l ";
+    stream << left << ' ' << (top - clampedRadius + control) << ' '
+           << (left + clampedRadius - control) << ' ' << top << ' '
+           << (left + clampedRadius) << ' ' << top << " c ";
+}
+
+static std::u16string BuildStickyNoteAppearanceStream(
+        const FS_RECTF& rect,
+        const std::string& iconKey,
+        int r,
+        int g,
+        int b
+) {
+    const float width = rect.right - rect.left;
+    const float height = rect.top - rect.bottom;
+    if (width <= 0.1f || height <= 0.1f) return std::u16string();
+
+    const std::string resolvedIconKey = iconKey.empty() ? "comment" : iconKey;
+    const float strokeWidth = std::max(std::min(width, height) * 0.12f, 1.5f);
+    const float red = std::max(0.0f, std::min(r / 255.0f, 1.0f));
+    const float green = std::max(0.0f, std::min(g / 255.0f, 1.0f));
+    const float blue = std::max(0.0f, std::min(b / 255.0f, 1.0f));
+    std::ostringstream stream;
+    stream.setf(std::ios::fixed);
+    stream << std::setprecision(3);
+    stream << "q 1 J 1 j " << strokeWidth << " w "
+           << red << ' ' << green << ' ' << blue << " RG "
+           << red << ' ' << green << ' ' << blue << " rg ";
+
+    const auto x = [&](float fraction) { return rect.left + (width * fraction); };
+    const auto y = [&](float fractionFromTop) { return rect.top - (height * fractionFromTop); };
+
+    if (resolvedIconKey == "right_pointer") {
+        stream << x(0.14f) << ' ' << y(0.12f) << " m "
+               << x(0.84f) << ' ' << y(0.50f) << " l "
+               << x(0.14f) << ' ' << y(0.88f) << " l "
+               << x(0.38f) << ' ' << y(0.50f) << " l h f ";
+    } else if (resolvedIconKey == "arrow_right") {
+        stream << x(0.12f) << ' ' << y(0.50f) << " m "
+               << x(0.84f) << ' ' << y(0.50f) << " l "
+               << x(0.62f) << ' ' << y(0.22f) << " m "
+               << x(0.84f) << ' ' << y(0.50f) << " l "
+               << x(0.62f) << ' ' << y(0.78f) << " m "
+               << x(0.84f) << ' ' << y(0.50f) << " l S ";
+    } else if (resolvedIconKey == "check") {
+        stream << x(0.16f) << ' ' << y(0.58f) << " m "
+               << x(0.38f) << ' ' << y(0.82f) << " l "
+               << x(0.86f) << ' ' << y(0.18f) << " l S ";
+    } else if (resolvedIconKey == "circle") {
+        AppendPdfCirclePath(stream, x(0.50f), y(0.50f), std::min(width, height) * 0.28f);
+        stream << "S ";
+    } else if (resolvedIconKey == "cross") {
+        stream << x(0.18f) << ' ' << y(0.18f) << " m "
+               << x(0.82f) << ' ' << y(0.82f) << " l "
+               << x(0.82f) << ' ' << y(0.18f) << " m "
+               << x(0.18f) << ' ' << y(0.82f) << " l S ";
+    } else if (resolvedIconKey == "flag") {
+        stream << x(0.22f) << ' ' << y(0.14f) << " m "
+               << x(0.22f) << ' ' << y(0.84f) << " l S "
+               << x(0.22f) << ' ' << y(0.14f) << " m "
+               << x(0.84f) << ' ' << y(0.24f) << " l "
+               << x(0.22f) << ' ' << y(0.52f) << " l h f ";
+    } else if (resolvedIconKey == "comment") {
+        const float bubbleLeft = x(0.12f);
+        const float bubbleRight = x(0.82f);
+        const float bubbleTop = y(0.12f);
+        const float bubbleBottom = y(0.76f);
+        const float bubbleRadius = (bubbleTop - bubbleBottom) * 0.22f;
+        AppendPdfRoundedRectPath(stream, bubbleLeft, bubbleBottom, bubbleRight, bubbleTop, bubbleRadius);
+        stream << bubbleLeft + ((bubbleRight - bubbleLeft) * 0.26f) << ' ' << bubbleBottom << " m "
+               << bubbleLeft + ((bubbleRight - bubbleLeft) * 0.38f) << ' ' << y(0.94f) << " l "
+               << bubbleLeft + ((bubbleRight - bubbleLeft) * 0.46f) << ' ' << bubbleBottom << " l h f ";
+    } else if (resolvedIconKey == "help") {
+        stream << x(0.32f) << ' ' << y(0.28f) << " m "
+               << x(0.32f) << ' ' << y(0.18f) << ' '
+               << x(0.42f) << ' ' << y(0.12f) << ' '
+               << x(0.53f) << ' ' << y(0.12f) << " c "
+               << x(0.67f) << ' ' << y(0.12f) << ' '
+               << x(0.77f) << ' ' << y(0.22f) << ' '
+               << x(0.77f) << ' ' << y(0.33f) << " c "
+               << x(0.77f) << ' ' << y(0.44f) << ' '
+               << x(0.70f) << ' ' << y(0.50f) << ' '
+               << x(0.61f) << ' ' << y(0.56f) << " c "
+               << x(0.54f) << ' ' << y(0.60f) << ' '
+               << x(0.50f) << ' ' << y(0.64f) << ' '
+               << x(0.50f) << ' ' << y(0.71f) << " c "
+               << x(0.50f) << ' ' << y(0.76f) << " l S ";
+        AppendPdfCirclePath(stream, x(0.50f), y(0.86f), std::min(width, height) * 0.06f);
+        stream << "f ";
+    } else if (resolvedIconKey == "star") {
+        const float cx = x(0.50f);
+        const float cy = y(0.50f);
+        const float outer = std::min(width, height) * 0.34f;
+        const float inner = outer * 0.45f;
+        const double pi = 3.14159265358979323846;
+        for (int index = 0; index < 10; index++) {
+            const double angle = (pi / 2.0) + ((pi / 5.0) * index);
+            const float radius = (index % 2 == 0) ? outer : inner;
+            const float pointX = cx + static_cast<float>(std::cos(angle) * radius);
+            const float pointY = cy + static_cast<float>(std::sin(angle) * radius);
+            stream << pointX << ' ' << pointY << (index == 0 ? " m " : " l ");
+        }
+        stream << "h f ";
+    } else {
+        const float bubbleLeft = x(0.16f);
+        const float bubbleRight = x(0.84f);
+        const float bubbleTop = y(0.16f);
+        const float bubbleBottom = y(0.80f);
+        const float bubbleRadius = (bubbleTop - bubbleBottom) * 0.22f;
+        AppendPdfRoundedRectPath(stream, bubbleLeft, bubbleBottom, bubbleRight, bubbleTop, bubbleRadius);
+        stream << "f ";
+    }
+
+    stream << "Q";
+    return AsciiToUtf16(stream.str());
+}
+
+static jstring BuildStickyNoteCommentMetaJString(JNIEnv* env, FPDF_ANNOTATION annot) {
+    if (!env || !annot) return nullptr;
+
+    jstring storedMeta = ReadAnnotStringValueJString(env, annot, "LufickCommentMeta");
+    if (storedMeta) {
+        return storedMeta;
+    }
+
+    const std::u16string title = ReadAnnotStringValueUtf16(annot, "T");
+    const std::u16string text = ReadAnnotStringValueUtf16(annot, "Contents");
+    const std::u16string pdfName = ReadAnnotStringValueUtf16(annot, "Name");
+    std::u16string createdAtRaw = ReadAnnotStringValueUtf16(annot, "CreationDate");
+    if (createdAtRaw.empty()) {
+        createdAtRaw = ReadAnnotStringValueUtf16(annot, "M");
+    }
+    if (title.empty() && text.empty() && pdfName.empty() && createdAtRaw.empty()) {
+        return nullptr;
+    }
+
+    std::u16string json = u"{\"title\":\"";
+    AppendEscapedJsonUtf16(&json, title);
+    json += u"\",\"text\":\"";
+    AppendEscapedJsonUtf16(&json, text);
+    json += u"\",\"iconKey\":\"";
+    json += AsciiToUtf16(MapPdfCommentNameToStickyNoteIconKey(pdfName));
+    json += u"\"";
+    if (!createdAtRaw.empty()) {
+        json += u",\"createdAtRaw\":\"";
+        AppendEscapedJsonUtf16(&json, createdAtRaw);
+        json += u"\"";
+    }
+    json += u"}";
+    return env->NewString(reinterpret_cast<const jchar*>(json.data()), static_cast<jsize>(json.size()));
+}
+//----------------------------------------------------------------------------------------
 // --- HELPER 1: LINK LOGIC ---
 static void processLink(JNIEnv* env, jobject obj, FPDF_PAGE page, FPDF_ANNOTATION annot, FS_RECTF rect, jfieldID urlField) {
     jstring jUrl = (jstring)env->GetObjectField(obj, urlField);
@@ -1643,6 +1934,93 @@ static void processLink(JNIEnv* env, jobject obj, FPDF_PAGE page, FPDF_ANNOTATIO
     FPDFAnnot_AppendAttachmentPoints(annot, &qp);
 }
 
+static void processStickyNoteComment(
+        JNIEnv* env,
+        jobject obj,
+        FPDF_ANNOTATION annot,
+        jfieldID commentPropsField,
+        int r,
+        int g,
+        int b,
+        int alpha,
+        jclass jsonClass,
+        jmethodID jsonInit
+) {
+    if (!annot) return;
+
+    // Reset any prior appearance before rebuilding the sticky note from the
+    // latest JSON payload.
+    FPDFAnnot_SetAP(annot, FPDF_ANNOT_APPEARANCEMODE_NORMAL, nullptr);
+    FPDFAnnot_SetColor(annot, FPDFANNOT_COLORTYPE_Color, r, g, b, alpha);
+    SetAnnotAsciiStringValue(annot, "Name", "Note");
+
+    jstring jJsonStr = (jstring)env->GetObjectField(obj, commentPropsField);
+    if (!jJsonStr) return;
+
+    SetAnnotWideStringValueFromJString(env, annot, "LufickCommentMeta", jJsonStr);
+
+    jobject json = env->NewObject(jsonClass, jsonInit, jJsonStr);
+    if (!json) {
+        env->DeleteLocalRef(jJsonStr);
+        return;
+    }
+
+    jmethodID optString = env->GetMethodID(jsonClass, "optString", "(Ljava/lang/String;)Ljava/lang/String;");
+    jstring titleKey = env->NewStringUTF("title");
+    jstring textKey = env->NewStringUTF("text");
+    jstring iconKeyKey = env->NewStringUTF("iconKey");
+    jstring createdAtRawKey = env->NewStringUTF("createdAtRaw");
+    jstring jTitle = (jstring)env->CallObjectMethod(json, optString, titleKey);
+    jstring jText = (jstring)env->CallObjectMethod(json, optString, textKey);
+    jstring jIconKey = (jstring)env->CallObjectMethod(json, optString, iconKeyKey);
+    jstring jCreatedAtRaw = (jstring)env->CallObjectMethod(json, optString, createdAtRawKey);
+
+    if (jTitle && env->GetStringLength(jTitle) > 0) {
+        SetAnnotWideStringValueFromJString(env, annot, "T", jTitle);
+    }
+    if (jText && env->GetStringLength(jText) > 0) {
+        SetAnnotWideStringValueFromJString(env, annot, "Contents", jText);
+    }
+    if (jCreatedAtRaw && env->GetStringLength(jCreatedAtRaw) > 0) {
+        SetAnnotWideStringValueFromJString(env, annot, "CreationDate", jCreatedAtRaw);
+        SetAnnotWideStringValueFromJString(env, annot, "M", jCreatedAtRaw);
+    }
+
+    std::string iconKey;
+    if (jIconKey) {
+        const char* rawIconKey = env->GetStringUTFChars(jIconKey, nullptr);
+        if (rawIconKey) {
+            iconKey = rawIconKey;
+            env->ReleaseStringUTFChars(jIconKey, rawIconKey);
+        }
+    }
+
+    const char* pdfIconName = MapStickyNoteIconKeyToPdfCommentName(iconKey);
+    SetAnnotAsciiStringValue(annot, "Name", pdfIconName);
+
+    FS_RECTF annotRect;
+    if (FPDFAnnot_GetRect(annot, &annotRect)) {
+        const std::u16string appearanceStream = BuildStickyNoteAppearanceStream(annotRect, iconKey, r, g, b);
+        if (!appearanceStream.empty()) {
+            FPDFAnnot_SetAP(
+                    annot,
+                    FPDF_ANNOT_APPEARANCEMODE_NORMAL,
+                    reinterpret_cast<FPDF_WIDESTRING>(appearanceStream.c_str())
+            );
+        }
+    }
+
+    env->DeleteLocalRef(jIconKey);
+    env->DeleteLocalRef(jText);
+    env->DeleteLocalRef(jTitle);
+    env->DeleteLocalRef(jCreatedAtRaw);
+    env->DeleteLocalRef(createdAtRawKey);
+    env->DeleteLocalRef(iconKeyKey);
+    env->DeleteLocalRef(textKey);
+    env->DeleteLocalRef(titleKey);
+    env->DeleteLocalRef(json);
+    env->DeleteLocalRef(jJsonStr);
+}
 // --- HELPER 2: TEXT STAMP LOGIC ---
 static void processTextStamp(JNIEnv* env, jobject obj, FPDF_DOCUMENT doc, FPDF_PAGE page, FPDF_ANNOTATION annot, FS_RECTF rect, jfieldID textPropsField, int r, int g, int b, int alpha, jclass jsonClass, jmethodID jsonInit) {
     jstring jJsonStr = (jstring)env->GetObjectField(obj, textPropsField);
@@ -3284,6 +3662,7 @@ static bool ApplyNativeAnnotationEditActions(
                                   (typeInt == 2) ? FPDF_ANNOT_STRIKEOUT :
                                   (typeInt == 8) ? FPDF_ANNOT_SQUIGGLY :
                                   (typeInt == 3) ? FPDF_ANNOT_LINK :
+                                  (typeInt == 10) ? FPDF_ANNOT_TEXT :
                                   (typeInt == 4 || typeInt == 7) ? FPDF_ANNOT_SQUARE :
                                   FPDF_ANNOT_HIGHLIGHT;
                     FPDF_ANNOTATION annot = FPDFPage_CreateAnnot(page, (typeInt == 5 || typeInt == 9) ? FPDF_ANNOT_STAMP : pdfType);
@@ -3294,6 +3673,7 @@ static bool ApplyNativeAnnotationEditActions(
                             FPDFAnnot_SetColor(annot, FPDFANNOT_COLORTYPE_Color, 0, 0, 0, 255);
                             FPDFAnnot_SetColor(annot, FPDFANNOT_COLORTYPE_InteriorColor, 0, 0, 0, 255);
                         }
+                        else if (typeInt == 10) processStickyNoteComment(env, obj, annot, textPropsField, r, g, b, alpha, jsonClass, jsonInit);
                         else if (typeInt == 5) processTextStamp(env, obj, doc, page, annot, rect, textPropsField, r, g, b, alpha, jsonClass, jsonInit);
                         else if (typeInt == 9) processImageStamp(env, obj, doc, page, annot, rect, imagePropsField, jsonClass, jsonInit);
                         else if (typeInt == 7) {
@@ -3516,6 +3896,7 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeSaveAnnotat
                               (typeInt == 2) ? FPDF_ANNOT_STRIKEOUT :
                               (typeInt == 8) ? FPDF_ANNOT_SQUIGGLY :
                               (typeInt == 3) ? FPDF_ANNOT_LINK :
+                              (typeInt == 10) ? FPDF_ANNOT_TEXT :
                               (typeInt == 4 || typeInt == 7) ? FPDF_ANNOT_SQUARE :
                               FPDF_ANNOT_HIGHLIGHT;
 
@@ -3527,6 +3908,7 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeSaveAnnotat
                         FPDFAnnot_SetColor(annot, FPDFANNOT_COLORTYPE_Color, 0, 0, 0, 255);
                         FPDFAnnot_SetColor(annot, FPDFANNOT_COLORTYPE_InteriorColor, 0, 0, 0, 255);
                     }
+                    else if (typeInt == 10) processStickyNoteComment(env, obj, annot, textPropsField, r, g, b, alpha, jsonClass, jsonInit);
                     else if (typeInt == 5) processTextStamp(env, obj, doc, currentPage, annot, rect, textPropsField, r, g, b, alpha, jsonClass, jsonInit);
                     else if (typeInt == 9) processImageStamp(env, obj, doc, currentPage, annot, rect, imagePropsField, jsonClass, jsonInit);
                     else if (typeInt == 7) {
@@ -3815,6 +4197,10 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeGetAnnotati
             case FPDF_ANNOT_STRIKEOUT: type = 2; break;
             case FPDF_ANNOT_SQUIGGLY:  type = 8; break;
             case FPDF_ANNOT_LINK:      type = 3; break;
+            case FPDF_ANNOT_TEXT:
+                type = 10;
+                usesRectOnly = true;
+                break;
             case FPDF_ANNOT_INK:
                 type = 6;
                 usesRectOnly = true;
@@ -3902,6 +4288,10 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeGetAnnotati
                 a = 0;
                 jImageProps = ReadAnnotStringValueJString(env, annot, "LufickImageMeta");
             }
+        }
+
+        if (type == 10) {
+            jTextProps = BuildStickyNoteCommentMetaJString(env, annot);
         }
 
         if (type == 6) {
