@@ -237,6 +237,31 @@ static void SetAnnotAsciiStringValue(FPDF_ANNOTATION annot, FPDF_BYTESTRING key,
     FPDFAnnot_SetStringValue(annot, key, (FPDF_WIDESTRING)utf16Value.data());
 }
 
+static std::string Utf16ToSimpleUtf8(const std::u16string& value) {
+    std::string output;
+    output.reserve(value.size());
+    for (char16_t ch : value) {
+        output.push_back(ch <= 0x7F ? static_cast<char>(ch) : '?');
+    }
+    return output;
+}
+
+static std::string EscapeJsonString(const std::string& input) {
+    std::string output;
+    output.reserve(input.size() + 8);
+    for (char ch : input) {
+        switch (ch) {
+            case '\\': output += "\\\\"; break;
+            case '"': output += "\\\""; break;
+            case '\n': output += "\\n"; break;
+            case '\r': break;
+            case '\t': output += "\\t"; break;
+            default: output += ch; break;
+        }
+    }
+    return output;
+}
+
 // once per document (store somewhere):
 static void ensureForm(DocumentFile* docFile){
     if (!docFile->gForm) {
@@ -1630,6 +1655,7 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeSaveAnnotat
 static void processLink(JNIEnv* env, jobject obj, FPDF_PAGE page, FPDF_ANNOTATION annot, FS_RECTF rect, jfieldID urlField);
 static void processStickyNoteComment(JNIEnv* env, jobject obj, FPDF_ANNOTATION annot, jfieldID commentPropsField, int r, int g, int b, int alpha, jclass jsonClass, jmethodID jsonInit);
 static void processTextStamp(JNIEnv* env, jobject obj, FPDF_DOCUMENT doc, FPDF_PAGE page, FPDF_ANNOTATION annot, FS_RECTF rect, jfieldID textPropsField, int r, int g, int b, int alpha, jclass jsonClass, jmethodID jsonInit);
+static void processFreeText(JNIEnv* env, jobject obj, FPDF_DOCUMENT doc, FPDF_ANNOTATION annot, FS_RECTF rect, jfieldID textPropsField, int r, int g, int b, int alpha, jclass jsonClass, jmethodID jsonInit);
 static bool processImageStamp(JNIEnv* env, jobject obj, FPDF_DOCUMENT doc, FPDF_PAGE page, FPDF_ANNOTATION annot, FS_RECTF rect, jfieldID imagePropsField, jclass jsonClass, jmethodID jsonInit);
 static void processFreeHand(JNIEnv* env, jobject obj, FPDF_PAGE page, jfieldID fhDrawingProperties, int r, int g, int b, jclass jsonClass, jmethodID jsonInit);
 
@@ -1695,6 +1721,22 @@ static std::u16string AsciiToUtf16(const std::string& value) {
     for (char ch : value) {
         result.push_back(static_cast<char16_t>(ch));
     }
+    return result;
+}
+
+static std::u16string JStringToUtf16(JNIEnv* env, jstring value) {
+    std::u16string result;
+    if (!env || !value) return result;
+
+    const jchar* rawValue = env->GetStringChars(value, nullptr);
+    if (!rawValue) return result;
+
+    const jsize valueLength = env->GetStringLength(value);
+    result.assign(
+            reinterpret_cast<const char16_t*>(rawValue),
+            reinterpret_cast<const char16_t*>(rawValue) + valueLength
+    );
+    env->ReleaseStringChars(value, rawValue);
     return result;
 }
 
@@ -1883,6 +1925,326 @@ static std::u16string BuildStickyNoteAppearanceStream(
     }
 
     stream << "Q";
+    return AsciiToUtf16(stream.str());
+}
+
+static void AppendPdfEscapedLiteralText(std::ostringstream& stream, const std::u16string& value) {
+    for (char16_t ch : value) {
+        if (ch == u'(' || ch == u')' || ch == u'\\') {
+            stream << '\\' << static_cast<char>(ch);
+        } else if (ch >= 0x20 && ch <= 0x7E) {
+            stream << static_cast<char>(ch);
+        } else {
+            stream << '?';
+        }
+    }
+}
+
+struct WrappedFreeTextLine {
+    std::u16string text;
+    bool alignLeft;
+};
+
+static bool IsFreeTextWrapSpace(char16_t ch) {
+    return ch == u' ' || ch == u'\t';
+}
+
+static size_t TrimFreeTextLineEnd(const std::u16string& line, size_t start, size_t end) {
+    while (end > start && IsFreeTextWrapSpace(line[end - 1])) {
+        end--;
+    }
+    return end;
+}
+
+static void AppendWrappedFreeTextParagraph(
+        const std::u16string& line,
+        size_t maxCharactersPerLine,
+        std::vector<WrappedFreeTextLine>* outLines
+) {
+    if (!outLines) return;
+    if (line.empty()) {
+        outLines->push_back({std::u16string(), false});
+        return;
+    }
+
+    const bool needsWrap = line.size() > maxCharactersPerLine;
+    size_t start = 0;
+    while (start < line.size()) {
+        while (start < line.size() && IsFreeTextWrapSpace(line[start])) {
+            start++;
+        }
+        if (start >= line.size()) break;
+
+        const size_t endLimit = std::min(line.size(), start + maxCharactersPerLine);
+        if (endLimit >= line.size()) {
+            const size_t trimmedEnd = TrimFreeTextLineEnd(line, start, line.size());
+            if (trimmedEnd > start) {
+                outLines->push_back({line.substr(start, trimmedEnd - start), needsWrap});
+            }
+            break;
+        }
+
+        size_t breakAt = endLimit;
+        for (size_t index = endLimit; index > start; index--) {
+            if (IsFreeTextWrapSpace(line[index - 1])) {
+                breakAt = index - 1;
+                break;
+            }
+        }
+        if (breakAt <= start) {
+            breakAt = endLimit;
+        }
+
+        const size_t trimmedEnd = TrimFreeTextLineEnd(line, start, breakAt);
+        if (trimmedEnd > start) {
+            outLines->push_back({line.substr(start, trimmedEnd - start), true});
+        }
+        start = breakAt;
+    }
+
+    if (outLines->empty()) {
+        outLines->push_back({std::u16string(), false});
+    }
+}
+
+static std::vector<WrappedFreeTextLine> WrapFreeTextAppearanceText(
+        const std::u16string& text,
+        float maxTextWidth,
+        float fontSize
+) {
+    std::vector<WrappedFreeTextLine> wrappedLines;
+    const float estimatedCharacterWidth = std::max(1.0f, fontSize * 0.50f);
+    const size_t maxCharactersPerLine = std::max<size_t>(
+            1,
+            static_cast<size_t>(std::floor(std::max(1.0f, maxTextWidth) / estimatedCharacterWidth))
+    );
+
+    size_t start = 0;
+    while (start <= text.size()) {
+        size_t end = text.find(u'\n', start);
+        if (end == std::u16string::npos) {
+            end = text.size();
+        }
+        AppendWrappedFreeTextParagraph(
+                text.substr(start, end - start),
+                maxCharactersPerLine,
+                &wrappedLines
+        );
+
+        if (end >= text.size()) break;
+        start = end + 1;
+    }
+
+    if (wrappedLines.empty()) {
+        wrappedLines.push_back({std::u16string(), false});
+    }
+    return wrappedLines;
+}
+
+static float EstimateFreeTextLineWidth(const std::u16string& line, float fontSize) {
+    return static_cast<float>(line.size()) * fontSize * 0.50f;
+}
+
+static const char* MapFreeTextFontToAppearanceResource(const std::string& fontName) {
+    if (fontName.find("Courier") != std::string::npos ||
+        fontName.find("Mono") != std::string::npos ||
+        fontName.find("mono") != std::string::npos) {
+        return "Cour";
+    }
+    if (fontName.find("Times") != std::string::npos ||
+        fontName.find("Serif") != std::string::npos ||
+        fontName.find("serif") != std::string::npos) {
+        return "TiRo";
+    }
+    return "Helv";
+}
+
+static float ClampFreeTextFontSize(float fontSize) {
+    if (!std::isfinite(fontSize) || fontSize <= 0.0f) return 12.0f;
+    return std::max(4.0f, std::min(fontSize, 160.0f));
+}
+
+static bool ParsePositiveFloatToken(const std::string& token, float* outValue) {
+    if (!outValue || token.empty()) return false;
+    std::istringstream stream(token);
+    float parsed = 0.0f;
+    stream >> parsed;
+    if (stream.fail() || !std::isfinite(parsed) || parsed <= 0.0f) return false;
+    *outValue = parsed;
+    return true;
+}
+
+static std::vector<std::string> SplitPdfAppearanceTokens(const std::string& value) {
+    std::vector<std::string> tokens;
+    std::istringstream stream(value);
+    std::string token;
+    while (stream >> token) {
+        tokens.push_back(token);
+    }
+    return tokens;
+}
+
+static float ParseFreeTextFontSizeFromAppearanceString(const std::string& defaultAppearance) {
+    const std::vector<std::string> tokens = SplitPdfAppearanceTokens(defaultAppearance);
+    for (size_t index = 0; index < tokens.size(); index++) {
+        if (tokens[index] != "Tf" || index < 1) continue;
+        float fontSize = 0.0f;
+        if (ParsePositiveFloatToken(tokens[index - 1], &fontSize)) {
+            return fontSize;
+        }
+    }
+    return 0.0f;
+}
+
+static std::string NormalizeFreeTextFontName(const std::string& fontToken) {
+    if (fontToken.empty()) return std::string();
+    std::string fontName = fontToken[0] == '/' ? fontToken.substr(1) : fontToken;
+    if (fontName.empty()) return std::string();
+    if (fontName == "Helv") return "Helvetica";
+    if (fontName == "Cour") return "Courier";
+    if (fontName == "TiRo") return "Times-Roman";
+    return fontName;
+}
+
+static std::string ParseFreeTextFontNameFromAppearanceString(const std::string& defaultAppearance) {
+    const std::vector<std::string> tokens = SplitPdfAppearanceTokens(defaultAppearance);
+    for (size_t index = 0; index < tokens.size(); index++) {
+        if (tokens[index] != "Tf" || index < 2) continue;
+        float ignoredFontSize = 0.0f;
+        if (!ParsePositiveFloatToken(tokens[index - 1], &ignoredFontSize)) continue;
+        const std::string fontName = NormalizeFreeTextFontName(tokens[index - 2]);
+        if (!fontName.empty()) return fontName;
+    }
+    return std::string();
+}
+
+static float ParseFreeTextFontSizeFromStyleString(const std::string& defaultStyle) {
+    size_t ptPosition = defaultStyle.find("pt");
+    while (ptPosition != std::string::npos) {
+        size_t numberEnd = ptPosition;
+        while (numberEnd > 0) {
+            const char ch = defaultStyle[numberEnd - 1];
+            if (ch != ' ' && ch != '\t' && ch != '\n' && ch != '\r') break;
+            numberEnd--;
+        }
+
+        size_t numberStart = numberEnd;
+        while (numberStart > 0) {
+            const char ch = defaultStyle[numberStart - 1];
+            if ((ch < '0' || ch > '9') && ch != '.') break;
+            numberStart--;
+        }
+
+        if (numberStart < numberEnd) {
+            float fontSize = 0.0f;
+            if (ParsePositiveFloatToken(defaultStyle.substr(numberStart, numberEnd - numberStart), &fontSize)) {
+                return fontSize;
+            }
+        }
+        ptPosition = defaultStyle.find("pt", ptPosition + 2);
+    }
+    return 0.0f;
+}
+
+static float ResolveFreeTextFontSize(FPDF_ANNOTATION annot) {
+    const std::string defaultAppearance = Utf16ToSimpleUtf8(ReadAnnotStringValueUtf16(annot, "DA"));
+    float fontSize = ParseFreeTextFontSizeFromAppearanceString(defaultAppearance);
+    if (fontSize > 0.0f) return ClampFreeTextFontSize(fontSize);
+
+    const std::string defaultStyle = Utf16ToSimpleUtf8(ReadAnnotStringValueUtf16(annot, "DS"));
+    fontSize = ParseFreeTextFontSizeFromStyleString(defaultStyle);
+    if (fontSize > 0.0f) return ClampFreeTextFontSize(fontSize);
+
+    const int objectCount = FPDFAnnot_GetObjectCount(annot);
+    for (int objectIndex = 0; objectIndex < objectCount; objectIndex++) {
+        FPDF_PAGEOBJECT pageObject = FPDFAnnot_GetObject(annot, objectIndex);
+        if (!pageObject || FPDFPageObj_GetType(pageObject) != FPDF_PAGEOBJ_TEXT) continue;
+
+        fontSize = 0.0f;
+        FPDFTextObj_GetFontSize(pageObject, &fontSize);
+        if (fontSize > 0.0f) return ClampFreeTextFontSize(fontSize);
+    }
+
+    return 12.0f;
+}
+
+static std::string ResolveFreeTextFontName(FPDF_ANNOTATION annot) {
+    const std::string defaultAppearance = Utf16ToSimpleUtf8(ReadAnnotStringValueUtf16(annot, "DA"));
+    const std::string fontName = ParseFreeTextFontNameFromAppearanceString(defaultAppearance);
+    return fontName.empty() ? "Helvetica" : fontName;
+}
+
+static std::u16string BuildFreeTextAppearanceStream(
+        const FS_RECTF& rect,
+        const std::u16string& text,
+        const char* fontResourceName,
+        float fontSize,
+        int r,
+        int g,
+        int b,
+        int bgR,
+        int bgG,
+        int bgB,
+        int bgA
+) {
+    const float width = rect.right - rect.left;
+    const float height = rect.top - rect.bottom;
+    if (width <= 0.1f || height <= 0.1f || text.empty()) return std::u16string();
+
+    const float resolvedFontSize = std::max(4.0f, fontSize > 0.0f ? fontSize : 12.0f);
+    const float padding = std::max(2.0f, std::min(width, height) * 0.08f);
+    const float lineHeight = resolvedFontSize * 1.20f;
+    const float maxTextWidth = std::max(1.0f, width - (padding * 2.0f));
+    const std::vector<WrappedFreeTextLine> wrappedLines = WrapFreeTextAppearanceText(
+            text,
+            maxTextWidth,
+            resolvedFontSize
+    );
+
+    const int lineCount = static_cast<int>(wrappedLines.size());
+    const float ascent = resolvedFontSize * 0.72f;
+    const float descent = resolvedFontSize * 0.21f;
+    const float textBlockHeight = ascent + descent + ((lineCount - 1) * lineHeight);
+    float baselineY = rect.bottom +
+                      (std::max(0.0f, height - textBlockHeight) * 0.5f) +
+                      ((lineCount - 1) * lineHeight) +
+                      descent;
+    baselineY = std::min(baselineY, rect.top - padding - ascent);
+    const float minY = rect.bottom + padding;
+
+    const float red = std::max(0.0f, std::min(r / 255.0f, 1.0f));
+    const float green = std::max(0.0f, std::min(g / 255.0f, 1.0f));
+    const float blue = std::max(0.0f, std::min(b / 255.0f, 1.0f));
+
+    std::ostringstream stream;
+    stream.setf(std::ios::fixed);
+    stream << std::setprecision(3);
+
+    if (bgA > 0) {
+        const float bgRed = std::max(0.0f, std::min(bgR / 255.0f, 1.0f));
+        const float bgGreen = std::max(0.0f, std::min(bgG / 255.0f, 1.0f));
+        const float bgBlue = std::max(0.0f, std::min(bgB / 255.0f, 1.0f));
+        stream << "q " << bgRed << ' ' << bgGreen << ' ' << bgBlue << " rg "
+               << rect.left << ' ' << rect.bottom << ' ' << width << ' ' << height << " re f Q ";
+    }
+
+    stream << "q BT /" << (fontResourceName ? fontResourceName : "Helv") << ' ' << resolvedFontSize << " Tf "
+           << red << ' ' << green << ' ' << blue << " rg ";
+
+    for (const WrappedFreeTextLine& line : wrappedLines) {
+        if (baselineY < minY) break;
+        const float estimatedLineWidth = EstimateFreeTextLineWidth(line.text, resolvedFontSize);
+        const float textX = !line.alignLeft && estimatedLineWidth < maxTextWidth
+                            ? rect.left + ((width - estimatedLineWidth) * 0.5f)
+                            : rect.left + padding;
+        stream << "1 0 0 1 " << textX << ' ' << baselineY << " Tm (";
+        AppendPdfEscapedLiteralText(stream, line.text);
+        stream << ") Tj ";
+
+        baselineY -= lineHeight;
+    }
+
+    stream << "ET Q";
     return AsciiToUtf16(stream.str());
 }
 
@@ -2185,6 +2547,104 @@ static void processTextStamp(JNIEnv* env, jobject obj, FPDF_DOCUMENT doc, FPDF_P
     env->ReleaseStringUTFChars(jAlign, alignStr);
     if (fontPath) env->ReleaseStringUTFChars(jFontPath, fontPath);
     env->DeleteLocalRef(json);
+}
+
+// --- HELPER 2B: REAL FREE TEXT ANNOTATION LOGIC ---
+static void processFreeText(JNIEnv* env, jobject obj, FPDF_DOCUMENT doc, FPDF_ANNOTATION annot, FS_RECTF rect, jfieldID textPropsField, int r, int g, int b, int alpha, jclass jsonClass, jmethodID jsonInit) {
+    (void)doc;
+    jstring jJsonStr = (jstring)env->GetObjectField(obj, textPropsField);
+    if (!jJsonStr) return;
+
+    jobject json = env->NewObject(jsonClass, jsonInit, jJsonStr);
+    if (!json) {
+        env->DeleteLocalRef(jJsonStr);
+        return;
+    }
+
+    jmethodID optS = env->GetMethodID(jsonClass, "optString", "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;");
+    jmethodID optD = env->GetMethodID(jsonClass, "optDouble", "(Ljava/lang/String;D)D");
+    jmethodID optI = env->GetMethodID(jsonClass, "optInt", "(Ljava/lang/String;I)I");
+
+    jstring textKey = env->NewStringUTF("text");
+    jstring fallbackText = env->NewStringUTF("");
+    jstring jText = (jstring)env->CallObjectMethod(json, optS, textKey, fallbackText);
+    env->DeleteLocalRef(textKey);
+    env->DeleteLocalRef(fallbackText);
+
+    jstring fontKey = env->NewStringUTF("font");
+    jstring fallbackFont = env->NewStringUTF("Helvetica");
+    jstring jFont = (jstring)env->CallObjectMethod(json, optS, fontKey, fallbackFont);
+    env->DeleteLocalRef(fontKey);
+    env->DeleteLocalRef(fallbackFont);
+
+    const char* appearanceFont = "Helv";
+
+    auto optIntValue = [&](const char* key, int fallback) -> int {
+        jstring jKey = env->NewStringUTF(key);
+        const int value = env->CallIntMethod(json, optI, jKey, fallback);
+        env->DeleteLocalRef(jKey);
+        return value;
+    };
+    const int textR = optIntValue("textColorR", r);
+    const int textG = optIntValue("textColorG", g);
+    const int textB = optIntValue("textColorB", b);
+    const int bgR = optIntValue("backgroundColorR", optIntValue("bgColorR", 255));
+    const int bgG = optIntValue("backgroundColorG", optIntValue("bgColorG", 255));
+    const int bgB = optIntValue("backgroundColorB", optIntValue("bgColorB", 255));
+    const int bgA = optIntValue("backgroundColorA", optIntValue("bgColorA", 0));
+
+    jstring sizeKey = env->NewStringUTF("size");
+    const double fontSizeValue = env->CallDoubleMethod(json, optD, sizeKey, 12.0);
+    env->DeleteLocalRef(sizeKey);
+    const float fontSize = static_cast<float>(fontSizeValue > 0.0 ? fontSizeValue : 12.0);
+
+    FPDFAnnot_SetRect(annot, &rect);
+    std::ostringstream defaultAppearance;
+    defaultAppearance << "/" << appearanceFont << " " << fontSize << " Tf "
+                      << (textR / 255.0f) << " "
+                      << (textG / 255.0f) << " "
+                      << (textB / 255.0f) << " rg";
+    SetAnnotAsciiStringValue(annot, "DA", defaultAppearance.str().c_str());
+
+    char defaultStyle[128];
+    snprintf(defaultStyle, sizeof(defaultStyle), "font: Helvetica %.2fpt; color:#%02X%02X%02X", fontSize, textR, textG, textB);
+    SetAnnotAsciiStringValue(annot, "DS", defaultStyle);
+
+    FPDFAnnot_SetBorder(annot, 0, 0, 0);
+    if (jText) {
+        SetAnnotWideStringValueFromJString(env, annot, "Contents", jText);
+    }
+    SetAnnotWideStringValueFromJString(env, annot, "LufickFreeTextMeta", jJsonStr);
+
+    if (jText && env->GetStringLength(jText) > 0) {
+        const std::u16string text = JStringToUtf16(env, jText);
+        const std::u16string appearanceStream = BuildFreeTextAppearanceStream(
+                rect,
+                text,
+                appearanceFont,
+                fontSize,
+                textR,
+                textG,
+                textB,
+                bgR,
+                bgG,
+                bgB,
+                bgA
+        );
+        if (!appearanceStream.empty()) {
+            FPDFAnnot_SetAP(
+                    annot,
+                    FPDF_ANNOT_APPEARANCEMODE_NORMAL,
+                    reinterpret_cast<FPDF_WIDESTRING>(appearanceStream.c_str())
+            );
+        }
+    }
+
+    FPDFAnnot_SetFlags(annot, FPDF_ANNOT_FLAG_PRINT);
+    if (jFont) env->DeleteLocalRef(jFont);
+    if (jText) env->DeleteLocalRef(jText);
+    env->DeleteLocalRef(json);
+    env->DeleteLocalRef(jJsonStr);
 }
 
 static bool processImageStamp(
@@ -3663,6 +4123,7 @@ static bool ApplyNativeAnnotationEditActions(
                                   (typeInt == 8) ? FPDF_ANNOT_SQUIGGLY :
                                   (typeInt == 3) ? FPDF_ANNOT_LINK :
                                   (typeInt == 10) ? FPDF_ANNOT_TEXT :
+                                  (typeInt == 11) ? FPDF_ANNOT_FREETEXT :
                                   (typeInt == 4 || typeInt == 7) ? FPDF_ANNOT_SQUARE :
                                   FPDF_ANNOT_HIGHLIGHT;
                     FPDF_ANNOTATION annot = FPDFPage_CreateAnnot(page, (typeInt == 5 || typeInt == 9) ? FPDF_ANNOT_STAMP : pdfType);
@@ -3675,6 +4136,7 @@ static bool ApplyNativeAnnotationEditActions(
                         }
                         else if (typeInt == 10) processStickyNoteComment(env, obj, annot, textPropsField, r, g, b, alpha, jsonClass, jsonInit);
                         else if (typeInt == 5) processTextStamp(env, obj, doc, page, annot, rect, textPropsField, r, g, b, alpha, jsonClass, jsonInit);
+                        else if (typeInt == 11) processFreeText(env, obj, doc, annot, rect, textPropsField, r, g, b, alpha, jsonClass, jsonInit);
                         else if (typeInt == 9) processImageStamp(env, obj, doc, page, annot, rect, imagePropsField, jsonClass, jsonInit);
                         else if (typeInt == 7) {
                             processRegionHighlight(env, obj, page, annot, rect, r, g, b, alpha);
@@ -3897,6 +4359,7 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeSaveAnnotat
                               (typeInt == 8) ? FPDF_ANNOT_SQUIGGLY :
                               (typeInt == 3) ? FPDF_ANNOT_LINK :
                               (typeInt == 10) ? FPDF_ANNOT_TEXT :
+                              (typeInt == 11) ? FPDF_ANNOT_FREETEXT :
                               (typeInt == 4 || typeInt == 7) ? FPDF_ANNOT_SQUARE :
                               FPDF_ANNOT_HIGHLIGHT;
 
@@ -3910,6 +4373,7 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeSaveAnnotat
                     }
                     else if (typeInt == 10) processStickyNoteComment(env, obj, annot, textPropsField, r, g, b, alpha, jsonClass, jsonInit);
                     else if (typeInt == 5) processTextStamp(env, obj, doc, currentPage, annot, rect, textPropsField, r, g, b, alpha, jsonClass, jsonInit);
+                    else if (typeInt == 11) processFreeText(env, obj, doc, annot, rect, textPropsField, r, g, b, alpha, jsonClass, jsonInit);
                     else if (typeInt == 9) processImageStamp(env, obj, doc, currentPage, annot, rect, imagePropsField, jsonClass, jsonInit);
                     else if (typeInt == 7) {
                         processRegionHighlight(env, obj, currentPage, annot, rect, r, g, b, alpha);
@@ -4197,6 +4661,10 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeGetAnnotati
             case FPDF_ANNOT_STRIKEOUT: type = 2; break;
             case FPDF_ANNOT_SQUIGGLY:  type = 8; break;
             case FPDF_ANNOT_LINK:      type = 3; break;
+            case FPDF_ANNOT_FREETEXT:
+                type = 11;
+                usesRectOnly = true;
+                break;
             case FPDF_ANNOT_TEXT:
                 type = 10;
                 usesRectOnly = true;
@@ -4292,6 +4760,32 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeGetAnnotati
 
         if (type == 10) {
             jTextProps = BuildStickyNoteCommentMetaJString(env, annot);
+        }
+
+        if (type == 11) {
+            jTextProps = ReadAnnotStringValueJString(env, annot, "LufickFreeTextMeta");
+            if (!jTextProps) {
+                FS_RECTF freeTextRect = {0, 0, 0, 0};
+                FPDFAnnot_GetRect(annot, &freeTextRect);
+                const std::u16string contents = ReadAnnotStringValueUtf16(annot, "Contents");
+                const std::string text = EscapeJsonString(Utf16ToSimpleUtf8(contents));
+                const std::string fontName = EscapeJsonString(ResolveFreeTextFontName(annot));
+                const float fontSize = ResolveFreeTextFontSize(annot);
+                std::ostringstream props;
+                props << "{"
+                      << "\"text\":\"" << text << "\","
+                      << "\"font\":\"" << fontName << "\","
+                      << "\"size\":" << fontSize << ","
+                      << "\"width\":" << fabs(freeTextRect.right - freeTextRect.left) << ","
+                      << "\"height\":" << fabs(freeTextRect.top - freeTextRect.bottom) << ","
+                      << "\"textColorR\":" << r << ","
+                      << "\"textColorG\":" << g << ","
+                      << "\"textColorB\":" << b << ","
+                      << "\"textColorA\":255"
+                      << "}";
+                jTextProps = env->NewStringUTF(props.str().c_str());
+            }
+            a = 255;
         }
 
         if (type == 6) {
