@@ -21,6 +21,7 @@ using namespace android;
 
 #include <fpdf_doc.h>
 #include <fpdf_annot.h>
+#include <fpdf_edit.h>
 #include <fpdfview.h>
 #include <fpdf_doc.h>
 #include <string>
@@ -28,6 +29,7 @@ using namespace android;
 #include <vector>
 #include <map>
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <functional>
 #include <iomanip>
@@ -186,6 +188,155 @@ void rgbBitmapTo565(void *source, int sourceStride, void *dest, AndroidBitmapInf
     }
 }
 
+static int getBlock(void *param, unsigned long position, unsigned char *outBuffer,
+                    unsigned long size);
+
+static jobject DecodeBitmapFile(JNIEnv* env, const char* imagePath) {
+    if (!env || !imagePath || strlen(imagePath) == 0) return nullptr;
+
+    jclass bitmapFactoryClass = env->FindClass("android/graphics/BitmapFactory");
+    if (!bitmapFactoryClass) return nullptr;
+
+    jmethodID decodeFileMethod = env->GetStaticMethodID(
+            bitmapFactoryClass,
+            "decodeFile",
+            "(Ljava/lang/String;)Landroid/graphics/Bitmap;"
+    );
+    if (!decodeFileMethod) {
+        env->DeleteLocalRef(bitmapFactoryClass);
+        return nullptr;
+    }
+
+    jstring jPath = env->NewStringUTF(imagePath);
+    jobject bitmap = env->CallStaticObjectMethod(bitmapFactoryClass, decodeFileMethod, jPath);
+    env->DeleteLocalRef(jPath);
+    env->DeleteLocalRef(bitmapFactoryClass);
+
+    if (env->ExceptionCheck()) {
+        env->ExceptionClear();
+        if (bitmap) env->DeleteLocalRef(bitmap);
+        return nullptr;
+    }
+    return bitmap;
+}
+
+FPDF_BITMAP ConvertToFPDFBitmap(JNIEnv *env, jobject bitmap) {
+    if (!env || !bitmap) return nullptr;
+
+    AndroidBitmapInfo info;
+    if (AndroidBitmap_getInfo(env, bitmap, &info) != ANDROID_BITMAP_RESULT_SUCCESS) {
+        return nullptr;
+    }
+    if (info.width <= 0 || info.height <= 0) {
+        return nullptr;
+    }
+
+    void* pixels = nullptr;
+    if (AndroidBitmap_lockPixels(env, bitmap, &pixels) != ANDROID_BITMAP_RESULT_SUCCESS || !pixels) {
+        return nullptr;
+    }
+
+    FPDF_BITMAP pdfBitmap = FPDFBitmap_Create(info.width, info.height, 1);
+    if (!pdfBitmap) {
+        AndroidBitmap_unlockPixels(env, bitmap);
+        return nullptr;
+    }
+
+    auto* dstBase = static_cast<uint8_t*>(FPDFBitmap_GetBuffer(pdfBitmap));
+    const int dstStride = FPDFBitmap_GetStride(pdfBitmap);
+    if (!dstBase || dstStride <= 0) {
+        FPDFBitmap_Destroy(pdfBitmap);
+        AndroidBitmap_unlockPixels(env, bitmap);
+        return nullptr;
+    }
+
+    switch (info.format) {
+        case ANDROID_BITMAP_FORMAT_RGBA_8888: {
+            for (uint32_t y = 0; y < info.height; ++y) {
+                const auto* srcLine = static_cast<const uint8_t*>(pixels) + (y * info.stride);
+                auto* dstLine = dstBase + (y * dstStride);
+                for (uint32_t x = 0; x < info.width; ++x) {
+                    const uint8_t* srcPixel = srcLine + (x * 4);
+                    uint8_t* dstPixel = dstLine + (x * 4);
+                    dstPixel[0] = srcPixel[2];
+                    dstPixel[1] = srcPixel[1];
+                    dstPixel[2] = srcPixel[0];
+                    dstPixel[3] = srcPixel[3];
+                }
+            }
+            break;
+        }
+        case ANDROID_BITMAP_FORMAT_RGB_565: {
+            for (uint32_t y = 0; y < info.height; ++y) {
+                const auto* srcLine = reinterpret_cast<const uint16_t*>(
+                        static_cast<const uint8_t*>(pixels) + (y * info.stride)
+                );
+                auto* dstLine = dstBase + (y * dstStride);
+                for (uint32_t x = 0; x < info.width; ++x) {
+                    const uint16_t pixel = srcLine[x];
+                    const uint8_t red = static_cast<uint8_t>(((pixel >> 11) & 0x1F) * 255 / 31);
+                    const uint8_t green = static_cast<uint8_t>(((pixel >> 5) & 0x3F) * 255 / 63);
+                    const uint8_t blue = static_cast<uint8_t>((pixel & 0x1F) * 255 / 31);
+                    uint8_t* dstPixel = dstLine + (x * 4);
+                    dstPixel[0] = blue;
+                    dstPixel[1] = green;
+                    dstPixel[2] = red;
+                    dstPixel[3] = 255;
+                }
+            }
+            break;
+        }
+        default:
+            FPDFBitmap_Destroy(pdfBitmap);
+            AndroidBitmap_unlockPixels(env, bitmap);
+            return nullptr;
+    }
+
+    AndroidBitmap_unlockPixels(env, bitmap);
+    return pdfBitmap;
+}
+
+static bool LoadJpegFileIntoImageObject(const char* imagePath, FPDF_PAGEOBJECT imageObj) {
+    if (!imagePath || !imageObj) return false;
+
+    const int imageFd = open(imagePath, O_RDONLY);
+    if (imageFd < 0) {
+        return false;
+    }
+
+    const size_t fileLength = static_cast<size_t>(getFileSize(imageFd));
+    if (fileLength == 0) {
+        close(imageFd);
+        return false;
+    }
+
+    FPDF_FILEACCESS loader;
+    loader.m_FileLen = fileLength;
+    loader.m_Param = reinterpret_cast<void*>(intptr_t(imageFd));
+    loader.m_GetBlock = &getBlock;
+
+    const bool loaded = FPDFImageObj_LoadJpegFileInline(nullptr, 0, imageObj, &loader);
+    close(imageFd);
+    return loaded;
+}
+
+static bool LoadBitmapFileIntoImageObject(JNIEnv* env, const char* imagePath, FPDF_PAGEOBJECT imageObj) {
+    if (!env || !imagePath || !imageObj) return false;
+
+    jobject bitmap = DecodeBitmapFile(env, imagePath);
+    if (!bitmap) return false;
+
+    FPDF_BITMAP pdfBitmap = ConvertToFPDFBitmap(env, bitmap);
+    env->DeleteLocalRef(bitmap);
+    if (!pdfBitmap) {
+        return false;
+    }
+
+    const bool loaded = FPDFImageObj_SetBitmap(nullptr, 0, imageObj, pdfBitmap);
+    FPDFBitmap_Destroy(pdfBitmap);
+    return loaded;
+}
+
 extern "C" { //For JNI support
 
 static int getBlock(void *param, unsigned long position, unsigned char *outBuffer,
@@ -260,6 +411,110 @@ static std::string EscapeJsonString(const std::string& input) {
         }
     }
     return output;
+}
+
+static jstring AppendSignatureSubtypeToPropsJson(
+        JNIEnv* env,
+        jstring props,
+        const std::u16string& signatureSubtype
+) {
+    if (!env || !props || signatureSubtype.empty()) {
+        return props;
+    }
+
+    const char* propsChars = env->GetStringUTFChars(props, nullptr);
+    if (!propsChars) {
+        return props;
+    }
+
+    std::string propsJson(propsChars);
+    env->ReleaseStringUTFChars(props, propsChars);
+
+    if (propsJson.find("\"signatureSubType\"") != std::string::npos) {
+        return props;
+    }
+
+    const size_t openBrace = propsJson.find('{');
+    const size_t closeBrace = propsJson.find_last_of('}');
+    if (openBrace == std::string::npos ||
+        closeBrace == std::string::npos ||
+        closeBrace <= openBrace) {
+        return props;
+    }
+
+    bool hasExistingPairs = false;
+    for (size_t index = openBrace + 1; index < closeBrace; index++) {
+        if (!std::isspace(static_cast<unsigned char>(propsJson[index]))) {
+            hasExistingPairs = true;
+            break;
+        }
+    }
+
+    std::string updatedJson = propsJson.substr(0, closeBrace);
+    if (hasExistingPairs) {
+        updatedJson += ",";
+    }
+    updatedJson += "\"signatureSubType\":\"";
+    updatedJson += EscapeJsonString(Utf16ToSimpleUtf8(signatureSubtype));
+    updatedJson += "\"";
+    updatedJson += propsJson.substr(closeBrace);
+
+    jstring updatedProps = env->NewStringUTF(updatedJson.c_str());
+    if (!updatedProps) {
+        return props;
+    }
+
+    env->DeleteLocalRef(props);
+    return updatedProps;
+}
+
+static jstring AppendSignImageFlagToPropsJson(JNIEnv* env, jstring props) {
+    if (!env || !props) {
+        return props;
+    }
+
+    const char* propsChars = env->GetStringUTFChars(props, nullptr);
+    if (!propsChars) {
+        return props;
+    }
+
+    std::string propsJson(propsChars);
+    env->ReleaseStringUTFChars(props, propsChars);
+
+    if (propsJson.find("\"signImage\"") != std::string::npos) {
+        return props;
+    }
+
+    const size_t openBrace = propsJson.find('{');
+    const size_t closeBrace = propsJson.find_last_of('}');
+    if (openBrace == std::string::npos ||
+        closeBrace == std::string::npos ||
+        closeBrace <= openBrace) {
+        return props;
+    }
+
+    bool hasExistingPairs = false;
+    for (size_t index = openBrace + 1; index < closeBrace; index++) {
+        if (!std::isspace(static_cast<unsigned char>(propsJson[index]))) {
+            hasExistingPairs = true;
+            break;
+        }
+    }
+
+    std::string updatedJson = propsJson.substr(0, closeBrace);
+    if (hasExistingPairs) {
+        updatedJson += ",";
+    }
+    updatedJson += "\"signImage\":true";
+    updatedJson += propsJson.substr(closeBrace);
+
+    jstring updatedProps = env->NewStringUTF(updatedJson.c_str());
+    if (!updatedProps) {
+        return props;
+    }
+
+    env->DeleteLocalRef(props);
+    return updatedProps;
 }
 
 // once per document (store somewhere):
@@ -2394,6 +2649,7 @@ static void processTextStamp(JNIEnv* env, jobject obj, FPDF_DOCUMENT doc, FPDF_P
     jmethodID getB = env->GetMethodID(jsonClass, "getBoolean", "(Ljava/lang/String;)Z");
     jmethodID getI = env->GetMethodID(jsonClass, "getInt", "(Ljava/lang/String;)I");
     jmethodID optI = env->GetMethodID(jsonClass, "optInt", "(Ljava/lang/String;I)I");
+    jmethodID optS = env->GetMethodID(jsonClass, "optString", "(Ljava/lang/String;)Ljava/lang/String;");
 
     jstring jText = (jstring)env->CallObjectMethod(json, getS, env->NewStringUTF("text"));
     jstring jFont = (jstring)env->CallObjectMethod(json, getS, env->NewStringUTF("font"));
@@ -2539,7 +2795,15 @@ static void processTextStamp(JNIEnv* env, jobject obj, FPDF_DOCUMENT doc, FPDF_P
     }
     const jchar* rawJsonContent = env->GetStringChars(jJsonStr, nullptr);
     FPDFAnnot_SetStringValue(annot, "Contents", (FPDF_WIDESTRING)rawJsonContent);
+    SetAnnotWideStringValueFromJString(env, annot, "LufickTextStampMeta", jJsonStr);
     SetAnnotAsciiStringValue(annot, "LufickStampKind", "text");
+    jstring jSignatureSubtypeKey = env->NewStringUTF("signatureSubType");
+    jstring jSignatureSubtype = (jstring)env->CallObjectMethod(json, optS, jSignatureSubtypeKey);
+    if (jSignatureSubtype && env->GetStringLength(jSignatureSubtype) > 0) {
+        SetAnnotWideStringValueFromJString(env, annot, "LufickSignatureSubtype", jSignatureSubtype);
+    }
+    if (jSignatureSubtype) env->DeleteLocalRef(jSignatureSubtype);
+    env->DeleteLocalRef(jSignatureSubtypeKey);
     env->ReleaseStringChars(jJsonStr, rawJsonContent);
     FPDFAnnot_SetFlags(annot, FPDF_ANNOT_FLAG_PRINT | FPDF_ANNOT_FLAG_READONLY);
     env->ReleaseStringChars(jText, (const jchar*)textContent);
@@ -2670,11 +2934,39 @@ static bool processImageStamp(
     jmethodID optS = env->GetMethodID(jsonClass, "optString", "(Ljava/lang/String;)Ljava/lang/String;");
     jmethodID optD = env->GetMethodID(jsonClass, "optDouble", "(Ljava/lang/String;D)D");
 
-    jstring jImagePath = (jstring)env->CallObjectMethod(json, optS, env->NewStringUTF("flattenedAssetPath"));
+    jstring jImagePathKey = env->NewStringUTF("flattenedAssetPath");
+    jstring jStampKindKey = env->NewStringUTF("stampKind");
+    jstring jAssetFormatKey = env->NewStringUTF("assetFormat");
+    jstring jSignatureSubtypeKey = env->NewStringUTF("signatureSubType");
+    jstring jImagePath = (jstring)env->CallObjectMethod(json, optS, jImagePathKey);
+    jstring jStampKind = (jstring)env->CallObjectMethod(json, optS, jStampKindKey);
+    jstring jAssetFormat = (jstring)env->CallObjectMethod(json, optS, jAssetFormatKey);
+    jstring jSignatureSubtype = (jstring)env->CallObjectMethod(json, optS, jSignatureSubtypeKey);
+    env->DeleteLocalRef(jImagePathKey);
+    env->DeleteLocalRef(jStampKindKey);
+    env->DeleteLocalRef(jAssetFormatKey);
+    env->DeleteLocalRef(jSignatureSubtypeKey);
+
     const char* imagePath = jImagePath ? env->GetStringUTFChars(jImagePath, nullptr) : nullptr;
-    if (!imagePath || strlen(imagePath) == 0) {
+    const char* stampKind = jStampKind ? env->GetStringUTFChars(jStampKind, nullptr) : nullptr;
+    const char* assetFormat = jAssetFormat ? env->GetStringUTFChars(jAssetFormat, nullptr) : nullptr;
+    const std::string resolvedStampKind =
+            (stampKind && strlen(stampKind) > 0) ? stampKind : "image";
+    const std::string resolvedAssetFormat =
+            (assetFormat && strlen(assetFormat) > 0) ? assetFormat : "";
+
+    auto releaseJsonStrings = [&]() {
+        if (assetFormat) env->ReleaseStringUTFChars(jAssetFormat, assetFormat);
+        if (jAssetFormat) env->DeleteLocalRef(jAssetFormat);
+        if (stampKind) env->ReleaseStringUTFChars(jStampKind, stampKind);
+        if (jStampKind) env->DeleteLocalRef(jStampKind);
         if (imagePath) env->ReleaseStringUTFChars(jImagePath, imagePath);
         if (jImagePath) env->DeleteLocalRef(jImagePath);
+    };
+
+    if (!imagePath || strlen(imagePath) == 0) {
+        releaseJsonStrings();
+        if (jSignatureSubtype) env->DeleteLocalRef(jSignatureSubtype);
         env->DeleteLocalRef(json);
         env->DeleteLocalRef(jJsonStr);
         return false;
@@ -2692,47 +2984,45 @@ static bool processImageStamp(
     env->DeleteLocalRef(jBaseWidthKey);
     env->DeleteLocalRef(jBaseHeightKey);
 
-    const int imageFd = open(imagePath, O_RDONLY);
-    if (imageFd < 0) {
-        env->ReleaseStringUTFChars(jImagePath, imagePath);
-        env->DeleteLocalRef(jImagePath);
-        env->DeleteLocalRef(json);
-        env->DeleteLocalRef(jJsonStr);
-        return false;
-    }
-
-    const size_t fileLength = (size_t)getFileSize(imageFd);
-    if (fileLength == 0) {
-        close(imageFd);
-        env->ReleaseStringUTFChars(jImagePath, imagePath);
-        env->DeleteLocalRef(jImagePath);
-        env->DeleteLocalRef(json);
-        env->DeleteLocalRef(jJsonStr);
-        return false;
-    }
-
     FPDF_PAGEOBJECT imageObj = FPDFPageObj_NewImageObj(doc);
     if (!imageObj) {
-        close(imageFd);
-        env->ReleaseStringUTFChars(jImagePath, imagePath);
-        env->DeleteLocalRef(jImagePath);
+        releaseJsonStrings();
+        if (jSignatureSubtype) env->DeleteLocalRef(jSignatureSubtype);
         env->DeleteLocalRef(json);
         env->DeleteLocalRef(jJsonStr);
         return false;
     }
 
-    FPDF_FILEACCESS loader;
-    loader.m_FileLen = fileLength;
-    loader.m_Param = reinterpret_cast<void*>(intptr_t(imageFd));
-    loader.m_GetBlock = &getBlock;
+    auto endsWith = [](const std::string& value, const std::string& suffix) {
+        return value.size() >= suffix.size() &&
+               value.compare(value.size() - suffix.size(), suffix.size(), suffix) == 0;
+    };
+    auto toLowerAscii = [](std::string value) {
+        std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
+            return static_cast<char>(std::tolower(c));
+        });
+        return value;
+    };
 
-    const bool loaded = FPDFImageObj_LoadJpegFileInline(nullptr, 0, imageObj, &loader);
-    close(imageFd);
-    env->ReleaseStringUTFChars(jImagePath, imagePath);
-    env->DeleteLocalRef(jImagePath);
+    const std::string normalizedAssetFormat = toLowerAscii(resolvedAssetFormat);
+    const std::string normalizedPath = toLowerAscii(imagePath);
+    bool preferJpegInline =
+            normalizedAssetFormat == "jpg" ||
+            normalizedAssetFormat == "jpeg";
+    if (!preferJpegInline && normalizedAssetFormat.empty()) {
+        preferJpegInline =
+                endsWith(normalizedPath, ".jpg") ||
+                endsWith(normalizedPath, ".jpeg");
+    }
+
+    const bool loaded = preferJpegInline
+                        ? LoadJpegFileIntoImageObject(imagePath, imageObj)
+                        : LoadBitmapFileIntoImageObject(env, imagePath, imageObj);
+    releaseJsonStrings();
 
     if (!loaded) {
         FPDFPageObj_Destroy(imageObj);
+        if (jSignatureSubtype) env->DeleteLocalRef(jSignatureSubtype);
         env->DeleteLocalRef(json);
         env->DeleteLocalRef(jJsonStr);
         return false;
@@ -2763,6 +3053,7 @@ static bool processImageStamp(
     FPDFImageObj_SetMatrix(imageObj, a, b, c, d, e, f);
     if (!FPDFAnnot_AppendObject(annot, imageObj)) {
         FPDFPageObj_Destroy(imageObj);
+        if (jSignatureSubtype) env->DeleteLocalRef(jSignatureSubtype);
         env->DeleteLocalRef(json);
         env->DeleteLocalRef(jJsonStr);
         return false;
@@ -2771,9 +3062,16 @@ static bool processImageStamp(
     FPDFAnnot_UpdateObject(annot, imageObj);
     const jchar* rawJsonContent = env->GetStringChars(jJsonStr, nullptr);
     FPDFAnnot_SetStringValue(annot, "LufickImageMeta", (FPDF_WIDESTRING)rawJsonContent);
-    SetAnnotAsciiStringValue(annot, "LufickStampKind", "image");
+    SetAnnotAsciiStringValue(annot, "LufickStampKind", resolvedStampKind.c_str());
+    if (jSignatureSubtype && env->GetStringLength(jSignatureSubtype) > 0) {
+        SetAnnotWideStringValueFromJString(env, annot, "LufickSignatureSubtype", jSignatureSubtype);
+        if (JStringToUtf16(env, jSignatureSubtype) == u"Sign_Image") {
+            SetAnnotAsciiStringValue(annot, "LufickSignImage", "1");
+        }
+    }
     env->ReleaseStringChars(jJsonStr, rawJsonContent);
     FPDFAnnot_SetFlags(annot, FPDF_ANNOT_FLAG_PRINT | FPDF_ANNOT_FLAG_READONLY);
+    if (jSignatureSubtype) env->DeleteLocalRef(jSignatureSubtype);
     env->DeleteLocalRef(json);
     env->DeleteLocalRef(jJsonStr);
     return true;
@@ -2795,6 +3093,7 @@ static void processFreeHand(JNIEnv* env, jobject obj, FPDF_PAGE page, jfieldID f
     jmethodID optA = env->GetMethodID(jsonClass, "optJSONArray", "(Ljava/lang/String;)Lorg/json/JSONArray;");
     jmethodID optI = env->GetMethodID(jsonClass, "optInt", "(Ljava/lang/String;I)I");
     jmethodID optD = env->GetMethodID(jsonClass, "optDouble", "(Ljava/lang/String;D)D");
+    jmethodID optS = env->GetMethodID(jsonClass, "optString", "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;");
 
     jstring jModeKey = env->NewStringUTF("mode");
     jstring jPointsKey = env->NewStringUTF("points");
@@ -2807,8 +3106,13 @@ static void processFreeHand(JNIEnv* env, jobject obj, FPDF_PAGE page, jfieldID f
     jstring jXKey = env->NewStringUTF("x");
     jstring jYKey = env->NewStringUTF("y");
     jstring jCloseKey = env->NewStringUTF("close");
+    jstring jSignatureSubtypeKey = env->NewStringUTF("signatureSubType");
+    jstring jEmptyValue = env->NewStringUTF("");
 
     jstring jMode = (jstring)env->CallObjectMethod(json, getS, jModeKey);
+    jstring jSignatureSubtype = optS
+            ? (jstring)env->CallObjectMethod(json, optS, jSignatureSubtypeKey, jEmptyValue)
+            : nullptr;
     const char* modeStr = jMode ? env->GetStringUTFChars(jMode, nullptr) : "BRUSH_PENS";
 
     jclass arrayClass = env->FindClass("org/json/JSONArray");
@@ -2902,6 +3206,9 @@ static void processFreeHand(JNIEnv* env, jobject obj, FPDF_PAGE page, jfieldID f
             return;
         }
 
+        if (jSignatureSubtype && env->GetStringLength(jSignatureSubtype) > 0) {
+            SetAnnotWideStringValueFromJString(env, annot, "LufickSignatureSubtype", jSignatureSubtype);
+        }
         FPDFAnnot_SetFlags(annot, FPDF_ANNOT_FLAG_PRINT);
         FPDFPage_CloseAnnot(annot);
     };
@@ -3096,6 +3403,9 @@ static void processFreeHand(JNIEnv* env, jobject obj, FPDF_PAGE page, jfieldID f
     env->DeleteLocalRef(jXKey);
     env->DeleteLocalRef(jYKey);
     env->DeleteLocalRef(jCloseKey);
+    if (jSignatureSubtype) env->DeleteLocalRef(jSignatureSubtype);
+    env->DeleteLocalRef(jSignatureSubtypeKey);
+    env->DeleteLocalRef(jEmptyValue);
     env->DeleteLocalRef(json);
     env->DeleteLocalRef(jJsonStr);
 }
@@ -3967,18 +4277,8 @@ static bool ApplyNativeAnnotationEditActions(
             }
         }
 
-        auto removalsIt = removalMap.find(pageIndex);
-        if (removalsIt != removalMap.end()) {
-            auto ids = removalsIt->second;
-            std::sort(ids.begin(), ids.end(), std::greater<int>());
-            ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
-            for (int annotIndex : ids) {
-                if (annotIndex >= 0 && annotIndex < FPDFPage_GetAnnotCount(page)) {
-                    FPDFPage_RemoveAnnot(page, annotIndex);
-                }
-            }
-        }
-
+        std::vector<FreehandRemovalTarget> residualObjectRemovalTargets;
+        std::vector<int> annotBackedFreehandRemovalIds;
         auto objectRemovalsIt = objectRemovalMap.find(pageIndex);
         if (objectRemovalsIt != objectRemovalMap.end()) {
             auto targets = objectRemovalsIt->second;
@@ -3988,7 +4288,42 @@ static bool ApplyNativeAnnotationEditActions(
             targets.erase(std::unique(targets.begin(), targets.end(), [](const FreehandRemovalTarget& first, const FreehandRemovalTarget& second) {
                 return first.objectIndex == second.objectIndex;
             }), targets.end());
+
             for (const auto& target : targets) {
+                bool isAnnotBackedInk = false;
+                if (target.objectIndex >= 0 && target.objectIndex < FPDFPage_GetAnnotCount(page)) {
+                    FPDF_ANNOTATION annot = FPDFPage_GetAnnot(page, target.objectIndex);
+                    if (annot) {
+                        isAnnotBackedInk = FPDFAnnot_GetSubtype(annot) == FPDF_ANNOT_INK;
+                        FPDFPage_CloseAnnot(annot);
+                    }
+                }
+
+                if (isAnnotBackedInk) {
+                    annotBackedFreehandRemovalIds.push_back(target.objectIndex);
+                } else {
+                    residualObjectRemovalTargets.push_back(target);
+                }
+            }
+        }
+
+        auto removalsIt = removalMap.find(pageIndex);
+        if (removalsIt != removalMap.end() || !annotBackedFreehandRemovalIds.empty()) {
+            std::vector<int> ids = removalsIt != removalMap.end()
+                    ? removalsIt->second
+                    : std::vector<int>();
+            ids.insert(ids.end(), annotBackedFreehandRemovalIds.begin(), annotBackedFreehandRemovalIds.end());
+            std::sort(ids.begin(), ids.end(), std::greater<int>());
+            ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+            for (int annotIndex : ids) {
+                if (annotIndex >= 0 && annotIndex < FPDFPage_GetAnnotCount(page)) {
+                    FPDFPage_RemoveAnnot(page, annotIndex);
+                }
+            }
+        }
+
+        if (!residualObjectRemovalTargets.empty()) {
+            for (const auto& target : residualObjectRemovalTargets) {
                 bool removed = false;
                 const float targetLeft = fmin(target.left, target.right);
                 const float targetRight = fmax(target.left, target.right);
@@ -4000,31 +4335,9 @@ static bool ApplyNativeAnnotationEditActions(
                     if (annot) {
                         const int subtype = FPDFAnnot_GetSubtype(annot);
                         if (subtype == FPDF_ANNOT_INK) {
-                            unsigned int annotR = 0, annotG = 0, annotB = 0, annotA = 255;
-                            FPDFAnnot_GetColor(annot, FPDFANNOT_COLORTYPE_Color, &annotR, &annotG, &annotB, &annotA);
-
-                            FS_RECTF annotRect = {0.0f, 0.0f, 0.0f, 0.0f};
-                            const bool hasRect = FPDFAnnot_GetRect(annot, &annotRect);
-                            const float annotLeft = fmin(annotRect.left, annotRect.right);
-                            const float annotRight = fmax(annotRect.left, annotRect.right);
-                            const float annotBottom = fmin(annotRect.bottom, annotRect.top);
-                            const float annotTop = fmax(annotRect.bottom, annotRect.top);
-                            const float overlapLeft = fmax(targetLeft, annotLeft);
-                            const float overlapBottom = fmax(targetBottom, annotBottom);
-                            const float overlapRight = fmin(targetRight, annotRight);
-                            const float overlapTop = fmin(targetTop, annotTop);
-                            const bool rectMatches = hasRect && overlapRight > overlapLeft && overlapTop > overlapBottom;
-                            const bool colorMatches =
-                                    static_cast<int>(annotR) == target.r &&
-                                    static_cast<int>(annotG) == target.g &&
-                                    static_cast<int>(annotB) == target.b;
-                            if (rectMatches || colorMatches) {
-                                FPDFPage_CloseAnnot(annot);
-                                if (FPDFPage_RemoveAnnot(page, target.objectIndex)) {
-                                    removed = true;
-                                }
-                            } else {
-                                FPDFPage_CloseAnnot(annot);
+                            FPDFPage_CloseAnnot(annot);
+                            if (FPDFPage_RemoveAnnot(page, target.objectIndex)) {
+                                removed = true;
                             }
                         } else {
                             FPDFPage_CloseAnnot(annot);
@@ -4745,16 +5058,30 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeGetAnnotati
         jstring jStoredMarkupRects = nullptr;
         std::ostringstream markupRectsStream;
         bool hasMarkupRects = false;
+        const std::u16string signatureSubtype = ReadAnnotStringValueUtf16(annot, "LufickSignatureSubtype");
+        const std::u16string signImageMarker = ReadAnnotStringValueUtf16(annot, "LufickSignImage");
+        const bool isSignImage =
+                !signImageMarker.empty() &&
+                signImageMarker != u"0" &&
+                signImageMarker != u"false" &&
+                signImageMarker != u"FALSE";
 
         if (type == 5) {
             const std::u16string stampKind = ReadAnnotStringValueUtf16(annot, "LufickStampKind");
-            if (stampKind == u"image") {
+            if (stampKind == u"image" || stampKind == u"signature") {
                 type = 9;
                 r = 0;
                 g = 0;
                 b = 0;
                 a = 0;
                 jImageProps = ReadAnnotStringValueJString(env, annot, "LufickImageMeta");
+                jImageProps = AppendSignatureSubtypeToPropsJson(env, jImageProps, signatureSubtype);
+                if (isSignImage) {
+                    if (signatureSubtype.empty()) {
+                        jImageProps = AppendSignatureSubtypeToPropsJson(env, jImageProps, u"Sign_Image");
+                    }
+                    jImageProps = AppendSignImageFlagToPropsJson(env, jImageProps);
+                }
             }
         }
 
@@ -4816,6 +5143,7 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeGetAnnotati
             const float deviceTop = static_cast<float>(std::min(dTop, dBottom));
             const float deviceBottom = static_cast<float>(std::max(dTop, dBottom));
             jstring jFhProps = env->NewStringUTF(freehandProps.c_str());
+            jFhProps = AppendSignatureSubtypeToPropsJson(env, jFhProps, signatureSubtype);
 
             jobject annotObj = env->NewObject(
                     annotClass,
@@ -4847,6 +5175,8 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeGetAnnotati
         }
 
         if (type == 5) {
+            jTextProps = ReadAnnotStringValueJString(env, annot, "LufickTextStampMeta");
+
             auto escapeJson = [](const std::string& input) {
                 std::string output;
                 output.reserve(input.size() + 8);
@@ -4866,23 +5196,25 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeGetAnnotati
             const int annotObjectCount = FPDFAnnot_GetObjectCount(annot);
             FS_RECTF stampRect = {0, 0, 0, 0};
             FPDFAnnot_GetRect(annot, &stampRect);
-            const unsigned long contentsLength = FPDFAnnot_GetStringValue(annot, "Contents", nullptr, 0);
-            if (contentsLength > sizeof(FPDF_WCHAR)) {
-                std::vector<FPDF_WCHAR> contentsBuffer(contentsLength / sizeof(FPDF_WCHAR));
-                FPDFAnnot_GetStringValue(annot, "Contents", contentsBuffer.data(), contentsLength);
-                const int contentCharCount = static_cast<int>(contentsBuffer.size()) - 1;
-                if (contentCharCount > 0) {
-                    std::u16string contentValue(
-                            reinterpret_cast<const char16_t*>(contentsBuffer.data()),
-                            contentCharCount
-                    );
-                    std::string utf8Content;
-                    utf8Content.reserve(contentValue.size());
-                    for (char16_t ch : contentValue) {
-                        utf8Content.push_back(ch <= 0x7F ? static_cast<char>(ch) : '?');
-                    }
-                    if (!utf8Content.empty()) {
-                        jTextProps = env->NewStringUTF(utf8Content.c_str());
+            if (!jTextProps) {
+                const unsigned long contentsLength = FPDFAnnot_GetStringValue(annot, "Contents", nullptr, 0);
+                if (contentsLength > sizeof(FPDF_WCHAR)) {
+                    std::vector<FPDF_WCHAR> contentsBuffer(contentsLength / sizeof(FPDF_WCHAR));
+                    FPDFAnnot_GetStringValue(annot, "Contents", contentsBuffer.data(), contentsLength);
+                    const int contentCharCount = static_cast<int>(contentsBuffer.size()) - 1;
+                    if (contentCharCount > 0) {
+                        std::u16string contentValue(
+                                reinterpret_cast<const char16_t*>(contentsBuffer.data()),
+                                contentCharCount
+                        );
+                        std::string utf8Content;
+                        utf8Content.reserve(contentValue.size());
+                        for (char16_t ch : contentValue) {
+                            utf8Content.push_back(ch <= 0x7F ? static_cast<char>(ch) : '?');
+                        }
+                        if (!utf8Content.empty()) {
+                            jTextProps = env->NewStringUTF(utf8Content.c_str());
+                        }
                     }
                 }
             }
@@ -4951,6 +5283,7 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeGetAnnotati
                 jTextProps = env->NewStringUTF(props.str().c_str());
                 break;
             }
+            jTextProps = AppendSignatureSubtypeToPropsJson(env, jTextProps, signatureSubtype);
         }
 
 //        const unsigned long markupMetaLength = FPDFAnnot_GetStringValue(annot, "LufickMarkupMeta", nullptr, 0);
