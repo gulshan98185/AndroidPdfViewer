@@ -1149,27 +1149,33 @@ public class PDFView extends RelativeLayout {
         if (selectionPaintView != null) {
             try {
                 if (hasSelection) {
-                    int pageStart = selPageSt;
-                    int pageCount = selPageEd - pageStart;
+                    if (dragPinchManager == null) {
+                        return null;
+                    }
+                    int pageStart = Math.min(selPageSt, selPageEd);
+                    int pageEnd = Math.max(selPageSt, selPageEd);
+                    int pageCount = pageEnd - pageStart;
                     if (pageCount == 0) {
-                        dragPinchManager.prepareText();
-                        int newSelEnd = selEnd;
-                        if (selEnd > dragPinchManager.allText.length())
-                            newSelEnd = dragPinchManager.allText.length();
-                        return dragPinchManager.allText.substring(selStart, newSelEnd);
+                        dragPinchManager.prepareText(pageStart);
+                        return safeSubstring(dragPinchManager.allText, selStart, selEnd);
                     }
                     StringBuilder sb = new StringBuilder();
                     int selCount = 0;
                     for (int i = 0; i <= pageCount; i++) {
 
-                        dragPinchManager.prepareText();
-                        int len = dragPinchManager.allText.length();
-                        selCount += i == 0 ? len - selStart : i == pageCount ? selEnd : len;
+                        dragPinchManager.prepareText(pageStart + i);
+                        int len = dragPinchManager.allText == null ? 0 : dragPinchManager.allText.length();
+                        int start = i == 0 ? clamp(selStart, len) : 0;
+                        int end = i == pageCount ? clamp(selEnd, len) : len;
+                        selCount += Math.max(0, end - start);
                     }
                     sb.ensureCapacity(selCount + 64);
                     for (int i = 0; i <= pageCount; i++) {
 
-                        sb.append(dragPinchManager.allText.substring(i == 0 ? selStart : 0, i == pageCount ? selEnd : dragPinchManager.allText.length()));
+                        dragPinchManager.prepareText(pageStart + i);
+                        sb.append(safeSubstring(dragPinchManager.allText,
+                                i == 0 ? selStart : 0,
+                                i == pageCount ? selEnd : dragPinchManager.allText == null ? 0 : dragPinchManager.allText.length()));
                     }
                     return sb.toString();
                 }
@@ -1179,6 +1185,24 @@ public class PDFView extends RelativeLayout {
             }
         }
         return null;
+    }
+
+    private static String safeSubstring(String text, int start, int end) {
+        if (text == null || text.length() == 0) {
+            return "";
+        }
+        int safeStart = clamp(start, text.length());
+        int safeEnd = clamp(end, text.length());
+        if (safeStart > safeEnd) {
+            int temp = safeStart;
+            safeStart = safeEnd;
+            safeEnd = temp;
+        }
+        return text.substring(safeStart, safeEnd);
+    }
+
+    private static int clamp(int value, int max) {
+        return Math.max(0, Math.min(value, max));
     }
 
     public String selectAllText() throws Exception {
