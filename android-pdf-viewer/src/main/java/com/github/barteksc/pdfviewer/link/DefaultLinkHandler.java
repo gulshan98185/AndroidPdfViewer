@@ -46,12 +46,20 @@ public class DefaultLinkHandler implements LinkHandler {
 
     private void handleUri(String uri) {
         Uri parsedUri = Uri.parse(uri);
+        if ("file".equalsIgnoreCase(parsedUri.getScheme())) {
+            Log.w(TAG, "Blocked unsafe file URI: " + uri);
+            return;
+        }
         Intent intent = new Intent(Intent.ACTION_VIEW, parsedUri);
         Context context = pdfView.getContext();
-        if (intent.resolveActivity(context.getPackageManager()) != null) {
-            context.startActivity(intent);
-        } else {
-            Log.w(TAG, "No activity found for URI: " + uri);
+        try {
+            if (intent.resolveActivity(context.getPackageManager()) != null) {
+                context.startActivity(intent);
+            } else {
+                Log.w(TAG, "No activity found for URI: " + uri);
+            }
+        } catch (RuntimeException e) {
+            Log.w(TAG, "Unable to open URI: " + uri, e);
         }
     }
 
