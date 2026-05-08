@@ -105,10 +105,10 @@ class DragPinchManager implements GestureDetector.OnGestureListener, GestureDete
         } else {
             onTapHandled = pdfView.callbacks.callOnTap(e);
         }
-        if(pdfView.pdfFile == null){
+        if (pdfView.pdfFile == null) {
             return true;
         }
-        boolean linkTapped = checkLinkTapped(e.getX(), e.getY());
+        boolean linkTapped = !isPdfRendering() && checkLinkTapped(e.getX(), e.getY());
         if (!onTapHandled && !linkTapped) {
             ScrollHandle ps = pdfView.getScrollHandle();
             if (ps != null && !pdfView.documentFitsView()) {
@@ -180,7 +180,7 @@ class DragPinchManager implements GestureDetector.OnGestureListener, GestureDete
                     ,  curX , curY , 10, 10);
 
         }*/
-        }catch (Exception e){
+        } catch (Exception e) {
             return -1;
         }
         return -1;
@@ -368,6 +368,15 @@ class DragPinchManager implements GestureDetector.OnGestureListener, GestureDete
         return false;
     }
 
+    private boolean isPdfRendering() {
+        try {
+            return pdfView.renderingHandler != null && pdfView.renderingHandler.isRendering();
+        } catch (Exception e) {
+            Log.e("PDFView", "isPdfRendering: ", e);
+        }
+        return false;
+    }
+
     public long prepareText() {
         float mappedX = -pdfView.getCurrentXOffset() + lastX;
         float mappedY = -pdfView.getCurrentYOffset() + lastY;
@@ -421,7 +430,7 @@ class DragPinchManager implements GestureDetector.OnGestureListener, GestureDete
                 }
             }
             return pdfView.pdfFile.pdfDocument.mNativeTextPtr.get(page);
-        }catch (Exception e){
+        } catch (Exception e) {
             return 0L;
         }
     }
@@ -490,10 +499,10 @@ class DragPinchManager implements GestureDetector.OnGestureListener, GestureDete
 
     @Override
     public boolean onScroll(MotionEvent e1, MotionEvent e2, float distanceX, float distanceY) {
-        if(pdfView.startInDrag){
+        if (pdfView.startInDrag) {
             if (pdfView.hideView != null)
                 pdfView.hideView.setVisibility(View.GONE);
-        }else{
+        } else {
             if (pdfView.hideView != null)
                 pdfView.hideView.setVisibility(View.VISIBLE);
         }

@@ -47,6 +47,7 @@ class RenderingHandler extends Handler {
     private Rect roundedRenderBounds = new Rect();
     private Matrix renderMatrix = new Matrix();
     private boolean running = false;
+    private volatile boolean rendering = false;
 
     RenderingHandler(Looper looper, PDFView pdfView) {
         super(looper);
@@ -106,7 +107,12 @@ class RenderingHandler extends Handler {
         }
         calculateBounds(w, h, renderingTask.bounds);
 
-        pdfFile.renderPageBitmap(render, renderingTask.page, roundedRenderBounds, renderingTask.annotationRendering);
+        rendering = true;
+        try {
+            pdfFile.renderPageBitmap(render, renderingTask.page, roundedRenderBounds, renderingTask.annotationRendering);
+        } finally {
+            rendering = false;
+        }
 
         return new PagePart(renderingTask.page, render,
                 renderingTask.bounds, renderingTask.thumbnail,
@@ -131,6 +137,9 @@ class RenderingHandler extends Handler {
         running = true;
     }
 
+    boolean isRendering() {
+        return rendering;
+    }
     private class RenderingTask {
 
         float width, height;
