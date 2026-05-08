@@ -331,6 +331,7 @@ public class PDFView extends RelativeLayout {
      * False if bitmap should be compressed by using RGB_565 format and take less memory
      */
     private boolean bestQuality = false;
+    private volatile boolean searchingPdfium = false;
 
     /**
      * True if annotations should be rendered
@@ -866,15 +867,21 @@ public class PDFView extends RelativeLayout {
 
     public SearchRecord findPageCached(String key, int pageIdx, int flag) {
 
-
-        long tid = dragPinchManager.loadText(pageIdx);
-        if (tid == -1) {
-            return null;
+        searchingPdfium = true;
+        try {
+            long tid = dragPinchManager.loadText(pageIdx);
+            if (tid == -1) {
+                return null;
+            }
+            int foundIdx = pdfiumCore.findTextPage(tid, key, flag);
+            return foundIdx == -1 ? null : new SearchRecord(pageIdx, foundIdx);
+        } finally {
+            searchingPdfium = false;
         }
-        int foundIdx = pdfiumCore.findTextPage(tid, key, flag);
-        SearchRecord ret = foundIdx == -1 ? null : new SearchRecord(pageIdx, foundIdx);
+    }
 
-        return ret;
+    boolean isSearchingPdfium() {
+        return searchingPdfium;
     }
 
     public void setNightMode(boolean nightMode) {

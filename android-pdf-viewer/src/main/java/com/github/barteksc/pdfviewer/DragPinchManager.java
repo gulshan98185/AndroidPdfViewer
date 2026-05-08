@@ -108,7 +108,7 @@ class DragPinchManager implements GestureDetector.OnGestureListener, GestureDete
         if (pdfView.pdfFile == null) {
             return true;
         }
-        boolean linkTapped = !isPdfRendering() && checkLinkTapped(e.getX(), e.getY());
+        boolean linkTapped = !isPdfiumBusy() && checkLinkTapped(e.getX(), e.getY());
         if (!onTapHandled && !linkTapped) {
             ScrollHandle ps = pdfView.getScrollHandle();
             if (ps != null && !pdfView.documentFitsView()) {
@@ -368,11 +368,11 @@ class DragPinchManager implements GestureDetector.OnGestureListener, GestureDete
         return false;
     }
 
-    private boolean isPdfRendering() {
+    private boolean isPdfiumBusy() {
         try {
-            return pdfView.renderingHandler != null && pdfView.renderingHandler.isRendering();
+            return pdfView.isSearchingPdfium() || (pdfView.renderingHandler != null && pdfView.renderingHandler.isRendering());
         } catch (Exception e) {
-            Log.e("PDFView", "isPdfRendering: ", e);
+            Log.e("PDFView", "isPdfiumBusy: ", e);
         }
         return false;
     }
