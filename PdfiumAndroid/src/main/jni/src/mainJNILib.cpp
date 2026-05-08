@@ -30,9 +30,11 @@ using namespace android;
 #include <map>
 #include <algorithm>
 #include <cctype>
+#include <cstdlib>
 #include <cmath>
 #include <functional>
 #include <iomanip>
+#include <fstream>
 #include <fpdf_text.h>
 
 static Mutex sLibraryLock;
@@ -1912,6 +1914,7 @@ static void processStickyNoteComment(JNIEnv* env, jobject obj, FPDF_ANNOTATION a
 static void processTextStamp(JNIEnv* env, jobject obj, FPDF_DOCUMENT doc, FPDF_PAGE page, FPDF_ANNOTATION annot, FS_RECTF rect, jfieldID textPropsField, int r, int g, int b, int alpha, jclass jsonClass, jmethodID jsonInit);
 static void processFreeText(JNIEnv* env, jobject obj, FPDF_DOCUMENT doc, FPDF_ANNOTATION annot, FS_RECTF rect, jfieldID textPropsField, int r, int g, int b, int alpha, jclass jsonClass, jmethodID jsonInit);
 static bool processImageStamp(JNIEnv* env, jobject obj, FPDF_DOCUMENT doc, FPDF_PAGE page, FPDF_ANNOTATION annot, FS_RECTF rect, jfieldID imagePropsField, jclass jsonClass, jmethodID jsonInit);
+static bool processPdfShape(JNIEnv* env, jobject obj, FPDF_ANNOTATION annot, FS_RECTF rect, int typeInt, jfieldID shapePropsField, int r, int g, int b, int alpha, jclass jsonClass, jmethodID jsonInit);
 static void processFreeHand(JNIEnv* env, jobject obj, FPDF_PAGE page, jfieldID fhDrawingProperties, int r, int g, int b, jclass jsonClass, jmethodID jsonInit);
 
 // helper for sticky note (to tell the native the name of the icon we want to set on the icon on note instead of default)
@@ -2070,6 +2073,1435 @@ static void AppendPdfRoundedRectPath(
     stream << left << ' ' << (top - clampedRadius + control) << ' '
            << (left + clampedRadius - control) << ' ' << top << ' '
            << (left + clampedRadius) << ' ' << top << " c ";
+}
+
+static void AppendPdfEllipsePath(
+        std::ostringstream& stream,
+        float cx,
+        float cy,
+        float rx,
+        float ry
+) {
+    const float kappa = 0.5522847498f;
+    const float controlX = rx * kappa;
+    const float controlY = ry * kappa;
+    stream << (cx + rx) << ' ' << cy << " m ";
+    stream << (cx + rx) << ' ' << (cy + controlY) << ' '
+           << (cx + controlX) << ' ' << (cy + ry) << ' '
+           << cx << ' ' << (cy + ry) << " c ";
+    stream << (cx - controlX) << ' ' << (cy + ry) << ' '
+           << (cx - rx) << ' ' << (cy + controlY) << ' '
+           << (cx - rx) << ' ' << cy << " c ";
+    stream << (cx - rx) << ' ' << (cy - controlY) << ' '
+           << (cx - controlX) << ' ' << (cy - ry) << ' '
+           << cx << ' ' << (cy - ry) << " c ";
+    stream << (cx + controlX) << ' ' << (cy - ry) << ' '
+           << (cx + rx) << ' ' << (cy - controlY) << ' '
+           << (cx + rx) << ' ' << cy << " c ";
+}
+
+static bool IsPdfShapeNativeType(int typeInt) {
+    return typeInt >= 12 && typeInt <= 18;
+}
+
+static int GetPdfShapeAnnotationSubtype(int typeInt) {
+    switch (typeInt) {
+        case 14:
+            return FPDF_ANNOT_CIRCLE;
+        case 15:
+            return FPDF_ANNOT_POLYGON;
+        case 16:
+            return FPDF_ANNOT_POLYLINE;
+        case 17:
+        case 18:
+            return FPDF_ANNOT_LINE;
+        case 12:
+        case 13:
+        default:
+            return FPDF_ANNOT_SQUARE;
+    }
+}
+
+static bool NeedsSavedPdfShapeDictionaryPatch(int typeInt) {
+    return typeInt == 15 || typeInt == 16 || typeInt == 17 || typeInt == 18;
+}
+
+static bool IsDirectNativePdfBoxShape(int typeInt) {
+    return typeInt == 12 || typeInt == 13 || typeInt == 14;
+}
+
+static int GetPdfShapeCreationSubtype(int typeInt) {
+    // This PDFium build exposes line/polygon/polyline constants and readers,
+    // but its public CreateAnnot API only creates a smaller subtype set. Create
+    // these as a supported temporary annotation and patch the saved dictionary
+    // to the real native subtype after PDFium writes the file.
+    if (typeInt == 17 || typeInt == 18) {
+        return FPDF_ANNOT_SQUARE;
+    }
+    return NeedsSavedPdfShapeDictionaryPatch(typeInt)
+           ? FPDF_ANNOT_HIGHLIGHT
+           : GetPdfShapeAnnotationSubtype(typeInt);
+}
+
+static FPDF_ANNOTATION CreatePdfShapeAnnotation(FPDF_PAGE page, int typeInt) {
+    if (!page || !IsPdfShapeNativeType(typeInt)) return nullptr;
+
+    FPDF_ANNOTATION annot = FPDFPage_CreateAnnot(page, GetPdfShapeAnnotationSubtype(typeInt));
+    if (annot) return annot;
+
+    if (NeedsSavedPdfShapeDictionaryPatch(typeInt)) {
+        return FPDFPage_CreateAnnot(page, GetPdfShapeCreationSubtype(typeInt));
+    }
+    return nullptr;
+}
+
+static const char* GetPdfShapePatchMarkerKey(int typeInt) {
+    switch (typeInt) {
+        case 15: return "LufickPdfShapePatchPolygon";
+        case 16: return "LufickPdfShapePatchPolyLine";
+        case 17: return "LufickPdfShapePatchLine";
+        case 18: return "LufickPdfShapePatchArrowLine";
+        default: return "LufickPdfShapePatchUnknown";
+    }
+}
+
+static const char* GetPdfBoxShapePatchMarkerKey(int typeInt) {
+    switch (typeInt) {
+        case 12: return "LufickPdfBoxShapePatchRectangle";
+        case 13: return "LufickPdfBoxShapePatchSquare";
+        case 14: return "LufickPdfBoxShapePatchCircle";
+        default: return "LufickPdfBoxShapePatchUnknown";
+    }
+}
+
+static const char* GetPdfShapeName(int typeInt) {
+    switch (typeInt) {
+        case 12: return "rectangle";
+        case 13: return "square";
+        case 14: return "circle";
+        case 15: return "polygon";
+        case 16: return "polyline";
+        case 17: return "line";
+        case 18: return "arrow_line";
+        default: return "rectangle";
+    }
+}
+
+static int GetPdfShapeTypeFromMeta(const std::string& meta, int fallbackType) {
+    if (meta.find("\"shapeType\":\"arrow_line\"") != std::string::npos ||
+        meta.find("\"shapeType\": \"arrow_line\"") != std::string::npos) {
+        return 18;
+    }
+    if (meta.find("\"shapeType\":\"line\"") != std::string::npos ||
+        meta.find("\"shapeType\": \"line\"") != std::string::npos) {
+        return 17;
+    }
+    if (meta.find("\"shapeType\":\"polyline\"") != std::string::npos ||
+        meta.find("\"shapeType\": \"polyline\"") != std::string::npos) {
+        return 16;
+    }
+    if (meta.find("\"shapeType\":\"polygon\"") != std::string::npos ||
+        meta.find("\"shapeType\": \"polygon\"") != std::string::npos) {
+        return 15;
+    }
+    if (meta.find("\"shapeType\":\"circle\"") != std::string::npos ||
+        meta.find("\"shapeType\": \"circle\"") != std::string::npos) {
+        return 14;
+    }
+    if (meta.find("\"shapeType\":\"square\"") != std::string::npos ||
+        meta.find("\"shapeType\": \"square\"") != std::string::npos) {
+        return 13;
+    }
+    if (meta.find("\"shapeType\":\"rectangle\"") != std::string::npos ||
+        meta.find("\"shapeType\": \"rectangle\"") != std::string::npos) {
+        return 12;
+    }
+    return fallbackType;
+}
+
+struct PdfShapePoint {
+    float x;
+    float y;
+};
+
+static PdfShapePoint RotatePdfShapePoint(PdfShapePoint point, float centerX, float centerY, float rotationDegrees) {
+    if (fabs(rotationDegrees) < 0.001f) return point;
+    const double radians = rotationDegrees * M_PI / 180.0;
+    const double cosA = cos(radians);
+    const double sinA = sin(radians);
+    const float dx = point.x - centerX;
+    const float dy = point.y - centerY;
+    return {
+            centerX + static_cast<float>((dx * cosA) - (dy * sinA)),
+            centerY + static_cast<float>((dx * sinA) + (dy * cosA))
+    };
+}
+
+static PdfShapePoint PdfShapePointFromFraction(
+        const FS_RECTF& baseRect,
+        float fractionX,
+        float fractionFromTop,
+        float rotationDegrees
+) {
+    const float left = fmin(baseRect.left, baseRect.right);
+    const float right = fmax(baseRect.left, baseRect.right);
+    const float bottom = fmin(baseRect.bottom, baseRect.top);
+    const float top = fmax(baseRect.bottom, baseRect.top);
+    const float width = right - left;
+    const float height = top - bottom;
+    const float centerX = (left + right) * 0.5f;
+    const float centerY = (bottom + top) * 0.5f;
+    PdfShapePoint point{
+            left + (width * fractionX),
+            top - (height * fractionFromTop)
+    };
+    return RotatePdfShapePoint(point, centerX, centerY, rotationDegrees);
+}
+
+static void AppendPdfShapePaintOperator(
+        std::ostringstream& stream,
+        bool allowFill,
+        int fillAlpha,
+        int strokeAlpha,
+        float strokeWidth
+) {
+    const bool shouldFill = allowFill && fillAlpha > 0;
+    const bool shouldStroke = strokeAlpha > 0 && strokeWidth > 0.0f;
+    if (shouldFill && shouldStroke) {
+        stream << "B ";
+    } else if (shouldFill) {
+        stream << "f ";
+    } else if (shouldStroke) {
+        stream << "S ";
+    }
+}
+
+static bool ShouldUseCustomPdfShapeAppearanceStream(
+        int typeInt,
+        int strokeAlpha,
+        int fillAlpha,
+        float rotationDegrees
+) {
+    if (NeedsSavedPdfShapeDictionaryPatch(typeInt)) return true;
+    if (fabs(rotationDegrees) >= 0.001f) return true;
+    return strokeAlpha >= 255 && (fillAlpha == 0 || fillAlpha >= 255);
+}
+
+static bool AppendPdfShapeAppearanceObject(
+        FPDF_ANNOTATION annot,
+        int typeInt,
+        const FS_RECTF& baseRect,
+        float rotationDegrees,
+        int strokeR,
+        int strokeG,
+        int strokeB,
+        int strokeA,
+        int fillR,
+        int fillG,
+        int fillB,
+        int fillA,
+        float strokeWidth
+) {
+    if (!annot) return false;
+
+    const float effectiveStrokeWidth = fmax(strokeWidth, 0.0f);
+    const bool shouldStroke = strokeA > 0 && effectiveStrokeWidth > 0.0f;
+    const bool shouldFill = fillA > 0 && typeInt != 16 && typeInt != 17 && typeInt != 18;
+    if (!shouldStroke && !shouldFill) return false;
+
+    FPDF_PAGEOBJECT path = nullptr;
+    auto appendPoint = [&](PdfShapePoint point, bool first) {
+        if (first) {
+            FPDFPath_MoveTo(path, point.x, point.y);
+        } else {
+            FPDFPath_LineTo(path, point.x, point.y);
+        }
+    };
+
+    if (typeInt == 14) {
+        const int segmentCount = 32;
+        const PdfShapePoint start = PdfShapePointFromFraction(baseRect, 1.0f, 0.5f, rotationDegrees);
+        path = FPDFPageObj_CreateNewPath(start.x, start.y);
+        if (!path) return false;
+        for (int index = 1; index < segmentCount; index++) {
+            const double angle = (2.0 * M_PI * index) / segmentCount;
+            const float fx = 0.5f + static_cast<float>(cos(angle) * 0.5);
+            const float fy = 0.5f - static_cast<float>(sin(angle) * 0.5);
+            appendPoint(PdfShapePointFromFraction(baseRect, fx, fy, rotationDegrees), false);
+        }
+        FPDFPath_Close(path);
+    } else {
+        const PdfShapePoint topLeft = PdfShapePointFromFraction(baseRect, 0.0f, 0.0f, rotationDegrees);
+        path = FPDFPageObj_CreateNewPath(topLeft.x, topLeft.y);
+        if (!path) return false;
+        appendPoint(PdfShapePointFromFraction(baseRect, 1.0f, 0.0f, rotationDegrees), false);
+        appendPoint(PdfShapePointFromFraction(baseRect, 1.0f, 1.0f, rotationDegrees), false);
+        appendPoint(PdfShapePointFromFraction(baseRect, 0.0f, 1.0f, rotationDegrees), false);
+        FPDFPath_Close(path);
+    }
+
+    FPDFPageObj_SetStrokeWidth(path, effectiveStrokeWidth);
+    FPDFPageObj_SetLineJoin(path, FPDF_LINEJOIN_ROUND);
+    FPDFPageObj_SetLineCap(path, FPDF_LINECAP_ROUND);
+    FPDFPageObj_SetStrokeColor(path, strokeR, strokeG, strokeB, strokeA);
+    FPDFPageObj_SetFillColor(path, fillR, fillG, fillB, fillA);
+    FPDFPath_SetDrawMode(path, shouldFill ? 1 : 0, shouldStroke ? 1 : 0);
+
+    if (!FPDFAnnot_AppendObject(annot, path)) {
+        FPDFPageObj_Destroy(path);
+        return false;
+    }
+    FPDFAnnot_UpdateObject(annot, path);
+    return true;
+}
+
+static std::string BuildPdfShapeAppearanceStreamAscii(
+        int typeInt,
+        const FS_RECTF& baseRect,
+        float rotationDegrees,
+        int strokeR,
+        int strokeG,
+        int strokeB,
+        int strokeA,
+        int fillR,
+        int fillG,
+        int fillB,
+        int fillA,
+        float strokeWidth,
+        const char* graphicsStateName = nullptr
+) {
+    const float left = fmin(baseRect.left, baseRect.right);
+    const float right = fmax(baseRect.left, baseRect.right);
+    const float bottom = fmin(baseRect.bottom, baseRect.top);
+    const float top = fmax(baseRect.bottom, baseRect.top);
+    const float width = right - left;
+    const float height = top - bottom;
+    if (width <= 0.1f || height <= 0.1f) return std::string();
+
+    const float effectiveStrokeWidth = fmax(strokeWidth, 0.0f);
+    const float strokeRed = std::max(0.0f, std::min(strokeR / 255.0f, 1.0f));
+    const float strokeGreen = std::max(0.0f, std::min(strokeG / 255.0f, 1.0f));
+    const float strokeBlue = std::max(0.0f, std::min(strokeB / 255.0f, 1.0f));
+    const float fillRed = std::max(0.0f, std::min(fillR / 255.0f, 1.0f));
+    const float fillGreen = std::max(0.0f, std::min(fillG / 255.0f, 1.0f));
+    const float fillBlue = std::max(0.0f, std::min(fillB / 255.0f, 1.0f));
+
+    std::ostringstream stream;
+    stream.setf(std::ios::fixed);
+    stream << std::setprecision(3);
+    stream << "q ";
+    if (graphicsStateName && graphicsStateName[0] != '\0') {
+        stream << "/" << graphicsStateName << " gs ";
+    }
+    stream << "1 J 1 j " << effectiveStrokeWidth << " w "
+           << strokeRed << ' ' << strokeGreen << ' ' << strokeBlue << " RG "
+           << fillRed << ' ' << fillGreen << ' ' << fillBlue << " rg ";
+
+    const auto emitMove = [&](PdfShapePoint point) {
+        stream << point.x << ' ' << point.y << " m ";
+    };
+    const auto emitLine = [&](PdfShapePoint point) {
+        stream << point.x << ' ' << point.y << " l ";
+    };
+
+    if (typeInt == 17 || typeInt == 18) {
+        const PdfShapePoint start = PdfShapePointFromFraction(baseRect, 0.08f, 0.50f, rotationDegrees);
+        const PdfShapePoint end = PdfShapePointFromFraction(baseRect, 0.92f, 0.50f, rotationDegrees);
+        emitMove(start);
+        emitLine(end);
+        if (typeInt == 18) {
+            emitMove(PdfShapePointFromFraction(baseRect, 0.72f, 0.30f, rotationDegrees));
+            emitLine(end);
+            emitMove(PdfShapePointFromFraction(baseRect, 0.72f, 0.70f, rotationDegrees));
+            emitLine(end);
+        }
+        stream << "S ";
+    } else if (typeInt == 16) {
+        emitMove(PdfShapePointFromFraction(baseRect, 0.05f, 0.80f, rotationDegrees));
+        emitLine(PdfShapePointFromFraction(baseRect, 0.35f, 0.20f, rotationDegrees));
+        emitLine(PdfShapePointFromFraction(baseRect, 0.65f, 0.65f, rotationDegrees));
+        emitLine(PdfShapePointFromFraction(baseRect, 0.95f, 0.10f, rotationDegrees));
+        stream << "S ";
+    } else if (typeInt == 15) {
+        emitMove(PdfShapePointFromFraction(baseRect, 0.50f, 0.00f, rotationDegrees));
+        emitLine(PdfShapePointFromFraction(baseRect, 1.00f, 0.38f, rotationDegrees));
+        emitLine(PdfShapePointFromFraction(baseRect, 0.82f, 1.00f, rotationDegrees));
+        emitLine(PdfShapePointFromFraction(baseRect, 0.18f, 1.00f, rotationDegrees));
+        emitLine(PdfShapePointFromFraction(baseRect, 0.00f, 0.38f, rotationDegrees));
+        stream << "h ";
+        AppendPdfShapePaintOperator(stream, true, fillA, strokeA, effectiveStrokeWidth);
+    } else if (typeInt == 14) {
+        if (fabs(rotationDegrees) < 0.001f) {
+            AppendPdfEllipsePath(
+                    stream,
+                    (left + right) * 0.5f,
+                    (bottom + top) * 0.5f,
+                    width * 0.5f,
+                    height * 0.5f
+            );
+            AppendPdfShapePaintOperator(stream, true, fillA, strokeA, effectiveStrokeWidth);
+        } else {
+            const int segmentCount = 32;
+            for (int index = 0; index < segmentCount; index++) {
+                const double angle = (2.0 * M_PI * index) / segmentCount;
+                const float fx = 0.5f + static_cast<float>(cos(angle) * 0.5);
+                const float fy = 0.5f - static_cast<float>(sin(angle) * 0.5);
+                if (index == 0) {
+                    emitMove(PdfShapePointFromFraction(baseRect, fx, fy, rotationDegrees));
+                } else {
+                    emitLine(PdfShapePointFromFraction(baseRect, fx, fy, rotationDegrees));
+                }
+            }
+            stream << "h ";
+            AppendPdfShapePaintOperator(stream, true, fillA, strokeA, effectiveStrokeWidth);
+        }
+    } else {
+        emitMove(PdfShapePointFromFraction(baseRect, 0.00f, 0.00f, rotationDegrees));
+        emitLine(PdfShapePointFromFraction(baseRect, 1.00f, 0.00f, rotationDegrees));
+        emitLine(PdfShapePointFromFraction(baseRect, 1.00f, 1.00f, rotationDegrees));
+        emitLine(PdfShapePointFromFraction(baseRect, 0.00f, 1.00f, rotationDegrees));
+        stream << "h ";
+        AppendPdfShapePaintOperator(stream, true, fillA, strokeA, effectiveStrokeWidth);
+    }
+
+    stream << "Q";
+    return stream.str();
+}
+
+static std::u16string BuildPdfShapeAppearanceStream(
+        int typeInt,
+        const FS_RECTF& baseRect,
+        float rotationDegrees,
+        int strokeR,
+        int strokeG,
+        int strokeB,
+        int strokeA,
+        int fillR,
+        int fillG,
+        int fillB,
+        int fillA,
+        float strokeWidth
+) {
+    const std::string appearanceStream = BuildPdfShapeAppearanceStreamAscii(
+            typeInt,
+            baseRect,
+            rotationDegrees,
+            strokeR,
+            strokeG,
+            strokeB,
+            strokeA,
+            fillR,
+            fillG,
+            fillB,
+            fillA,
+            strokeWidth
+    );
+    return AsciiToUtf16(appearanceStream.c_str());
+}
+
+static bool IsPdfNameDelimiter(char ch) {
+    return std::isspace(static_cast<unsigned char>(ch)) ||
+           ch == '/' ||
+           ch == '<' ||
+           ch == '>' ||
+           ch == '[' ||
+           ch == ']' ||
+           ch == '(' ||
+           ch == ')';
+}
+
+static bool ParsePdfRectFromObject(
+        const std::string& objectText,
+        FS_RECTF* outRect
+) {
+    if (!outRect) return false;
+    const size_t rectKey = objectText.find("/Rect");
+    if (rectKey == std::string::npos) return false;
+    const size_t arrayStart = objectText.find('[', rectKey);
+    const size_t arrayEnd = objectText.find(']', arrayStart);
+    if (arrayStart == std::string::npos || arrayEnd == std::string::npos || arrayEnd <= arrayStart) {
+        return false;
+    }
+
+    const std::string numbers = objectText.substr(arrayStart + 1, arrayEnd - arrayStart - 1);
+    const char* cursor = numbers.c_str();
+    char* end = nullptr;
+    float values[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    for (int index = 0; index < 4; index++) {
+        values[index] = std::strtof(cursor, &end);
+        if (end == cursor) return false;
+        cursor = end;
+    }
+
+    outRect->left = values[0];
+    outRect->bottom = values[1];
+    outRect->right = values[2];
+    outRect->top = values[3];
+    return true;
+}
+
+static std::string FormatPdfFloat(float value) {
+    std::ostringstream stream;
+    stream.setf(std::ios::fixed);
+    stream << std::setprecision(3) << value;
+    std::string output = stream.str();
+    while (output.size() > 1 && output.back() == '0') {
+        output.pop_back();
+    }
+    if (!output.empty() && output.back() == '.') {
+        output.pop_back();
+    }
+    return output.empty() ? "0" : output;
+}
+
+static void AppendPdfPoint(std::ostringstream& stream, PdfShapePoint point) {
+    stream << FormatPdfFloat(point.x) << ' ' << FormatPdfFloat(point.y);
+}
+
+static float ParsePdfShapeBorderWidthFromObject(const std::string& objectText) {
+    const size_t bsKey = objectText.find("/BS");
+    if (bsKey != std::string::npos) {
+        const size_t bsEnd = objectText.find(">>", bsKey);
+        const size_t widthKey = objectText.find("/W", bsKey);
+        if (widthKey != std::string::npos && (bsEnd == std::string::npos || widthKey < bsEnd)) {
+            const char* cursor = objectText.c_str() + widthKey + 2;
+            char* end = nullptr;
+            const float width = std::strtof(cursor, &end);
+            if (end != cursor && width > 0.0f) {
+                return width;
+            }
+        }
+    }
+
+    const size_t borderKey = objectText.find("/Border");
+    if (borderKey != std::string::npos) {
+        const size_t arrayStart = objectText.find('[', borderKey);
+        const size_t arrayEnd = objectText.find(']', arrayStart);
+        if (arrayStart != std::string::npos && arrayEnd != std::string::npos && arrayEnd > arrayStart) {
+            const std::string numbers = objectText.substr(arrayStart + 1, arrayEnd - arrayStart - 1);
+            const char* cursor = numbers.c_str();
+            char* end = nullptr;
+            float values[3] = {0.0f, 0.0f, 1.0f};
+            for (int index = 0; index < 3; index++) {
+                values[index] = std::strtof(cursor, &end);
+                if (end == cursor) return 1.0f;
+                cursor = end;
+            }
+            if (values[2] > 0.0f) {
+                return values[2];
+            }
+        }
+    }
+
+    return 1.0f;
+}
+
+static float ParsePdfShapeOpacityFromMarker(
+        const std::string& objectText,
+        const std::string& marker
+) {
+    const size_t markerPos = objectText.find(marker);
+    if (markerPos == std::string::npos) return -1.0f;
+
+    size_t cursor = markerPos + marker.size();
+    int alpha = 0;
+    bool hasDigit = false;
+    while (cursor < objectText.size() &&
+           std::isdigit(static_cast<unsigned char>(objectText[cursor]))) {
+        hasDigit = true;
+        alpha = (alpha * 10) + (objectText[cursor] - '0');
+        cursor++;
+    }
+    if (!hasDigit) return -1.0f;
+    alpha = std::max(0, std::min(alpha, 255));
+    return alpha / 255.0f;
+}
+
+static float ParsePdfShapeOpacityFromObject(const std::string& objectText) {
+    return ParsePdfShapeOpacityFromMarker(objectText, "/LufickPdfShapeAlpha");
+}
+
+static float ParsePdfBoxShapeOpacityFromObject(const std::string& objectText) {
+    return ParsePdfShapeOpacityFromMarker(objectText, "/LufickPdfBoxShapeAlpha");
+}
+
+static void SetPdfShapeFloatMarker(FPDF_ANNOTATION annot, const char* prefix, float value) {
+    if (!annot || !prefix) return;
+    const long long scaled = static_cast<long long>(std::llround(value * 1000.0f));
+    const long long magnitude = scaled < 0 ? -scaled : scaled;
+    std::ostringstream marker;
+    marker << prefix << (scaled < 0 ? 'N' : 'P') << magnitude;
+    SetAnnotAsciiStringValue(annot, marker.str().c_str(), "1");
+}
+
+static bool ParsePdfShapeFloatMarker(
+        const std::string& objectText,
+        const std::string& marker,
+        float* outValue
+) {
+    if (!outValue) return false;
+    const size_t markerPos = objectText.find(marker);
+    if (markerPos == std::string::npos) return false;
+
+    size_t cursor = markerPos + marker.size();
+    if (cursor >= objectText.size()) return false;
+    const bool isNegative = objectText[cursor] == 'N';
+    if (!isNegative && objectText[cursor] != 'P') return false;
+    cursor++;
+
+    long long scaled = 0;
+    bool hasDigit = false;
+    while (cursor < objectText.size() &&
+           std::isdigit(static_cast<unsigned char>(objectText[cursor]))) {
+        hasDigit = true;
+        scaled = (scaled * 10) + (objectText[cursor] - '0');
+        cursor++;
+    }
+    if (!hasDigit) return false;
+    *outValue = (isNegative ? -1.0f : 1.0f) * (static_cast<float>(scaled) / 1000.0f);
+    return true;
+}
+
+static std::vector<PdfShapePoint> BuildNativePdfShapePatchPoints(
+        int typeInt,
+        const FS_RECTF& rect,
+        float rotationDegrees
+) {
+    if (typeInt == 15) {
+        return {
+                PdfShapePointFromFraction(rect, 0.50f, 0.00f, rotationDegrees),
+                PdfShapePointFromFraction(rect, 1.00f, 0.38f, rotationDegrees),
+                PdfShapePointFromFraction(rect, 0.82f, 1.00f, rotationDegrees),
+                PdfShapePointFromFraction(rect, 0.18f, 1.00f, rotationDegrees),
+                PdfShapePointFromFraction(rect, 0.00f, 0.38f, rotationDegrees)
+        };
+    }
+    if (typeInt == 16) {
+        return {
+                PdfShapePointFromFraction(rect, 0.05f, 0.80f, rotationDegrees),
+                PdfShapePointFromFraction(rect, 0.35f, 0.20f, rotationDegrees),
+                PdfShapePointFromFraction(rect, 0.65f, 0.65f, rotationDegrees),
+                PdfShapePointFromFraction(rect, 0.95f, 0.10f, rotationDegrees)
+        };
+    }
+    return {
+            PdfShapePointFromFraction(rect, 0.08f, 0.50f, rotationDegrees),
+            PdfShapePointFromFraction(rect, 0.92f, 0.50f, rotationDegrees)
+    };
+}
+
+static std::string BuildNativePdfShapeDictionaryPatch(
+        int typeInt,
+        const FS_RECTF& rect,
+        const std::string& objectText
+) {
+    float rotation = 0.0f;
+    ParsePdfShapeFloatMarker(objectText, "/LufickPdfShapeRotation", &rotation);
+
+    FS_RECTF pointRect = rect;
+    if (fabs(rotation) >= 0.001f) {
+        float left = rect.left;
+        float top = rect.top;
+        float right = rect.right;
+        float bottom = rect.bottom;
+        const bool hasBaseRect =
+                ParsePdfShapeFloatMarker(objectText, "/LufickPdfShapeBaseLeft", &left) &&
+                ParsePdfShapeFloatMarker(objectText, "/LufickPdfShapeBaseTop", &top) &&
+                ParsePdfShapeFloatMarker(objectText, "/LufickPdfShapeBaseRight", &right) &&
+                ParsePdfShapeFloatMarker(objectText, "/LufickPdfShapeBaseBottom", &bottom);
+        if (hasBaseRect) {
+            pointRect = {left, top, right, bottom};
+        }
+    }
+
+    const std::vector<PdfShapePoint> points = BuildNativePdfShapePatchPoints(
+            typeInt,
+            pointRect,
+            rotation
+    );
+    if (points.empty()) return std::string();
+
+    std::ostringstream patch;
+    patch.setf(std::ios::fixed);
+    patch << std::setprecision(3);
+    if (objectText.find("/BS") == std::string::npos) {
+        patch << "/BS << /W " << FormatPdfFloat(ParsePdfShapeBorderWidthFromObject(objectText)) << " /S /S >> ";
+    }
+    const float opacity = ParsePdfShapeOpacityFromObject(objectText);
+    if (opacity >= 0.0f) {
+        patch << "/CA " << FormatPdfFloat(opacity) << " ";
+    }
+
+    if (typeInt == 17) {
+        if (points.size() < 2) return std::string();
+        patch << "/L [";
+        AppendPdfPoint(patch, points[0]);
+        patch << ' ';
+        AppendPdfPoint(patch, points[1]);
+        patch << "] ";
+        return patch.str();
+    }
+
+    if (typeInt == 18) {
+        if (points.size() < 2) return std::string();
+        patch << "/L [";
+        AppendPdfPoint(patch, points[0]);
+        patch << ' ';
+        AppendPdfPoint(patch, points[1]);
+        patch << "] ";
+        patch << "/LE [/None /OpenArrow] ";
+        return patch.str();
+    }
+
+    patch << "/Vertices [";
+    for (size_t index = 0; index < points.size(); index++) {
+        if (index > 0) patch << ' ';
+        AppendPdfPoint(patch, points[index]);
+    }
+    patch << "] ";
+    return patch.str();
+}
+
+static bool ReplacePdfNameInRange(
+        std::string* data,
+        size_t objectStart,
+        size_t objectEnd,
+        const std::string& key,
+        const std::string& newName
+) {
+    if (!data || objectStart >= objectEnd || objectEnd > data->size()) return false;
+    const std::string keyToken = "/" + key;
+    const size_t keyPos = data->find(keyToken, objectStart);
+    if (keyPos == std::string::npos || keyPos >= objectEnd) return false;
+
+    size_t valueStart = keyPos + keyToken.size();
+    while (valueStart < objectEnd && std::isspace(static_cast<unsigned char>((*data)[valueStart]))) {
+        valueStart++;
+    }
+    if (valueStart >= objectEnd || (*data)[valueStart] != '/') return false;
+
+    size_t valueEnd = valueStart + 1;
+    while (valueEnd < objectEnd && !IsPdfNameDelimiter((*data)[valueEnd])) {
+        valueEnd++;
+    }
+
+    const size_t oldLength = valueEnd - valueStart;
+    if (newName.size() > oldLength) return false;
+    std::string replacement = newName;
+    replacement.append(oldLength - replacement.size(), ' ');
+    data->replace(valueStart, oldLength, replacement);
+    return true;
+}
+
+static bool FindPdfDictionaryValueSegment(
+        const std::string& data,
+        size_t objectStart,
+        size_t objectEnd,
+        const std::string& key,
+        size_t* outStart,
+        size_t* outEnd
+) {
+    const std::string keyToken = "/" + key;
+    const size_t keyPos = data.find(keyToken, objectStart);
+    if (keyPos == std::string::npos || keyPos >= objectEnd) return false;
+
+    size_t valueStart = keyPos + keyToken.size();
+    while (valueStart < objectEnd && std::isspace(static_cast<unsigned char>(data[valueStart]))) {
+        valueStart++;
+    }
+    if (valueStart >= objectEnd) return false;
+
+    size_t valueEnd = valueStart;
+    if (data[valueStart] == '<' && valueStart + 1 < objectEnd && data[valueStart + 1] != '<') {
+        valueEnd = data.find('>', valueStart + 1);
+        if (valueEnd == std::string::npos || valueEnd >= objectEnd) return false;
+        valueEnd++;
+    } else if (data[valueStart] == '(') {
+        int depth = 1;
+        bool escaped = false;
+        valueEnd = valueStart + 1;
+        while (valueEnd < objectEnd && depth > 0) {
+            const char ch = data[valueEnd++];
+            if (escaped) {
+                escaped = false;
+            } else if (ch == '\\') {
+                escaped = true;
+            } else if (ch == '(') {
+                depth++;
+            } else if (ch == ')') {
+                depth--;
+            }
+        }
+        if (depth != 0) return false;
+    } else {
+        valueEnd = valueStart;
+        while (valueEnd < objectEnd && !std::isspace(static_cast<unsigned char>(data[valueEnd]))) {
+            valueEnd++;
+        }
+    }
+
+    *outStart = keyPos;
+    *outEnd = valueEnd;
+    return *outEnd > *outStart;
+}
+
+static void BlankPdfDictionaryValueSegment(
+        std::string* data,
+        size_t objectStart,
+        size_t objectEnd,
+        const std::string& key
+) {
+    if (!data) return;
+    size_t valueStart = 0;
+    size_t valueEnd = 0;
+    if (!FindPdfDictionaryValueSegment(*data, objectStart, objectEnd, key, &valueStart, &valueEnd)) {
+        return;
+    }
+    data->replace(valueStart, valueEnd - valueStart, valueEnd - valueStart, ' ');
+}
+
+static int GetPdfShapePatchTypeFromObject(const std::string& objectText) {
+    if (objectText.find("/LufickPdfShapePatchArrowLine") != std::string::npos) return 18;
+    if (objectText.find("/LufickPdfShapePatchLine") != std::string::npos) return 17;
+    if (objectText.find("/LufickPdfShapePatchPolyLine") != std::string::npos) return 16;
+    if (objectText.find("/LufickPdfShapePatchPolygon") != std::string::npos) return 15;
+    return -1;
+}
+
+static const char* GetPdfShapePatchedSubtypeName(int typeInt) {
+    switch (typeInt) {
+        case 15: return "/Polygon";
+        case 16: return "/PolyLine";
+        case 17:
+        case 18:
+            return "/Line";
+        default:
+            return "/Square";
+    }
+}
+
+static bool FindEnclosingPdfDictionaryRange(
+        const std::string& data,
+        size_t objectStart,
+        size_t objectEnd,
+        size_t position,
+        size_t* outStart,
+        size_t* outEnd
+) {
+    if (!outStart || !outEnd || position < objectStart || position >= objectEnd || objectEnd > data.size()) {
+        return false;
+    }
+
+    std::vector<size_t> dictionaryStack;
+    size_t bestStart = std::string::npos;
+    size_t bestEnd = std::string::npos;
+
+    for (size_t index = objectStart; index + 1 < objectEnd; index++) {
+        const char current = data[index];
+        const char next = data[index + 1];
+        if (current == '<' && next == '<') {
+            dictionaryStack.push_back(index);
+            index++;
+        } else if (current == '>' && next == '>' && !dictionaryStack.empty()) {
+            const size_t start = dictionaryStack.back();
+            dictionaryStack.pop_back();
+            const size_t end = index + 2;
+            if (start <= position && position < end &&
+                (bestStart == std::string::npos || start > bestStart)) {
+                bestStart = start;
+                bestEnd = end;
+            }
+            index++;
+        }
+    }
+
+    if (bestStart == std::string::npos || bestEnd == std::string::npos || bestEnd <= bestStart) {
+        return false;
+    }
+
+    *outStart = bestStart;
+    *outEnd = bestEnd;
+    return true;
+}
+
+struct PdfObjectReplacement {
+    int objectNumber;
+    int generation;
+    std::string body;
+};
+
+static int GetPdfBoxShapePatchTypeFromObject(const std::string& objectText) {
+    if (objectText.find("/LufickPdfBoxShapePatchRectangle") != std::string::npos) return 12;
+    if (objectText.find("/LufickPdfBoxShapePatchSquare") != std::string::npos) return 13;
+    if (objectText.find("/LufickPdfBoxShapePatchCircle") != std::string::npos) return 14;
+    return -1;
+}
+
+static size_t FindPdfKeyTokenInRange(
+        const std::string& data,
+        size_t start,
+        size_t end,
+        const std::string& key
+) {
+    if (start >= end || end > data.size()) return std::string::npos;
+    const std::string keyToken = "/" + key;
+    size_t pos = data.find(keyToken, start);
+    while (pos != std::string::npos && pos < end) {
+        const size_t afterKey = pos + keyToken.size();
+        if (afterKey >= end || IsPdfNameDelimiter(data[afterKey])) {
+            return pos;
+        }
+        pos = data.find(keyToken, afterKey);
+    }
+    return std::string::npos;
+}
+
+static bool ExtractPdfArrayValueFromObject(
+        const std::string& objectText,
+        const std::string& key,
+        std::string* outArray
+) {
+    if (!outArray) return false;
+    const size_t keyPos = FindPdfKeyTokenInRange(objectText, 0, objectText.size(), key);
+    if (keyPos == std::string::npos) return false;
+    const size_t arrayStart = objectText.find('[', keyPos);
+    const size_t arrayEnd = objectText.find(']', arrayStart);
+    if (arrayStart == std::string::npos || arrayEnd == std::string::npos || arrayEnd <= arrayStart) {
+        return false;
+    }
+    *outArray = objectText.substr(arrayStart, arrayEnd - arrayStart + 1);
+    return true;
+}
+
+static bool ParsePdfFloatValueFromObject(
+        const std::string& objectText,
+        const std::string& key,
+        float* outValue
+) {
+    if (!outValue) return false;
+    const size_t keyPos = FindPdfKeyTokenInRange(objectText, 0, objectText.size(), key);
+    if (keyPos == std::string::npos) return false;
+
+    size_t valueStart = keyPos + key.size() + 1;
+    while (valueStart < objectText.size() &&
+           std::isspace(static_cast<unsigned char>(objectText[valueStart]))) {
+        valueStart++;
+    }
+    if (valueStart >= objectText.size()) return false;
+
+    char* end = nullptr;
+    const float value = std::strtof(objectText.c_str() + valueStart, &end);
+    if (end == objectText.c_str() + valueStart) return false;
+    *outValue = value;
+    return true;
+}
+
+static int PdfColorComponentToByte(float value) {
+    const float scaled = value <= 1.0f ? value * 255.0f : value;
+    return std::max(0, std::min(static_cast<int>(std::lround(scaled)), 255));
+}
+
+static bool ParsePdfColorArrayFromObject(
+        const std::string& objectText,
+        const std::string& key,
+        int* outR,
+        int* outG,
+        int* outB
+) {
+    if (!outR || !outG || !outB) return false;
+    std::string arrayValue;
+    if (!ExtractPdfArrayValueFromObject(objectText, key, &arrayValue)) return false;
+
+    const char* cursor = arrayValue.c_str() + 1;
+    char* end = nullptr;
+    float values[3] = {0.0f, 0.0f, 0.0f};
+    for (int index = 0; index < 3; index++) {
+        values[index] = std::strtof(cursor, &end);
+        if (end == cursor) return false;
+        cursor = end;
+    }
+
+    *outR = PdfColorComponentToByte(values[0]);
+    *outG = PdfColorComponentToByte(values[1]);
+    *outB = PdfColorComponentToByte(values[2]);
+    return true;
+}
+
+static bool ParsePdfNormalAppearanceReference(
+        const std::string& objectText,
+        int* outObjectNumber,
+        int* outGeneration
+) {
+    if (!outObjectNumber || !outGeneration) return false;
+    const size_t apPos = FindPdfKeyTokenInRange(objectText, 0, objectText.size(), "AP");
+    if (apPos == std::string::npos) return false;
+    const size_t normalPos = FindPdfKeyTokenInRange(objectText, apPos, objectText.size(), "N");
+    if (normalPos == std::string::npos) return false;
+
+    const char* cursor = objectText.c_str() + normalPos + 2;
+    while (*cursor != '\0' && std::isspace(static_cast<unsigned char>(*cursor))) cursor++;
+    char* end = nullptr;
+    const long objectNumber = std::strtol(cursor, &end, 10);
+    if (end == cursor) return false;
+    cursor = end;
+    while (*cursor != '\0' && std::isspace(static_cast<unsigned char>(*cursor))) cursor++;
+    const long generation = std::strtol(cursor, &end, 10);
+    if (end == cursor) return false;
+    cursor = end;
+    while (*cursor != '\0' && std::isspace(static_cast<unsigned char>(*cursor))) cursor++;
+    if (*cursor != 'R') return false;
+
+    *outObjectNumber = static_cast<int>(objectNumber);
+    *outGeneration = static_cast<int>(generation);
+    return *outObjectNumber > 0 && *outGeneration >= 0;
+}
+
+static bool FindPdfObjectRange(
+        const std::string& data,
+        int objectNumber,
+        int generation,
+        size_t* outStart,
+        size_t* outEnd
+) {
+    if (!outStart || !outEnd || objectNumber <= 0 || generation < 0) return false;
+    const std::string objectHeader =
+            std::to_string(objectNumber) + " " + std::to_string(generation) + " obj";
+    size_t pos = data.find(objectHeader);
+    while (pos != std::string::npos) {
+        const bool validStart = pos == 0 || std::isspace(static_cast<unsigned char>(data[pos - 1]));
+        const size_t afterHeader = pos + objectHeader.size();
+        const bool validEnd = afterHeader >= data.size() ||
+                              std::isspace(static_cast<unsigned char>(data[afterHeader]));
+        if (validStart && validEnd) {
+            const size_t endObj = data.find("endobj", afterHeader);
+            if (endObj == std::string::npos) return false;
+            *outStart = pos;
+            *outEnd = endObj + strlen("endobj");
+            return true;
+        }
+        pos = data.find(objectHeader, afterHeader);
+    }
+    return false;
+}
+
+static bool ExtractPdfStreamDictionaryText(
+        const std::string& data,
+        size_t objectStart,
+        size_t objectEnd,
+        std::string* outDictionary
+) {
+    if (!outDictionary || objectStart >= objectEnd || objectEnd > data.size()) return false;
+    const size_t streamPos = data.find("stream", objectStart);
+    if (streamPos == std::string::npos || streamPos >= objectEnd) return false;
+    const size_t dictStart = data.find("<<", objectStart);
+    const size_t dictEnd = data.rfind(">>", streamPos);
+    if (dictStart == std::string::npos || dictEnd == std::string::npos ||
+        dictEnd <= dictStart || dictEnd >= streamPos) {
+        return false;
+    }
+    *outDictionary = data.substr(dictStart, dictEnd - dictStart + 2);
+    return true;
+}
+
+static std::string FormatPdfRectArray(const FS_RECTF& rect) {
+    std::ostringstream stream;
+    stream << '['
+           << FormatPdfFloat(rect.left) << ' '
+           << FormatPdfFloat(rect.bottom) << ' '
+           << FormatPdfFloat(rect.right) << ' '
+           << FormatPdfFloat(rect.top) << ']';
+    return stream.str();
+}
+
+static float ResolvePdfBoxShapeOpacity(const std::string& objectText) {
+    float opacity = -1.0f;
+    if (ParsePdfFloatValueFromObject(objectText, "CA", &opacity)) {
+        return std::max(0.0f, std::min(opacity, 1.0f));
+    }
+    opacity = ParsePdfBoxShapeOpacityFromObject(objectText);
+    return opacity >= 0.0f ? std::max(0.0f, std::min(opacity, 1.0f)) : -1.0f;
+}
+
+static bool BuildPdfBoxShapeAppearanceReplacementObject(
+        const std::string& data,
+        int appearanceObjectNumber,
+        int appearanceGeneration,
+        const std::string& annotationText,
+        int typeInt,
+        float opacity,
+        std::string* outObjectBody
+) {
+    if (!outObjectBody || !IsDirectNativePdfBoxShape(typeInt) || opacity < 0.0f) {
+        return false;
+    }
+
+    size_t appearanceStart = 0;
+    size_t appearanceEnd = 0;
+    if (!FindPdfObjectRange(data, appearanceObjectNumber, appearanceGeneration, &appearanceStart, &appearanceEnd)) {
+        return false;
+    }
+
+    std::string appearanceDictionary;
+    if (!ExtractPdfStreamDictionaryText(data, appearanceStart, appearanceEnd, &appearanceDictionary)) {
+        return false;
+    }
+
+    FS_RECTF rect;
+    if (!ParsePdfRectFromObject(annotationText, &rect)) return false;
+
+    FS_RECTF baseRect = rect;
+    float rotation = 0.0f;
+    ParsePdfShapeFloatMarker(annotationText, "/LufickPdfBoxShapeRotation", &rotation);
+    float baseLeft = rect.left;
+    float baseTop = rect.top;
+    float baseRight = rect.right;
+    float baseBottom = rect.bottom;
+    const bool hasBaseRect =
+            ParsePdfShapeFloatMarker(annotationText, "/LufickPdfBoxShapeBaseLeft", &baseLeft) &&
+            ParsePdfShapeFloatMarker(annotationText, "/LufickPdfBoxShapeBaseTop", &baseTop) &&
+            ParsePdfShapeFloatMarker(annotationText, "/LufickPdfBoxShapeBaseRight", &baseRight) &&
+            ParsePdfShapeFloatMarker(annotationText, "/LufickPdfBoxShapeBaseBottom", &baseBottom);
+    if (hasBaseRect) {
+        baseRect = {baseLeft, baseTop, baseRight, baseBottom};
+    }
+
+    int strokeR = 0;
+    int strokeG = 0;
+    int strokeB = 0;
+    ParsePdfColorArrayFromObject(annotationText, "C", &strokeR, &strokeG, &strokeB);
+
+    int fillR = 0;
+    int fillG = 0;
+    int fillB = 0;
+    const bool hasFill = ParsePdfColorArrayFromObject(annotationText, "IC", &fillR, &fillG, &fillB);
+
+    const int alpha = std::max(0, std::min(static_cast<int>(std::lround(opacity * 255.0f)), 255));
+    const float strokeWidth = ParsePdfShapeBorderWidthFromObject(annotationText);
+    const char* graphicsStateName = "LufickPdfBoxShapeGS";
+    const std::string appearanceStream = BuildPdfShapeAppearanceStreamAscii(
+            typeInt,
+            baseRect,
+            rotation,
+            strokeR,
+            strokeG,
+            strokeB,
+            alpha,
+            fillR,
+            fillG,
+            fillB,
+            hasFill ? alpha : 0,
+            strokeWidth,
+            graphicsStateName
+    );
+    if (appearanceStream.empty()) return false;
+
+    std::string bbox;
+    if (!ExtractPdfArrayValueFromObject(appearanceDictionary, "BBox", &bbox)) {
+        bbox = FormatPdfRectArray(rect);
+    }
+    std::string matrix;
+    const bool hasMatrix = ExtractPdfArrayValueFromObject(appearanceDictionary, "Matrix", &matrix);
+
+    std::ostringstream replacement;
+    replacement << "<< /Type /XObject /Subtype /Form /BBox " << bbox << ' ';
+    if (hasMatrix) {
+        replacement << "/Matrix " << matrix << ' ';
+    }
+    replacement << "/Resources << /ExtGState << /" << graphicsStateName
+                << " << /Type /ExtGState /CA " << FormatPdfFloat(opacity)
+                << " /ca " << FormatPdfFloat(opacity)
+                << " >> >> >> /Length " << appearanceStream.size() << " >>\n"
+                << "stream\n"
+                << appearanceStream
+                << "\nendstream";
+    *outObjectBody = replacement.str();
+    return true;
+}
+
+static bool ParseLastStartXref(const std::string& data, long long* outStartXref) {
+    if (!outStartXref) return false;
+    const size_t startXrefPos = data.rfind("startxref");
+    if (startXrefPos == std::string::npos) return false;
+    const char* cursor = data.c_str() + startXrefPos + strlen("startxref");
+    while (*cursor != '\0' && std::isspace(static_cast<unsigned char>(*cursor))) cursor++;
+    char* end = nullptr;
+    const long long value = std::strtoll(cursor, &end, 10);
+    if (end == cursor || value < 0) return false;
+    *outStartXref = value;
+    return true;
+}
+
+static bool ExtractLastTrailerDictionary(const std::string& data, std::string* outTrailer) {
+    if (!outTrailer) return false;
+    const size_t trailerPos = data.rfind("trailer");
+    if (trailerPos == std::string::npos) return false;
+    const size_t trailerStart = data.find("<<", trailerPos);
+    if (trailerStart == std::string::npos) return false;
+
+    std::vector<size_t> stack;
+    for (size_t index = trailerStart; index + 1 < data.size(); index++) {
+        if (data[index] == '<' && data[index + 1] == '<') {
+            stack.push_back(index);
+            index++;
+        } else if (data[index] == '>' && data[index + 1] == '>' && !stack.empty()) {
+            stack.pop_back();
+            if (stack.empty()) {
+                *outTrailer = data.substr(trailerStart, index + 2 - trailerStart);
+                return true;
+            }
+            index++;
+        }
+    }
+    return false;
+}
+
+static bool AppendIncrementalPdfObjectUpdates(
+        std::string* data,
+        std::vector<PdfObjectReplacement>* replacements
+) {
+    if (!data || !replacements || replacements->empty()) return true;
+
+    long long previousStartXref = 0;
+    if (!ParseLastStartXref(*data, &previousStartXref)) return false;
+
+    std::string trailer;
+    if (!ExtractLastTrailerDictionary(*data, &trailer)) return false;
+
+    size_t prevStart = 0;
+    size_t prevEnd = 0;
+    if (FindPdfDictionaryValueSegment(trailer, 0, trailer.size(), "Prev", &prevStart, &prevEnd)) {
+        trailer.replace(prevStart, prevEnd - prevStart, prevEnd - prevStart, ' ');
+    }
+    const size_t trailerInsert = trailer.rfind(">>");
+    if (trailerInsert == std::string::npos) return false;
+    trailer.insert(trailerInsert, "/Prev " + std::to_string(previousStartXref) + " ");
+
+    std::sort(replacements->begin(), replacements->end(), [](const PdfObjectReplacement& first, const PdfObjectReplacement& second) {
+        if (first.objectNumber != second.objectNumber) return first.objectNumber < second.objectNumber;
+        return first.generation < second.generation;
+    });
+    replacements->erase(std::unique(replacements->begin(), replacements->end(), [](const PdfObjectReplacement& first, const PdfObjectReplacement& second) {
+        return first.objectNumber == second.objectNumber && first.generation == second.generation;
+    }), replacements->end());
+
+    if (!data->empty() && data->back() != '\n') {
+        data->push_back('\n');
+    }
+
+    std::vector<long long> offsets;
+    offsets.reserve(replacements->size());
+    for (const PdfObjectReplacement& replacement : *replacements) {
+        offsets.push_back(static_cast<long long>(data->size()));
+        data->append(std::to_string(replacement.objectNumber));
+        data->push_back(' ');
+        data->append(std::to_string(replacement.generation));
+        data->append(" obj\n");
+        data->append(replacement.body);
+        data->append("\nendobj\n");
+    }
+
+    const long long xrefStart = static_cast<long long>(data->size());
+    data->append("xref\n");
+    for (size_t index = 0; index < replacements->size(); index++) {
+        const PdfObjectReplacement& replacement = (*replacements)[index];
+        data->append(std::to_string(replacement.objectNumber));
+        data->append(" 1\n");
+        char offsetBuffer[32];
+        snprintf(offsetBuffer, sizeof(offsetBuffer), "%010lld %05d n \n", offsets[index], replacement.generation);
+        data->append(offsetBuffer);
+    }
+    data->append("trailer\n");
+    data->append(trailer);
+    data->append("\nstartxref\n");
+    data->append(std::to_string(xrefStart));
+    data->append("\n%%EOF\n");
+    return true;
+}
+
+static bool PatchSavedPdfShapeNativeDictionaries(const char* outputPath) {
+    if (!outputPath) return false;
+
+    std::ifstream input(outputPath, std::ios::binary);
+    if (!input) return false;
+    std::string data((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+    input.close();
+    if (data.empty()) return false;
+
+    std::vector<PdfObjectReplacement> objectReplacements;
+    const std::string padKey = "/LufickPdfShapePatchPad";
+    size_t searchPos = 0;
+    int patchedCount = 0;
+    while (true) {
+        const size_t padPos = data.find(padKey, searchPos);
+        if (padPos == std::string::npos) break;
+
+        const size_t objKeyword = data.rfind(" obj", padPos);
+        const size_t endObj = data.find("endobj", padPos);
+        if (objKeyword == std::string::npos || endObj == std::string::npos) {
+            searchPos = padPos + padKey.size();
+            continue;
+        }
+
+        size_t objectStart = data.rfind('\n', objKeyword);
+        objectStart = (objectStart == std::string::npos) ? 0 : objectStart + 1;
+        const size_t objectEnd = endObj + strlen("endobj");
+        if (objectEnd <= objectStart || objectEnd > data.size()) {
+            searchPos = padPos + padKey.size();
+            continue;
+        }
+
+        size_t patchStart = objectStart;
+        size_t patchEnd = objectEnd;
+        FindEnclosingPdfDictionaryRange(data, objectStart, objectEnd, padPos, &patchStart, &patchEnd);
+
+        const std::string objectText = data.substr(patchStart, patchEnd - patchStart);
+        const int typeInt = GetPdfShapePatchTypeFromObject(objectText);
+        if (!NeedsSavedPdfShapeDictionaryPatch(typeInt)) {
+            searchPos = padPos + padKey.size();
+            continue;
+        }
+
+        FS_RECTF rect;
+        if (!ParsePdfRectFromObject(objectText, &rect)) {
+            searchPos = padPos + padKey.size();
+            continue;
+        }
+
+        if (!ReplacePdfNameInRange(
+                &data,
+                patchStart,
+                patchEnd,
+                "Subtype",
+                GetPdfShapePatchedSubtypeName(typeInt)
+        )) {
+            searchPos = padPos + padKey.size();
+            continue;
+        }
+
+        BlankPdfDictionaryValueSegment(&data, patchStart, patchEnd, "QuadPoints");
+        if (ParsePdfShapeOpacityFromObject(objectText) >= 0.0f) {
+            BlankPdfDictionaryValueSegment(&data, patchStart, patchEnd, "CA");
+        }
+
+        size_t padStart = 0;
+        size_t padEnd = 0;
+        if (!FindPdfDictionaryValueSegment(
+                data,
+                patchStart,
+                patchEnd,
+                "LufickPdfShapePatchPad",
+                &padStart,
+                &padEnd
+        )) {
+            searchPos = padPos + padKey.size();
+            continue;
+        }
+
+        std::string nativePatch = BuildNativePdfShapeDictionaryPatch(typeInt, rect, objectText);
+        const size_t padLength = padEnd - padStart;
+        if (nativePatch.empty() || nativePatch.size() > padLength) {
+            searchPos = padPos + padKey.size();
+            continue;
+        }
+        nativePatch.append(padLength - nativePatch.size(), ' ');
+        data.replace(padStart, padLength, nativePatch);
+        patchedCount++;
+        searchPos = patchEnd;
+    }
+
+    const std::string boxShapePatchKey = "/LufickPdfBoxShapePatch";
+    searchPos = 0;
+    while (true) {
+        const size_t markerPos = data.find(boxShapePatchKey, searchPos);
+        if (markerPos == std::string::npos) break;
+
+        const size_t objKeyword = data.rfind(" obj", markerPos);
+        const size_t endObj = data.find("endobj", markerPos);
+        if (objKeyword == std::string::npos || endObj == std::string::npos) {
+            searchPos = markerPos + boxShapePatchKey.size();
+            continue;
+        }
+
+        size_t objectStart = data.rfind('\n', objKeyword);
+        objectStart = (objectStart == std::string::npos) ? 0 : objectStart + 1;
+        const size_t objectEnd = endObj + strlen("endobj");
+        if (objectEnd <= objectStart || objectEnd > data.size()) {
+            searchPos = markerPos + boxShapePatchKey.size();
+            continue;
+        }
+
+        size_t patchStart = objectStart;
+        size_t patchEnd = objectEnd;
+        FindEnclosingPdfDictionaryRange(data, objectStart, objectEnd, markerPos, &patchStart, &patchEnd);
+
+        const std::string objectText = data.substr(patchStart, patchEnd - patchStart);
+        const int typeInt = GetPdfBoxShapePatchTypeFromObject(objectText);
+        if (!IsDirectNativePdfBoxShape(typeInt)) {
+            searchPos = markerPos + boxShapePatchKey.size();
+            continue;
+        }
+
+        const float opacity = ResolvePdfBoxShapeOpacity(objectText);
+        if (opacity < 0.0f) {
+            searchPos = markerPos + boxShapePatchKey.size();
+            continue;
+        }
+
+        size_t padStart = 0;
+        size_t padEnd = 0;
+        if (FindPdfDictionaryValueSegment(
+                data,
+                patchStart,
+                patchEnd,
+                "LufickPdfBoxShapeOpacityPad",
+                &padStart,
+                &padEnd
+        )) {
+            BlankPdfDictionaryValueSegment(&data, patchStart, patchEnd, "CA");
+
+            std::string opacityPatch = "/CA " + FormatPdfFloat(opacity) + " ";
+            const size_t padLength = padEnd - padStart;
+            if (opacityPatch.size() <= padLength) {
+                opacityPatch.append(padLength - opacityPatch.size(), ' ');
+                data.replace(padStart, padLength, opacityPatch);
+                patchedCount++;
+            }
+        }
+
+        int appearanceObjectNumber = -1;
+        int appearanceGeneration = 0;
+        std::string appearanceObjectBody;
+        if (ParsePdfNormalAppearanceReference(objectText, &appearanceObjectNumber, &appearanceGeneration) &&
+            BuildPdfBoxShapeAppearanceReplacementObject(
+                    data,
+                    appearanceObjectNumber,
+                    appearanceGeneration,
+                    objectText,
+                    typeInt,
+                    opacity,
+                    &appearanceObjectBody
+            )) {
+            objectReplacements.push_back({
+                    appearanceObjectNumber,
+                    appearanceGeneration,
+                    appearanceObjectBody
+            });
+        }
+        searchPos = patchEnd;
+    }
+
+    if (!objectReplacements.empty() && !AppendIncrementalPdfObjectUpdates(&data, &objectReplacements)) {
+        return false;
+    }
+
+    if (patchedCount <= 0 && objectReplacements.empty()) return true;
+
+    std::ofstream output(outputPath, std::ios::binary | std::ios::trunc);
+    if (!output) return false;
+    output.write(data.data(), static_cast<std::streamsize>(data.size()));
+    output.close();
+    LOGE("Patched %d PDF shape annotation dictionaries and %zu appearance streams", patchedCount, objectReplacements.size());
+    return true;
 }
 
 static std::u16string BuildStickyNoteAppearanceStream(
@@ -3077,6 +4509,159 @@ static bool processImageStamp(
     return true;
 }
 
+static bool processPdfShape(
+        JNIEnv* env,
+        jobject obj,
+        FPDF_ANNOTATION annot,
+        FS_RECTF rect,
+        int typeInt,
+        jfieldID shapePropsField,
+        int r,
+        int g,
+        int b,
+        int alpha,
+        jclass jsonClass,
+        jmethodID jsonInit
+) {
+    if (!annot) return false;
+
+    jstring jJsonStr = shapePropsField
+            ? (jstring)env->GetObjectField(obj, shapePropsField)
+            : nullptr;
+    jobject json = jJsonStr ? env->NewObject(jsonClass, jsonInit, jJsonStr) : nullptr;
+
+    jmethodID optD = env->GetMethodID(jsonClass, "optDouble", "(Ljava/lang/String;D)D");
+    jmethodID optI = env->GetMethodID(jsonClass, "optInt", "(Ljava/lang/String;I)I");
+
+    auto optDoubleValue = [&](const char* key, double fallback) -> double {
+        if (!json || !optD) return fallback;
+        jstring jKey = env->NewStringUTF(key);
+        const double value = env->CallDoubleMethod(json, optD, jKey, fallback);
+        env->DeleteLocalRef(jKey);
+        return value;
+    };
+
+    auto optIntValue = [&](const char* key, int fallback) -> int {
+        if (!json || !optI) return fallback;
+        jstring jKey = env->NewStringUTF(key);
+        const int value = env->CallIntMethod(json, optI, jKey, fallback);
+        env->DeleteLocalRef(jKey);
+        return value;
+    };
+
+    FS_RECTF baseRect;
+    baseRect.left = static_cast<float>(optDoubleValue("baseLeft", rect.left));
+    baseRect.top = static_cast<float>(optDoubleValue("baseTop", rect.top));
+    baseRect.right = static_cast<float>(optDoubleValue("baseRight", rect.right));
+    baseRect.bottom = static_cast<float>(optDoubleValue("baseBottom", rect.bottom));
+
+    const float rotation = static_cast<float>(optDoubleValue("rotation", 0.0));
+    const float strokeWidth = static_cast<float>(optDoubleValue("strokeWidth", 1.0));
+    const int strokeR = optIntValue("strokeR", r);
+    const int strokeG = optIntValue("strokeG", g);
+    const int strokeB = optIntValue("strokeB", b);
+    const int strokeA = std::max(0, std::min(optIntValue("strokeA", alpha), 255));
+    const int fillR = optIntValue("fillR", 0);
+    const int fillG = optIntValue("fillG", 0);
+    const int fillB = optIntValue("fillB", 0);
+    const int requestedFillA = std::max(0, std::min(optIntValue("fillA", 0), 255));
+    const int fillA = requestedFillA > 0 ? strokeA : 0;
+
+    FPDFAnnot_SetBorder(annot, 0, 0, fmax(strokeWidth, 0.0f));
+    FPDFAnnot_SetColor(annot, FPDFANNOT_COLORTYPE_Color, strokeR, strokeG, strokeB, strokeA);
+    if (fillA > 0) {
+        FPDFAnnot_SetColor(annot, FPDFANNOT_COLORTYPE_InteriorColor, fillR, fillG, fillB, fillA);
+    }
+
+    if (jJsonStr) {
+        SetAnnotWideStringValueFromJString(env, annot, "LufickPdfShapeMeta", jJsonStr);
+    }
+    SetAnnotAsciiStringValue(annot, "LufickPdfShapeType", GetPdfShapeName(typeInt));
+    SetAnnotAsciiStringValue(annot, "LufickStampKind", "shape");
+    if (IsDirectNativePdfBoxShape(typeInt) && fabs(rotation) >= 0.001f) {
+        SetAnnotAsciiStringValue(annot, GetPdfBoxShapePatchMarkerKey(typeInt), "1");
+        SetPdfShapeFloatMarker(annot, "LufickPdfBoxShapeRotation", rotation);
+        SetPdfShapeFloatMarker(annot, "LufickPdfBoxShapeBaseLeft", baseRect.left);
+        SetPdfShapeFloatMarker(annot, "LufickPdfBoxShapeBaseTop", baseRect.top);
+        SetPdfShapeFloatMarker(annot, "LufickPdfBoxShapeBaseRight", baseRect.right);
+        SetPdfShapeFloatMarker(annot, "LufickPdfBoxShapeBaseBottom", baseRect.bottom);
+        if (strokeA < 255) {
+            std::ostringstream alphaMarker;
+            alphaMarker << "LufickPdfBoxShapeAlpha" << strokeA;
+            SetAnnotAsciiStringValue(annot, alphaMarker.str().c_str(), "1");
+            static const std::string opacityPatchPad(128, ' ');
+            SetAnnotAsciiStringValue(annot, "LufickPdfBoxShapeOpacityPad", opacityPatchPad.c_str());
+        }
+    }
+    if (NeedsSavedPdfShapeDictionaryPatch(typeInt)) {
+        SetAnnotAsciiStringValue(annot, GetPdfShapePatchMarkerKey(typeInt), "1");
+        std::ostringstream alphaMarker;
+        alphaMarker << "LufickPdfShapeAlpha" << strokeA;
+        SetAnnotAsciiStringValue(annot, alphaMarker.str().c_str(), "1");
+        SetPdfShapeFloatMarker(annot, "LufickPdfShapeRotation", rotation);
+        SetPdfShapeFloatMarker(annot, "LufickPdfShapeBaseLeft", baseRect.left);
+        SetPdfShapeFloatMarker(annot, "LufickPdfShapeBaseTop", baseRect.top);
+        SetPdfShapeFloatMarker(annot, "LufickPdfShapeBaseRight", baseRect.right);
+        SetPdfShapeFloatMarker(annot, "LufickPdfShapeBaseBottom", baseRect.bottom);
+        static const std::string patchPad(2048, ' ');
+        SetAnnotAsciiStringValue(annot, "LufickPdfShapePatchPad", patchPad.c_str());
+    }
+
+    const bool useRotatedAlphaObject =
+            !NeedsSavedPdfShapeDictionaryPatch(typeInt) &&
+            fabs(rotation) >= 0.001f &&
+            (strokeA < 255 || (fillA > 0 && fillA < 255));
+    const bool appendedRotatedAlphaObject = useRotatedAlphaObject && AppendPdfShapeAppearanceObject(
+            annot,
+            typeInt,
+            baseRect,
+            rotation,
+            strokeR,
+            strokeG,
+            strokeB,
+            strokeA,
+            fillR,
+            fillG,
+            fillB,
+            fillA,
+            strokeWidth
+    );
+
+    if (appendedRotatedAlphaObject) {
+        // The appended annotation object keeps RGBA alpha; replacing it with a
+        // raw AP stream would lose opacity for rotated box-based shapes.
+    } else if (ShouldUseCustomPdfShapeAppearanceStream(typeInt, strokeA, fillA, rotation)) {
+        const std::u16string appearanceStream = BuildPdfShapeAppearanceStream(
+                typeInt,
+                baseRect,
+                rotation,
+                strokeR,
+                strokeG,
+                strokeB,
+                strokeA,
+                fillR,
+                fillG,
+                fillB,
+                fillA,
+                strokeWidth
+        );
+        if (!appearanceStream.empty()) {
+            FPDFAnnot_SetAP(
+                    annot,
+                    FPDF_ANNOT_APPEARANCEMODE_NORMAL,
+                    reinterpret_cast<FPDF_WIDESTRING>(appearanceStream.c_str())
+            );
+        }
+    } else {
+        FPDFAnnot_SetAP(annot, FPDF_ANNOT_APPEARANCEMODE_NORMAL, nullptr);
+    }
+
+    FPDFAnnot_SetFlags(annot, FPDF_ANNOT_FLAG_PRINT);
+    if (json) env->DeleteLocalRef(json);
+    if (jJsonStr) env->DeleteLocalRef(jJsonStr);
+    return true;
+}
+
 // --- HELPER 3: FREEHAND LOGIC ---
 static void processFreeHand(JNIEnv* env, jobject obj, FPDF_PAGE page, jfieldID fhField, int r, int g, int b, jclass jsonClass, jmethodID jsonInit) {
     jstring jJsonStr = (jstring)env->GetObjectField(obj, fhField);
@@ -3653,6 +5238,82 @@ static void ResolveAnnotAppearanceColors(
     }
 }
 
+static float ResolveAnnotAppearanceStrokeWidth(
+        FPDF_ANNOTATION annot,
+        float fallbackWidth,
+        bool* sawPathObject = nullptr,
+        bool* sawStrokedPath = nullptr
+) {
+    float resolvedWidth = fallbackWidth > 0.0f ? fallbackWidth : 0.0f;
+    if (sawPathObject) *sawPathObject = false;
+    if (sawStrokedPath) *sawStrokedPath = false;
+    if (!annot) return resolvedWidth;
+
+    const int objectCount = FPDFAnnot_GetObjectCount(annot);
+    for (int objectIndex = 0; objectIndex < objectCount; objectIndex++) {
+        FPDF_PAGEOBJECT pageObject = FPDFAnnot_GetObject(annot, objectIndex);
+        if (!pageObject || FPDFPageObj_GetType(pageObject) != FPDF_PAGEOBJ_PATH) continue;
+        if (sawPathObject) *sawPathObject = true;
+
+        int fillMode = 0;
+        FPDF_BOOL isStroked = false;
+        if (FPDFPath_GetDrawMode(pageObject, &fillMode, &isStroked) && !isStroked) {
+            continue;
+        }
+
+        unsigned int strokeR = 0, strokeG = 0, strokeB = 0, strokeA = 0;
+        if (FPDFPageObj_GetStrokeColor(pageObject, &strokeR, &strokeG, &strokeB, &strokeA) &&
+            strokeA == 0) {
+            continue;
+        }
+
+        float appearanceStrokeWidth = 0.0f;
+        if (FPDFPageObj_GetStrokeWidth(pageObject, &appearanceStrokeWidth) &&
+            appearanceStrokeWidth > 0.0f) {
+            if (sawStrokedPath) *sawStrokedPath = true;
+            return appearanceStrokeWidth;
+        }
+    }
+
+    return resolvedWidth;
+}
+
+static float ResolveAnnotVisibleStrokeWidth(FPDF_ANNOTATION annot) {
+    if (!annot) return 0.0f;
+
+    float horizontalRadius = 0.0f;
+    float verticalRadius = 0.0f;
+    float borderWidth = 0.0f;
+    if (!FPDFAnnot_GetBorder(annot, &horizontalRadius, &verticalRadius, &borderWidth) ||
+        borderWidth <= 0.0f) {
+        borderWidth = 0.0f;
+    }
+    bool sawPathObject = false;
+    bool sawStrokedPath = false;
+    const float strokeWidth = ResolveAnnotAppearanceStrokeWidth(
+            annot,
+            borderWidth,
+            &sawPathObject,
+            &sawStrokedPath
+    );
+    return sawPathObject && !sawStrokedPath ? 0.0f : strokeWidth;
+}
+
+static int GetPdfBoxShapeTypeFromAnnotBounds(FPDF_ANNOTATION annot) {
+    FS_RECTF shapeRect = {0, 0, 0, 0};
+    if (!annot || !FPDFAnnot_GetRect(annot, &shapeRect)) {
+        return 12;
+    }
+
+    const float width = fabs(shapeRect.right - shapeRect.left);
+    const float height = fabs(shapeRect.top - shapeRect.bottom);
+    const float largerSide = fmax(width, height);
+    if (largerSide > 0.0f && fabs(width - height) <= fmax(1.0f, largerSide * 0.03f)) {
+        return 13;
+    }
+    return 12;
+}
+
 // helper for annotation update // todo testing code not final...
 static void ApplyExistingAnnotationColor(
         FPDF_ANNOTATION annot,
@@ -4118,6 +5779,7 @@ static bool ApplyNativeAnnotationEditActions(
     jfieldID textPropsField = env->GetFieldID(highlightClass, "textProperties", "Ljava/lang/String;");
     jfieldID fhDrawingProperties = env->GetFieldID(highlightClass, "fhDrawingProperties", "Ljava/lang/String;");
     jfieldID imagePropsField = env->GetFieldID(highlightClass, "imageProperties", "Ljava/lang/String;");
+    jfieldID shapePropsField = env->GetFieldID(highlightClass, "shapeProperties", "Ljava/lang/String;");
     jfieldID nativeSourceIdField = env->GetFieldID(highlightClass, "nativeSourceId", "I");
     jfieldID nativeEditActionField = env->GetFieldID(highlightClass, "nativeEditAction", "I");
 
@@ -4198,14 +5860,14 @@ static bool ApplyNativeAnnotationEditActions(
                 env->DeleteLocalRef(jMarkupRects);
             }
             colorUpdateMap[pageIndex].push_back({
-                                                        nativeSourceId,
-                                                        env->GetIntField(obj, typeField),
-                                                        env->GetIntField(obj, rField),
-                                                        env->GetIntField(obj, gField),
-                                                        env->GetIntField(obj, bField),
-                                                         env->GetIntField(obj, alphaField),
-                                                         markupRectsJson
-                                                 });
+                                                          nativeSourceId,
+                                                          env->GetIntField(obj, typeField),
+                                                          env->GetIntField(obj, rField),
+                                                          env->GetIntField(obj, gField),
+                                                          env->GetIntField(obj, bField),
+                                                           env->GetIntField(obj, alphaField),
+                                                           markupRectsJson
+                                                   });
         } else if (nativeSourceId >= 0 && nativeEditAction == 3) {
             rectUpdateMap[pageIndex].push_back({
                 nativeSourceId,
@@ -4432,14 +6094,16 @@ static bool ApplyNativeAnnotationEditActions(
                     processFreeHand(env, obj, page, fhDrawingProperties, r, g, b, jsonClass, jsonInit);
                 } else {
                     int pdfType = (typeInt == 1) ? FPDF_ANNOT_UNDERLINE :
-                                  (typeInt == 2) ? FPDF_ANNOT_STRIKEOUT :
-                                  (typeInt == 8) ? FPDF_ANNOT_SQUIGGLY :
+                                   (typeInt == 2) ? FPDF_ANNOT_STRIKEOUT :
+                                   (typeInt == 8) ? FPDF_ANNOT_SQUIGGLY :
                                   (typeInt == 3) ? FPDF_ANNOT_LINK :
-                                  (typeInt == 10) ? FPDF_ANNOT_TEXT :
-                                  (typeInt == 11) ? FPDF_ANNOT_FREETEXT :
-                                  (typeInt == 4 || typeInt == 7) ? FPDF_ANNOT_SQUARE :
-                                  FPDF_ANNOT_HIGHLIGHT;
-                    FPDF_ANNOTATION annot = FPDFPage_CreateAnnot(page, (typeInt == 5 || typeInt == 9) ? FPDF_ANNOT_STAMP : pdfType);
+                                   (typeInt == 10) ? FPDF_ANNOT_TEXT :
+                                   (typeInt == 11) ? FPDF_ANNOT_FREETEXT :
+                                   (typeInt == 4 || typeInt == 7) ? FPDF_ANNOT_SQUARE :
+                                   FPDF_ANNOT_HIGHLIGHT;
+                    FPDF_ANNOTATION annot = IsPdfShapeNativeType(typeInt)
+                                            ? CreatePdfShapeAnnotation(page, typeInt)
+                                            : FPDFPage_CreateAnnot(page, (typeInt == 5 || typeInt == 9) ? FPDF_ANNOT_STAMP : pdfType);
                     if (annot) {
                         FPDFAnnot_SetRect(annot, &rect);
                         if (typeInt == 3) processLink(env, obj, page, annot, rect, urlField);
@@ -4453,6 +6117,9 @@ static bool ApplyNativeAnnotationEditActions(
                         else if (typeInt == 9) processImageStamp(env, obj, doc, page, annot, rect, imagePropsField, jsonClass, jsonInit);
                         else if (typeInt == 7) {
                             processRegionHighlight(env, obj, page, annot, rect, r, g, b, alpha);
+                        }
+                        else if (IsPdfShapeNativeType(typeInt)) {
+                            processPdfShape(env, obj, annot, rect, typeInt, shapePropsField, r, g, b, alpha, jsonClass, jsonInit);
                         }
                         else {
                             FPDFAnnot_SetColor(annot, FPDFANNOT_COLORTYPE_Color, r, g, b, alpha);
@@ -4614,6 +6281,7 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeSaveAnnotat
     jfieldID textPropsField = env->GetFieldID(highlightClass, "textProperties", "Ljava/lang/String;");
     jfieldID fhDrawingProperties = env->GetFieldID(highlightClass, "fhDrawingProperties", "Ljava/lang/String;");
     jfieldID imagePropsField = env->GetFieldID(highlightClass, "imageProperties", "Ljava/lang/String;");
+    jfieldID shapePropsField = env->GetFieldID(highlightClass, "shapeProperties", "Ljava/lang/String;");
     jfieldID nativeSourceIdField = env->GetFieldID(highlightClass, "nativeSourceId", "I");
     jfieldID nativeEditActionField = env->GetFieldID(highlightClass, "nativeEditAction", "I");
 
@@ -4676,7 +6344,9 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeSaveAnnotat
                               (typeInt == 4 || typeInt == 7) ? FPDF_ANNOT_SQUARE :
                               FPDF_ANNOT_HIGHLIGHT;
 
-                FPDF_ANNOTATION annot = FPDFPage_CreateAnnot(currentPage, (typeInt == 5 || typeInt == 9) ? FPDF_ANNOT_STAMP : pdfType);
+                FPDF_ANNOTATION annot = IsPdfShapeNativeType(typeInt)
+                                        ? CreatePdfShapeAnnotation(currentPage, typeInt)
+                                        : FPDFPage_CreateAnnot(currentPage, (typeInt == 5 || typeInt == 9) ? FPDF_ANNOT_STAMP : pdfType);
                 if (annot) {
                     FPDFAnnot_SetRect(annot, &rect);
                     if (typeInt == 3) processLink(env, obj, currentPage, annot, rect, urlField);
@@ -4690,6 +6360,9 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeSaveAnnotat
                     else if (typeInt == 9) processImageStamp(env, obj, doc, currentPage, annot, rect, imagePropsField, jsonClass, jsonInit);
                     else if (typeInt == 7) {
                         processRegionHighlight(env, obj, currentPage, annot, rect, r, g, b, alpha);
+                    }
+                    else if (IsPdfShapeNativeType(typeInt)) {
+                        processPdfShape(env, obj, annot, rect, typeInt, shapePropsField, r, g, b, alpha, jsonClass, jsonInit);
                     }
                     else { // Highlight / Underline / Strikeout / Squiggly
                         FPDFAnnot_SetColor(annot, FPDFANNOT_COLORTYPE_Color, r, g, b, alpha);
@@ -4816,6 +6489,9 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeSaveAnnotat
     PdfFileWriter writer{ {1, WriteBlock}, file };
     int success = (file) ? FPDF_SaveAsCopy(doc, (FPDF_FILEWRITE*)&writer, FPDF_NO_INCREMENTAL) : JNI_FALSE;
     if (file) fclose(file);
+    if (success && !PatchSavedPdfShapeNativeDictionaries(outputPath)) {
+        success = JNI_FALSE;
+    }
 
     FPDF_CloseDocument(doc);
     env->ReleaseStringUTFChars(inputPath_, inputPath);
@@ -4954,7 +6630,7 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeGetAnnotati
     jmethodID constructor = env->GetMethodID(
             annotClass,
             "<init>",
-            "(IIFFFFIIIILjava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Landroid/graphics/Bitmap;II)V"
+            "(IIFFFFIIIILjava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Landroid/graphics/Bitmap;II)V"
     );
 
     // Use a vector to prevent ArrayIndexOutOfBoundsException
@@ -4988,6 +6664,22 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeGetAnnotati
                 break;
             case FPDF_ANNOT_STAMP:
                 type = 5;
+                usesRectOnly = true;
+                break;
+            case FPDF_ANNOT_LINE:
+                type = 17;
+                usesRectOnly = true;
+                break;
+            case FPDF_ANNOT_CIRCLE:
+                type = 14;
+                usesRectOnly = true;
+                break;
+            case FPDF_ANNOT_POLYGON:
+                type = 15;
+                usesRectOnly = true;
+                break;
+            case FPDF_ANNOT_POLYLINE:
+                type = 16;
                 usesRectOnly = true;
                 break;
             case FPDF_ANNOT_SQUARE:
@@ -5032,11 +6724,14 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeGetAnnotati
                 b = interiorB;
                 a = interiorA;
             }
-        } else if (subtype == FPDF_ANNOT_SQUARE) {
+        } else if (subtype == FPDF_ANNOT_SQUARE && !IsPdfShapeNativeType(type)) {
             const bool looksLikeRedaction =
                     (hasStrokeColor && r == 0 && g == 0 && b == 0 && a == 255) &&
                     (!hasInteriorColor || (interiorR == 0 && interiorG == 0 && interiorB == 0 && interiorA == 255));
-            type = looksLikeRedaction ? 4 : 7;
+            const float visibleStrokeWidth = ResolveAnnotVisibleStrokeWidth(annot);
+            type = looksLikeRedaction
+                   ? 4
+                   : (visibleStrokeWidth > 0.0f ? GetPdfBoxShapeTypeFromAnnotBounds(annot) : 7);
             const bool interiorIsMeaningful =
                     hasInteriorColor &&
                     (interiorA < 255 || interiorR != 0 || interiorG != 0 || interiorB != 0);
@@ -5045,7 +6740,8 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeGetAnnotati
                     interiorIsMeaningful &&
                     (!hasStrokeColor ||
                      interiorR != r || interiorG != g || interiorB != b || interiorA != a);
-            if (shouldUseInteriorColor || (!hasStrokeColor && hasInteriorColor)) {
+            if (!IsPdfShapeNativeType(type) &&
+                (shouldUseInteriorColor || (!hasStrokeColor && hasInteriorColor))) {
                 r = interiorR;
                 g = interiorG;
                 b = interiorB;
@@ -5055,9 +6751,59 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeGetAnnotati
         jstring jLinkUrl = nullptr;
         jstring jTextProps = nullptr;
         jstring jImageProps = nullptr;
+        jstring jShapeProps = nullptr;
         jstring jStoredMarkupRects = nullptr;
         std::ostringstream markupRectsStream;
         bool hasMarkupRects = false;
+        const std::u16string shapeMeta = ReadAnnotStringValueUtf16(annot, "LufickPdfShapeMeta");
+        if (!shapeMeta.empty()) {
+            const std::string shapeMetaJson = Utf16ToSimpleUtf8(shapeMeta);
+            type = GetPdfShapeTypeFromMeta(shapeMetaJson, type);
+            usesRectOnly = true;
+            if (!IsDirectNativePdfBoxShape(type)) {
+                jShapeProps = env->NewStringUTF(shapeMetaJson.c_str());
+            }
+        }
+        if (!jShapeProps && IsPdfShapeNativeType(type)) {
+            FS_RECTF shapeRect = {0, 0, 0, 0};
+            FPDFAnnot_GetRect(annot, &shapeRect);
+
+            float borderHorizontalRadius = 0.0f;
+            float borderVerticalRadius = 0.0f;
+            float borderWidth = 1.0f;
+            if (!FPDFAnnot_GetBorder(annot, &borderHorizontalRadius, &borderVerticalRadius, &borderWidth) ||
+                borderWidth <= 0.0f) {
+                borderWidth = 1.0f;
+            }
+            borderWidth = ResolveAnnotAppearanceStrokeWidth(annot, borderWidth);
+
+            const int fillAlphaForProps = hasInteriorColor ? (int)interiorA : 0;
+            std::ostringstream shapeProps;
+            shapeProps << "{"
+                       << "\"shapeType\":\"" << GetPdfShapeName(type) << "\","
+                       << "\"baseLeft\":" << shapeRect.left << ","
+                       << "\"baseTop\":" << shapeRect.top << ","
+                       << "\"baseRight\":" << shapeRect.right << ","
+                       << "\"baseBottom\":" << shapeRect.bottom << ","
+                       << "\"pageLeft\":" << shapeRect.left << ","
+                       << "\"pageTop\":" << shapeRect.top << ","
+                       << "\"pageRight\":" << shapeRect.right << ","
+                       << "\"pageBottom\":" << shapeRect.bottom << ","
+                       << "\"width\":" << fabs(shapeRect.right - shapeRect.left) << ","
+                       << "\"height\":" << fabs(shapeRect.top - shapeRect.bottom) << ","
+                       << "\"rotation\":0,"
+                       << "\"strokeWidth\":" << borderWidth << ","
+                       << "\"strokeR\":" << (int)r << ","
+                       << "\"strokeG\":" << (int)g << ","
+                       << "\"strokeB\":" << (int)b << ","
+                       << "\"strokeA\":" << (int)a << ","
+                       << "\"fillR\":" << (hasInteriorColor ? (int)interiorR : 0) << ","
+                       << "\"fillG\":" << (hasInteriorColor ? (int)interiorG : 0) << ","
+                       << "\"fillB\":" << (hasInteriorColor ? (int)interiorB : 0) << ","
+                       << "\"fillA\":" << fillAlphaForProps
+                       << "}";
+            jShapeProps = env->NewStringUTF(shapeProps.str().c_str());
+        }
         const std::u16string signatureSubtype = ReadAnnotStringValueUtf16(annot, "LufickSignatureSubtype");
         const std::u16string signImageMarker = ReadAnnotStringValueUtf16(annot, "LufickSignImage");
         const bool isSignImage =
@@ -5162,6 +6908,7 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeGetAnnotati
                     nullptr,
                     nullptr,
                     jFhProps,
+                    nullptr,
                     nullptr,
                     nullptr,
                     i,
@@ -5317,7 +7064,7 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeGetAnnotati
 
                 jobject annotObj = env->NewObject(annotClass, constructor,
                                                   type, pageIndex, (float)dLeft, (float)dTop, (float)dRight, (float)dBottom,
-                                                  (int)r, (int)g, (int)b, (int)a, jLinkUrl, nullptr, jTextProps, nullptr, jImageProps, nullptr, i, 0);
+                                                  (int)r, (int)g, (int)b, (int)a, jLinkUrl, nullptr, jTextProps, nullptr, jImageProps, jShapeProps, nullptr, i, 0);
 
                 if (annotObj) tempCollector.push_back(annotObj);
             }
@@ -5369,7 +7116,7 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeGetAnnotati
 
                     jobject annotObj = env->NewObject(annotClass, constructor,
                                                       type, pageIndex, (float)dLeft, (float)dTop, (float)dRight, (float)dBottom,
-                                                      (int)r, (int)g, (int)b, (int)a, jLinkUrl, jMarkupRects, jTextProps, nullptr, jImageProps, nullptr, i, 0);
+                                                      (int)r, (int)g, (int)b, (int)a, jLinkUrl, jMarkupRects, jTextProps, nullptr, jImageProps, nullptr, nullptr, i, 0);
 
                     if (annotObj) tempCollector.push_back(annotObj);
                 }
@@ -5435,6 +7182,7 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeGetAnnotati
                 nullptr,
                 nullptr,
                 jFhProps,
+                nullptr,
                 nullptr,
                 nullptr,
                 i,
