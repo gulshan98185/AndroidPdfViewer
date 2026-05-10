@@ -387,6 +387,9 @@ class DragPinchManager implements GestureDetector.OnGestureListener, GestureDete
     }
 
     public long prepareText(int page) {
+        if (isPdfiumBusy()) {
+            return 0L;
+        }
         long tid = loadText(page);
         if (tid != -1) {
             allText = pdfView.pdfiumCore.getText(tid);
