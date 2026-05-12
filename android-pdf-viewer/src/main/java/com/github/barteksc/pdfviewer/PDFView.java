@@ -1019,7 +1019,11 @@ public class PDFView extends RelativeLayout {
             currentYOffset = -relativeCenterPointInStripYOffset * pdfFile.getMaxPageHeight() + h * 0.5f;
         }
         moveTo(currentXOffset, currentYOffset);
-        loadPageByOffset();
+        try {
+            loadPageByOffset();
+        } catch (Exception e) {
+            Log.e(TAG, "onSizeChanged: ", e);
+        }
     }
 
     @Override
@@ -1543,19 +1547,22 @@ public class PDFView extends RelativeLayout {
     }
 
     void loadPageByOffset() {
-        if (0 == pdfFile.getPagesCount()) {
+        if (pdfFile == null || 0 == pdfFile.getPagesCount()) {
             return;
         }
 
         int[] childLocation = new int[2];
-        scrollHandle.getCurrentView().getLocationOnScreen(childLocation);
+        View currentView = scrollHandle != null ? scrollHandle.getCurrentView() : null;
+        if (currentView != null) {
+            currentView.getLocationOnScreen(childLocation);
+        }
         float offset, screenCenter;
         if (swipeVertical) {
             offset = currentYOffset;
-            screenCenter = childLocation[1];//((float) getHeight()) / 2;
+            screenCenter = currentView != null ? childLocation[1] : ((float) getHeight()) / 2;
         } else {
             offset = currentXOffset;
-            screenCenter = childLocation[0];//((float) getWidth()) / 2;
+            screenCenter = currentView != null ? childLocation[0] : ((float) getWidth()) / 2;
         }
 
         int page = pdfFile.getPageAtOffset(-(offset - screenCenter), zoom);
