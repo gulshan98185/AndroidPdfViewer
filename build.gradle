@@ -1,4 +1,4 @@
-
+//APP_RELEASE_VERSION_6.9.7|70188
 buildscript {
     repositories {
         google()
