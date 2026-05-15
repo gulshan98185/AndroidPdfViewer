@@ -35,6 +35,7 @@ using namespace android;
 #include <functional>
 #include <iomanip>
 #include <fstream>
+#include <cstdint>
 #include <fpdf_text.h>
 
 static Mutex sLibraryLock;
@@ -1913,7 +1914,9 @@ static void processLink(JNIEnv* env, jobject obj, FPDF_PAGE page, FPDF_ANNOTATIO
 static void processStickyNoteComment(JNIEnv* env, jobject obj, FPDF_ANNOTATION annot, jfieldID commentPropsField, int r, int g, int b, int alpha, jclass jsonClass, jmethodID jsonInit);
 static void processTextStamp(JNIEnv* env, jobject obj, FPDF_DOCUMENT doc, FPDF_PAGE page, FPDF_ANNOTATION annot, FS_RECTF rect, jfieldID textPropsField, int r, int g, int b, int alpha, jclass jsonClass, jmethodID jsonInit);
 static void processFreeText(JNIEnv* env, jobject obj, FPDF_DOCUMENT doc, FPDF_ANNOTATION annot, FS_RECTF rect, jfieldID textPropsField, int r, int g, int b, int alpha, jclass jsonClass, jmethodID jsonInit);
-static bool processImageStamp(JNIEnv* env, jobject obj, FPDF_DOCUMENT doc, FPDF_PAGE page, FPDF_ANNOTATION annot, FS_RECTF rect, jfieldID imagePropsField, jclass jsonClass, jmethodID jsonInit);
+static bool processStickerStamp(JNIEnv* env, FPDF_DOCUMENT doc, FPDF_ANNOTATION annot, FS_RECTF rect, jobject json, jstring jJsonStr, jmethodID optS, jmethodID optD, jmethodID optI, jmethodID optB, int r, int g, int b, int alpha);
+static bool processSvgPathStamp(JNIEnv* env, FPDF_ANNOTATION annot, FS_RECTF rect, jobject json, jstring jJsonStr, jmethodID optS, jmethodID optD, jmethodID optI, jmethodID optB, int r, int g, int b, int alpha);
+static bool processImageOrPresetStamp(JNIEnv* env, jobject obj, FPDF_DOCUMENT doc, FPDF_PAGE page, FPDF_ANNOTATION annot, FS_RECTF rect, jfieldID imagePropsField, jclass jsonClass, jmethodID jsonInit);
 static bool processPdfShape(JNIEnv* env, jobject obj, FPDF_ANNOTATION annot, FS_RECTF rect, int typeInt, jfieldID shapePropsField, int r, int g, int b, int alpha, jclass jsonClass, jmethodID jsonInit);
 static void processFreeHand(JNIEnv* env, jobject obj, FPDF_PAGE page, jfieldID fhDrawingProperties, int r, int g, int b, jclass jsonClass, jmethodID jsonInit);
 
@@ -4343,7 +4346,1384 @@ static void processFreeText(JNIEnv* env, jobject obj, FPDF_DOCUMENT doc, FPDF_AN
     env->DeleteLocalRef(jJsonStr);
 }
 
-static bool processImageStamp(
+// for sticker tff to pdf path conversion code----
+struct GlyphOutlinePoint {
+    double x;
+    double y;
+    bool onCurve;
+};
+
+struct GlyphOutlineContour {
+    std::vector<GlyphOutlinePoint> points;
+};
+
+struct GlyphOutline {
+    std::vector<GlyphOutlineContour> contours;
+    double minX = 0.0;
+    double minY = 0.0;
+    double maxX = 0.0;
+    double maxY = 0.0;
+    bool hasBounds = false;
+};
+
+struct GlyphAffine {
+    double a;
+    double b;
+    double c;
+    double d;
+    double e;
+    double f;
+};
+
+struct TrueTypeTable {
+    uint32_t offset;
+    uint32_t length;
+};
+
+static GlyphAffine GlyphIdentityMatrix() {
+    return {1.0, 0.0, 0.0, 1.0, 0.0, 0.0};
+}
+
+static GlyphAffine GlyphMultiplyMatrix(const GlyphAffine& first, const GlyphAffine& second) {
+    return {
+            first.a * second.a + first.c * second.b,
+            first.b * second.a + first.d * second.b,
+            first.a * second.c + first.c * second.d,
+            first.b * second.c + first.d * second.d,
+            first.a * second.e + first.c * second.f + first.e,
+            first.b * second.e + first.d * second.f + first.f
+    };
+}
+
+static GlyphOutlinePoint GlyphTransformPoint(const GlyphAffine& matrix, const GlyphOutlinePoint& point) {
+    return {
+            matrix.a * point.x + matrix.c * point.y + matrix.e,
+            matrix.b * point.x + matrix.d * point.y + matrix.f,
+            point.onCurve
+    };
+}
+
+static bool ReadFileBytes(const char* path, std::vector<uint8_t>* outBytes) {
+    if (!path || !outBytes || strlen(path) == 0) return false;
+
+    FILE* file = fopen(path, "rb");
+    if (!file) return false;
+
+    fseek(file, 0, SEEK_END);
+    const long fileSize = ftell(file);
+    rewind(file);
+    if (fileSize <= 0) {
+        fclose(file);
+        return false;
+    }
+
+    outBytes->assign(static_cast<size_t>(fileSize), 0);
+    const size_t readSize = fread(outBytes->data(), 1, outBytes->size(), file);
+    fclose(file);
+    return readSize == outBytes->size();
+}
+
+class TrueTypeGlyphReader {
+public:
+    explicit TrueTypeGlyphReader(const std::vector<uint8_t>& bytes) : data(bytes) {}
+
+    bool load() {
+        if (data.size() < 12) return false;
+
+        uint16_t numTables = 0;
+        if (!readU16(4, &numTables)) return false;
+        const size_t tableDirectoryEnd = 12 + (static_cast<size_t>(numTables) * 16);
+        if (tableDirectoryEnd > data.size()) return false;
+
+        for (uint16_t i = 0; i < numTables; i++) {
+            const size_t recordOffset = 12 + (static_cast<size_t>(i) * 16);
+            uint32_t tableOffset = 0;
+            uint32_t tableLength = 0;
+            if (!readU32(recordOffset + 8, &tableOffset) ||
+                !readU32(recordOffset + 12, &tableLength)) {
+                return false;
+            }
+            if (!rangeValid(tableOffset, tableLength)) continue;
+
+            std::string tag(reinterpret_cast<const char*>(&data[recordOffset]), 4);
+            tables[tag] = {tableOffset, tableLength};
+        }
+
+        TrueTypeTable headTable;
+        TrueTypeTable maxpTable;
+        if (!getTable("head", &headTable) ||
+            !getTable("maxp", &maxpTable) ||
+            !getTable("loca", nullptr) ||
+            !getTable("glyf", nullptr) ||
+            !getTable("cmap", nullptr)) {
+            return false;
+        }
+
+        uint16_t units = 0;
+        int16_t locaFormat = 0;
+        uint16_t glyphCount = 0;
+        if (!readU16(headTable.offset + 18, &units) ||
+            !readS16(headTable.offset + 50, &locaFormat) ||
+            !readU16(maxpTable.offset + 4, &glyphCount)) {
+            return false;
+        }
+        unitsPerEm = units > 0 ? units : 1000;
+        indexToLocFormat = locaFormat;
+        numGlyphs = glyphCount;
+        return numGlyphs > 0 && (indexToLocFormat == 0 || indexToLocFormat == 1);
+    }
+
+    bool loadGlyphForCodepoint(uint32_t codepoint, GlyphOutline* outline) const {
+        if (!outline) return false;
+
+        uint32_t glyphIndex = 0;
+        if (!mapCodepointToGlyph(codepoint, &glyphIndex) || glyphIndex == 0 || glyphIndex >= numGlyphs) {
+            return false;
+        }
+
+        *outline = GlyphOutline();
+        if (!parseGlyph(glyphIndex, GlyphIdentityMatrix(), outline, 0)) {
+            return false;
+        }
+        return outline->hasBounds && !outline->contours.empty();
+    }
+
+private:
+    const std::vector<uint8_t>& data;
+    std::map<std::string, TrueTypeTable> tables;
+    uint16_t unitsPerEm = 1000;
+    int16_t indexToLocFormat = 0;
+    uint16_t numGlyphs = 0;
+
+    bool rangeValid(size_t offset, size_t length) const {
+        return offset <= data.size() && length <= data.size() - offset;
+    }
+
+    bool readU8(size_t offset, uint8_t* out) const {
+        if (!out || !rangeValid(offset, 1)) return false;
+        *out = data[offset];
+        return true;
+    }
+
+    bool readS8(size_t offset, int8_t* out) const {
+        uint8_t value = 0;
+        if (!readU8(offset, &value) || !out) return false;
+        *out = static_cast<int8_t>(value);
+        return true;
+    }
+
+    bool readU16(size_t offset, uint16_t* out) const {
+        if (!out || !rangeValid(offset, 2)) return false;
+        *out = static_cast<uint16_t>((static_cast<uint16_t>(data[offset]) << 8) |
+                                     static_cast<uint16_t>(data[offset + 1]));
+        return true;
+    }
+
+    bool readS16(size_t offset, int16_t* out) const {
+        uint16_t value = 0;
+        if (!readU16(offset, &value) || !out) return false;
+        *out = static_cast<int16_t>(value);
+        return true;
+    }
+
+    bool readU32(size_t offset, uint32_t* out) const {
+        if (!out || !rangeValid(offset, 4)) return false;
+        *out = (static_cast<uint32_t>(data[offset]) << 24) |
+               (static_cast<uint32_t>(data[offset + 1]) << 16) |
+               (static_cast<uint32_t>(data[offset + 2]) << 8) |
+               static_cast<uint32_t>(data[offset + 3]);
+        return true;
+    }
+
+    bool getTable(const char* tag, TrueTypeTable* out) const {
+        auto it = tables.find(tag);
+        if (it == tables.end()) return false;
+        if (out) *out = it->second;
+        return true;
+    }
+
+    bool mapCodepointToGlyph(uint32_t codepoint, uint32_t* glyphIndex) const {
+        TrueTypeTable cmapTable;
+        if (!glyphIndex || !getTable("cmap", &cmapTable) || cmapTable.length < 4) return false;
+
+        uint16_t subtableCount = 0;
+        if (!readU16(cmapTable.offset + 2, &subtableCount)) return false;
+        if (cmapTable.length < 4 + static_cast<uint32_t>(subtableCount) * 8) return false;
+
+        struct CmapCandidate {
+            uint32_t offset;
+            uint16_t platform;
+            uint16_t encoding;
+            uint16_t format;
+            int score;
+        };
+        std::vector<CmapCandidate> candidates;
+        for (uint16_t i = 0; i < subtableCount; i++) {
+            const size_t recordOffset = cmapTable.offset + 4 + (static_cast<size_t>(i) * 8);
+            uint16_t platform = 0;
+            uint16_t encoding = 0;
+            uint32_t relativeOffset = 0;
+            if (!readU16(recordOffset, &platform) ||
+                !readU16(recordOffset + 2, &encoding) ||
+                !readU32(recordOffset + 4, &relativeOffset)) {
+                continue;
+            }
+            if (relativeOffset >= cmapTable.length) continue;
+
+            const uint32_t subtableOffset = cmapTable.offset + relativeOffset;
+            uint16_t format = 0;
+            if (!readU16(subtableOffset, &format)) continue;
+            if (format != 0 && format != 4 && format != 12) continue;
+
+            int score = 0;
+            if (platform == 3 && encoding == 10) score += 40;
+            if (platform == 3 && encoding == 1) score += 30;
+            if (platform == 0) score += 20;
+            if (format == 12) score += 12;
+            if (format == 4) score += 8;
+            if (format == 0) score += 1;
+            candidates.push_back({subtableOffset, platform, encoding, format, score});
+        }
+
+        std::sort(candidates.begin(), candidates.end(), [](const CmapCandidate& lhs, const CmapCandidate& rhs) {
+            return lhs.score > rhs.score;
+        });
+
+        for (const auto& candidate : candidates) {
+            uint32_t mappedGlyph = 0;
+            bool mapped = false;
+            if (candidate.format == 12) {
+                mapped = mapFormat12(candidate.offset, codepoint, &mappedGlyph);
+            } else if (candidate.format == 4) {
+                mapped = mapFormat4(candidate.offset, codepoint, &mappedGlyph);
+            } else if (candidate.format == 0) {
+                mapped = mapFormat0(candidate.offset, codepoint, &mappedGlyph);
+            }
+            if (mapped && mappedGlyph > 0) {
+                *glyphIndex = mappedGlyph;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    bool mapFormat0(uint32_t tableOffset, uint32_t codepoint, uint32_t* glyphIndex) const {
+        if (!glyphIndex || codepoint > 255 || !rangeValid(tableOffset, 262)) return false;
+        *glyphIndex = data[tableOffset + 6 + codepoint];
+        return *glyphIndex > 0;
+    }
+
+    bool mapFormat4(uint32_t tableOffset, uint32_t codepoint, uint32_t* glyphIndex) const {
+        if (!glyphIndex || codepoint > 0xFFFF || !rangeValid(tableOffset, 16)) return false;
+
+        uint16_t length = 0;
+        uint16_t segCountX2 = 0;
+        if (!readU16(tableOffset + 2, &length) ||
+            !readU16(tableOffset + 6, &segCountX2) ||
+            length < 16 ||
+            !rangeValid(tableOffset, length)) {
+            return false;
+        }
+
+        const uint16_t segCount = segCountX2 / 2;
+        const size_t endCodeOffset = tableOffset + 14;
+        const size_t startCodeOffset = endCodeOffset + (static_cast<size_t>(segCount) * 2) + 2;
+        const size_t idDeltaOffset = startCodeOffset + (static_cast<size_t>(segCount) * 2);
+        const size_t idRangeOffsetOffset = idDeltaOffset + (static_cast<size_t>(segCount) * 2);
+        if (!rangeValid(idRangeOffsetOffset, static_cast<size_t>(segCount) * 2)) return false;
+
+        for (uint16_t i = 0; i < segCount; i++) {
+            uint16_t endCode = 0;
+            uint16_t startCode = 0;
+            int16_t idDelta = 0;
+            uint16_t idRangeOffset = 0;
+            if (!readU16(endCodeOffset + (static_cast<size_t>(i) * 2), &endCode) ||
+                !readU16(startCodeOffset + (static_cast<size_t>(i) * 2), &startCode) ||
+                !readS16(idDeltaOffset + (static_cast<size_t>(i) * 2), &idDelta) ||
+                !readU16(idRangeOffsetOffset + (static_cast<size_t>(i) * 2), &idRangeOffset)) {
+                continue;
+            }
+
+            if (codepoint < startCode || codepoint > endCode) continue;
+
+            uint32_t mappedGlyph = 0;
+            if (idRangeOffset == 0) {
+                mappedGlyph = (codepoint + idDelta) & 0xFFFF;
+            } else {
+                const size_t glyphOffset =
+                        idRangeOffsetOffset +
+                        (static_cast<size_t>(i) * 2) +
+                        idRangeOffset +
+                        ((codepoint - startCode) * 2);
+                if (!rangeValid(glyphOffset, 2) || glyphOffset + 2 > tableOffset + length) {
+                    return false;
+                }
+                uint16_t glyphValue = 0;
+                if (!readU16(glyphOffset, &glyphValue)) return false;
+                mappedGlyph = glyphValue == 0 ? 0 : ((glyphValue + idDelta) & 0xFFFF);
+            }
+
+            *glyphIndex = mappedGlyph;
+            return mappedGlyph > 0;
+        }
+        return false;
+    }
+
+    bool mapFormat12(uint32_t tableOffset, uint32_t codepoint, uint32_t* glyphIndex) const {
+        if (!glyphIndex || !rangeValid(tableOffset, 16)) return false;
+
+        uint32_t length = 0;
+        uint32_t groupCount = 0;
+        if (!readU32(tableOffset + 4, &length) ||
+            !readU32(tableOffset + 12, &groupCount) ||
+            length < 16 ||
+            !rangeValid(tableOffset, length)) {
+            return false;
+        }
+
+        const size_t groupsOffset = tableOffset + 16;
+        if (!rangeValid(groupsOffset, static_cast<size_t>(groupCount) * 12)) return false;
+
+        for (uint32_t i = 0; i < groupCount; i++) {
+            const size_t groupOffset = groupsOffset + (static_cast<size_t>(i) * 12);
+            uint32_t startChar = 0;
+            uint32_t endChar = 0;
+            uint32_t startGlyph = 0;
+            if (!readU32(groupOffset, &startChar) ||
+                !readU32(groupOffset + 4, &endChar) ||
+                !readU32(groupOffset + 8, &startGlyph)) {
+                continue;
+            }
+            if (codepoint >= startChar && codepoint <= endChar) {
+                *glyphIndex = startGlyph + (codepoint - startChar);
+                return *glyphIndex > 0;
+            }
+        }
+        return false;
+    }
+
+    bool glyphDataRange(uint32_t glyphIndex, uint32_t* glyphOffset, uint32_t* glyphLength) const {
+        if (!glyphOffset || !glyphLength || glyphIndex >= numGlyphs) return false;
+
+        TrueTypeTable locaTable;
+        TrueTypeTable glyfTable;
+        if (!getTable("loca", &locaTable) || !getTable("glyf", &glyfTable)) return false;
+
+        uint32_t start = 0;
+        uint32_t end = 0;
+        if (indexToLocFormat == 0) {
+            uint16_t startShort = 0;
+            uint16_t endShort = 0;
+            const size_t locaOffset = locaTable.offset + (static_cast<size_t>(glyphIndex) * 2);
+            if (!readU16(locaOffset, &startShort) || !readU16(locaOffset + 2, &endShort)) return false;
+            start = static_cast<uint32_t>(startShort) * 2;
+            end = static_cast<uint32_t>(endShort) * 2;
+        } else {
+            const size_t locaOffset = locaTable.offset + (static_cast<size_t>(glyphIndex) * 4);
+            if (!readU32(locaOffset, &start) || !readU32(locaOffset + 4, &end)) return false;
+        }
+
+        if (end <= start || end > glyfTable.length) return false;
+        *glyphOffset = glyfTable.offset + start;
+        *glyphLength = end - start;
+        return rangeValid(*glyphOffset, *glyphLength);
+    }
+
+    void addContour(GlyphOutline* outline, const GlyphOutlineContour& contour) const {
+        if (!outline || contour.points.empty()) return;
+        for (const auto& point : contour.points) {
+            if (!outline->hasBounds) {
+                outline->minX = outline->maxX = point.x;
+                outline->minY = outline->maxY = point.y;
+                outline->hasBounds = true;
+            } else {
+                outline->minX = std::min(outline->minX, point.x);
+                outline->maxX = std::max(outline->maxX, point.x);
+                outline->minY = std::min(outline->minY, point.y);
+                outline->maxY = std::max(outline->maxY, point.y);
+            }
+        }
+        outline->contours.push_back(contour);
+    }
+
+    bool parseGlyph(uint32_t glyphIndex, const GlyphAffine& transform, GlyphOutline* outline, int depth) const {
+        if (!outline || depth > 12) return false;
+
+        uint32_t glyphOffset = 0;
+        uint32_t glyphLength = 0;
+        if (!glyphDataRange(glyphIndex, &glyphOffset, &glyphLength) || glyphLength < 10) return false;
+
+        int16_t contourCount = 0;
+        if (!readS16(glyphOffset, &contourCount)) return false;
+        if (contourCount >= 0) {
+            return parseSimpleGlyph(glyphOffset, glyphLength, contourCount, transform, outline);
+        }
+        return parseCompositeGlyph(glyphOffset, glyphLength, transform, outline, depth);
+    }
+
+    bool parseSimpleGlyph(
+            uint32_t glyphOffset,
+            uint32_t glyphLength,
+            int16_t contourCount,
+            const GlyphAffine& transform,
+            GlyphOutline* outline
+    ) const {
+        if (contourCount <= 0) return false;
+
+        const size_t endPointsOffset = glyphOffset + 10;
+        if (!rangeValid(endPointsOffset, static_cast<size_t>(contourCount) * 2)) return false;
+
+        std::vector<uint16_t> endPoints(static_cast<size_t>(contourCount));
+        for (int i = 0; i < contourCount; i++) {
+            if (!readU16(endPointsOffset + (static_cast<size_t>(i) * 2), &endPoints[i])) return false;
+        }
+
+        const uint16_t pointCount = static_cast<uint16_t>(endPoints.back() + 1);
+        const size_t instructionLengthOffset = endPointsOffset + (static_cast<size_t>(contourCount) * 2);
+        uint16_t instructionLength = 0;
+        if (!readU16(instructionLengthOffset, &instructionLength)) return false;
+
+        size_t cursor = instructionLengthOffset + 2 + instructionLength;
+        const size_t glyphEnd = glyphOffset + glyphLength;
+        if (cursor > glyphEnd) return false;
+
+        std::vector<uint8_t> flags;
+        flags.reserve(pointCount);
+        while (flags.size() < pointCount && cursor < glyphEnd) {
+            uint8_t flag = 0;
+            if (!readU8(cursor++, &flag)) return false;
+            flags.push_back(flag);
+            if ((flag & 0x08) != 0) {
+                uint8_t repeatCount = 0;
+                if (!readU8(cursor++, &repeatCount)) return false;
+                for (uint8_t repeatIndex = 0; repeatIndex < repeatCount && flags.size() < pointCount; repeatIndex++) {
+                    flags.push_back(flag);
+                }
+            }
+        }
+        if (flags.size() != pointCount) return false;
+
+        std::vector<int> xCoordinates(pointCount, 0);
+        std::vector<int> yCoordinates(pointCount, 0);
+        int currentX = 0;
+        for (uint16_t i = 0; i < pointCount; i++) {
+            int delta = 0;
+            if ((flags[i] & 0x02) != 0) {
+                uint8_t value = 0;
+                if (!readU8(cursor++, &value)) return false;
+                delta = ((flags[i] & 0x10) != 0) ? value : -static_cast<int>(value);
+            } else if ((flags[i] & 0x10) == 0) {
+                int16_t value = 0;
+                if (!readS16(cursor, &value)) return false;
+                cursor += 2;
+                delta = value;
+            }
+            currentX += delta;
+            xCoordinates[i] = currentX;
+        }
+
+        int currentY = 0;
+        for (uint16_t i = 0; i < pointCount; i++) {
+            int delta = 0;
+            if ((flags[i] & 0x04) != 0) {
+                uint8_t value = 0;
+                if (!readU8(cursor++, &value)) return false;
+                delta = ((flags[i] & 0x20) != 0) ? value : -static_cast<int>(value);
+            } else if ((flags[i] & 0x20) == 0) {
+                int16_t value = 0;
+                if (!readS16(cursor, &value)) return false;
+                cursor += 2;
+                delta = value;
+            }
+            currentY += delta;
+            yCoordinates[i] = currentY;
+        }
+
+        uint16_t startPoint = 0;
+        for (int contourIndex = 0; contourIndex < contourCount; contourIndex++) {
+            const uint16_t endPoint = endPoints[contourIndex];
+            if (endPoint < startPoint || endPoint >= pointCount) return false;
+
+            GlyphOutlineContour contour;
+            contour.points.reserve(static_cast<size_t>(endPoint - startPoint) + 1);
+            for (uint16_t pointIndex = startPoint; pointIndex <= endPoint; pointIndex++) {
+                GlyphOutlinePoint point = {
+                        static_cast<double>(xCoordinates[pointIndex]),
+                        static_cast<double>(yCoordinates[pointIndex]),
+                        (flags[pointIndex] & 0x01) != 0
+                };
+                contour.points.push_back(GlyphTransformPoint(transform, point));
+            }
+            addContour(outline, contour);
+            startPoint = static_cast<uint16_t>(endPoint + 1);
+        }
+
+        return true;
+    }
+
+    static double readF2Dot14(int16_t value) {
+        return static_cast<double>(value) / 16384.0;
+    }
+
+    bool parseCompositeGlyph(
+            uint32_t glyphOffset,
+            uint32_t glyphLength,
+            const GlyphAffine& parentTransform,
+            GlyphOutline* outline,
+            int depth
+    ) const {
+        const size_t glyphEnd = glyphOffset + glyphLength;
+        size_t cursor = glyphOffset + 10;
+        bool parsedAny = false;
+        bool moreComponents = true;
+
+        while (moreComponents && cursor + 4 <= glyphEnd) {
+            uint16_t flags = 0;
+            uint16_t componentGlyph = 0;
+            if (!readU16(cursor, &flags) || !readU16(cursor + 2, &componentGlyph)) return false;
+            cursor += 4;
+
+            int arg1 = 0;
+            int arg2 = 0;
+            if ((flags & 0x0001) != 0) {
+                int16_t first = 0;
+                int16_t second = 0;
+                if (!readS16(cursor, &first) || !readS16(cursor + 2, &second)) return false;
+                cursor += 4;
+                arg1 = first;
+                arg2 = second;
+            } else {
+                int8_t first = 0;
+                int8_t second = 0;
+                if (!readS8(cursor, &first) || !readS8(cursor + 1, &second)) return false;
+                cursor += 2;
+                arg1 = first;
+                arg2 = second;
+            }
+
+            if ((flags & 0x0002) == 0) {
+                return false;
+            }
+
+            GlyphAffine componentTransform = {1.0, 0.0, 0.0, 1.0, static_cast<double>(arg1), static_cast<double>(arg2)};
+            if ((flags & 0x0008) != 0) {
+                int16_t scale = 0;
+                if (!readS16(cursor, &scale)) return false;
+                cursor += 2;
+                componentTransform.a = readF2Dot14(scale);
+                componentTransform.d = readF2Dot14(scale);
+            } else if ((flags & 0x0040) != 0) {
+                int16_t xScale = 0;
+                int16_t yScale = 0;
+                if (!readS16(cursor, &xScale) || !readS16(cursor + 2, &yScale)) return false;
+                cursor += 4;
+                componentTransform.a = readF2Dot14(xScale);
+                componentTransform.d = readF2Dot14(yScale);
+            } else if ((flags & 0x0080) != 0) {
+                int16_t xScale = 0;
+                int16_t scale01 = 0;
+                int16_t scale10 = 0;
+                int16_t yScale = 0;
+                if (!readS16(cursor, &xScale) ||
+                    !readS16(cursor + 2, &scale01) ||
+                    !readS16(cursor + 4, &scale10) ||
+                    !readS16(cursor + 6, &yScale)) {
+                    return false;
+                }
+                cursor += 8;
+                componentTransform.a = readF2Dot14(xScale);
+                componentTransform.c = readF2Dot14(scale01);
+                componentTransform.b = readF2Dot14(scale10);
+                componentTransform.d = readF2Dot14(yScale);
+            }
+
+            const GlyphAffine combinedTransform = GlyphMultiplyMatrix(parentTransform, componentTransform);
+            if (!parseGlyph(componentGlyph, combinedTransform, outline, depth + 1)) {
+                return false;
+            }
+            parsedAny = true;
+            moreComponents = (flags & 0x0020) != 0;
+        }
+
+        return parsedAny;
+    }
+};
+
+static GlyphOutlinePoint MidPoint(const GlyphOutlinePoint& first, const GlyphOutlinePoint& second) {
+    return {
+            (first.x + second.x) * 0.5,
+            (first.y + second.y) * 0.5,
+            true
+    };
+}
+
+static void AppendQuadraticAsCubic(
+        FPDF_PAGEOBJECT path,
+        const GlyphOutlinePoint& start,
+        const GlyphOutlinePoint& control,
+        const GlyphOutlinePoint& end
+) {
+    const double cp1X = start.x + ((control.x - start.x) * (2.0 / 3.0));
+    const double cp1Y = start.y + ((control.y - start.y) * (2.0 / 3.0));
+    const double cp2X = end.x + ((control.x - end.x) * (2.0 / 3.0));
+    const double cp2Y = end.y + ((control.y - end.y) * (2.0 / 3.0));
+    FPDFPath_BezierTo(
+            path,
+            static_cast<float>(cp1X),
+            static_cast<float>(cp1Y),
+            static_cast<float>(cp2X),
+            static_cast<float>(cp2Y),
+            static_cast<float>(end.x),
+            static_cast<float>(end.y)
+    );
+}
+
+static bool AppendGlyphContourToPdfPath(FPDF_PAGEOBJECT path, const GlyphOutlineContour& contour) {
+    if (!path || contour.points.empty()) return false;
+
+    const int pointCount = static_cast<int>(contour.points.size());
+    const GlyphOutlinePoint& first = contour.points.front();
+    const GlyphOutlinePoint& last = contour.points.back();
+
+    GlyphOutlinePoint start = first;
+    int index = 1;
+    int consumed = 1;
+    if (!first.onCurve) {
+        if (last.onCurve) {
+            start = last;
+            index = 0;
+            consumed = 1;
+        } else {
+            start = MidPoint(last, first);
+            index = 0;
+            consumed = 0;
+        }
+    }
+
+    FPDFPath_MoveTo(path, static_cast<float>(start.x), static_cast<float>(start.y));
+    GlyphOutlinePoint current = start;
+
+    while (consumed < pointCount) {
+        const GlyphOutlinePoint& point = contour.points[index % pointCount];
+        if (point.onCurve) {
+            FPDFPath_LineTo(path, static_cast<float>(point.x), static_cast<float>(point.y));
+            current = point;
+            index++;
+            consumed++;
+        } else {
+            const GlyphOutlinePoint& next = contour.points[(index + 1) % pointCount];
+            if (next.onCurve) {
+                AppendQuadraticAsCubic(path, current, point, next);
+                current = next;
+                index += 2;
+                consumed += 2;
+            } else {
+                const GlyphOutlinePoint midpoint = MidPoint(point, next);
+                AppendQuadraticAsCubic(path, current, point, midpoint);
+                current = midpoint;
+                index++;
+                consumed++;
+            }
+        }
+    }
+
+    FPDFPath_Close(path);
+    return true;
+}
+
+static FPDF_PAGEOBJECT CreateGlyphPathObject(const GlyphOutline& outline) {
+    if (!outline.hasBounds || outline.contours.empty()) return nullptr;
+
+    FPDF_PAGEOBJECT path = nullptr;
+    for (const auto& contour : outline.contours) {
+        if (contour.points.empty()) continue;
+        if (!path) {
+            GlyphOutlinePoint start = contour.points.front();
+            if (!start.onCurve) {
+                const GlyphOutlinePoint& last = contour.points.back();
+                start = last.onCurve ? last : MidPoint(last, start);
+            }
+            path = FPDFPageObj_CreateNewPath(static_cast<float>(start.x), static_cast<float>(start.y));
+            if (!path) return nullptr;
+        }
+        AppendGlyphContourToPdfPath(path, contour);
+    }
+
+    return path;
+}
+//------------------------------------------------------------------------------------------------------
+
+static bool processSvgPathStamp(
+        JNIEnv* env,
+        FPDF_ANNOTATION annot,
+        FS_RECTF rect,
+        jobject json,
+        jstring jJsonStr,
+        jmethodID optS,
+        jmethodID optD,
+        jmethodID optI,
+        jmethodID optB,
+        int r,
+        int g,
+        int b,
+        int alpha
+) {
+    if (!env || !annot || !json || !jJsonStr || !optS || !optD || !optI || !optB) {
+        return false;
+    }
+
+    auto optStringValue = [&](const char* key) -> jstring {
+        jstring jKey = env->NewStringUTF(key);
+        jstring value = (jstring)env->CallObjectMethod(json, optS, jKey);
+        env->DeleteLocalRef(jKey);
+        return value;
+    };
+
+    auto optDoubleValue = [&](const char* key, double fallback) -> double {
+        jstring jKey = env->NewStringUTF(key);
+        const double value = env->CallDoubleMethod(json, optD, jKey, fallback);
+        env->DeleteLocalRef(jKey);
+        return value;
+    };
+
+    auto optIntValue = [&](const char* key, int fallback) -> int {
+        jstring jKey = env->NewStringUTF(key);
+        const int value = env->CallIntMethod(json, optI, jKey, fallback);
+        env->DeleteLocalRef(jKey);
+        return value;
+    };
+
+    auto optBoolValue = [&](const char* key, bool fallback) -> bool {
+        jstring jKey = env->NewStringUTF(key);
+        const bool value = env->CallBooleanMethod(
+                json,
+                optB,
+                jKey,
+                fallback ? JNI_TRUE : JNI_FALSE
+        ) == JNI_TRUE;
+        env->DeleteLocalRef(jKey);
+        return value;
+    };
+
+    jstring jPathData = optStringValue("pathData");
+    if (!jPathData) {
+        jPathData = optStringValue("svgPathData");
+    }
+    const char* rawPathData = jPathData ? env->GetStringUTFChars(jPathData, nullptr) : nullptr;
+    const std::string pathData = rawPathData ? rawPathData : "";
+    if (rawPathData) env->ReleaseStringUTFChars(jPathData, rawPathData);
+    if (jPathData) env->DeleteLocalRef(jPathData);
+    if (pathData.empty()) {
+        return false;
+    }
+
+    struct SvgParser {
+        const std::string& data;
+        size_t pos = 0;
+        char command = 0;
+        FPDF_PAGEOBJECT path = nullptr;
+        bool hasPath = false;
+        bool hasCurrent = false;
+        double currentX = 0.0;
+        double currentY = 0.0;
+        double startX = 0.0;
+        double startY = 0.0;
+        double lastCubicX = 0.0;
+        double lastCubicY = 0.0;
+        double lastQuadX = 0.0;
+        double lastQuadY = 0.0;
+        char previousCurve = 0;
+        double minX = 0.0;
+        double minY = 0.0;
+        double maxX = 0.0;
+        double maxY = 0.0;
+
+        bool isCommand(char c) const {
+            return c == 'M' || c == 'm' || c == 'L' || c == 'l' ||
+                   c == 'H' || c == 'h' || c == 'V' || c == 'v' ||
+                   c == 'C' || c == 'c' || c == 'S' || c == 's' ||
+                   c == 'Q' || c == 'q' || c == 'T' || c == 't' ||
+                   c == 'A' || c == 'a' || c == 'Z' || c == 'z';
+        }
+
+        void skipSeparators() {
+            while (pos < data.size()) {
+                const char c = data[pos];
+                if (std::isspace(static_cast<unsigned char>(c)) || c == ',') {
+                    pos++;
+                } else {
+                    break;
+                }
+            }
+        }
+
+        bool hasNumberAhead() {
+            skipSeparators();
+            if (pos >= data.size()) return false;
+            const char c = data[pos];
+            return c == '-' || c == '+' || c == '.' || std::isdigit(static_cast<unsigned char>(c));
+        }
+
+        bool readNumber(double* out) {
+            skipSeparators();
+            if (pos >= data.size()) return false;
+            char* endPtr = nullptr;
+            const char* start = data.c_str() + pos;
+            const double value = std::strtod(start, &endPtr);
+            if (endPtr == start) return false;
+            pos = static_cast<size_t>(endPtr - data.c_str());
+            *out = value;
+            return true;
+        }
+
+        void includePoint(double x, double y) {
+            if (!hasPath) {
+                minX = maxX = x;
+                minY = maxY = y;
+                hasPath = true;
+            } else {
+                minX = std::min(minX, x);
+                maxX = std::max(maxX, x);
+                minY = std::min(minY, y);
+                maxY = std::max(maxY, y);
+            }
+        }
+
+        bool ensurePath(double x, double y) {
+            if (!path) {
+                path = FPDFPageObj_CreateNewPath(static_cast<float>(x), static_cast<float>(y));
+                if (!path) return false;
+            } else {
+                FPDFPath_MoveTo(path, static_cast<float>(x), static_cast<float>(y));
+            }
+            currentX = startX = x;
+            currentY = startY = y;
+            hasCurrent = true;
+            includePoint(x, y);
+            previousCurve = 0;
+            return true;
+        }
+
+        void lineTo(double x, double y) {
+            if (!path && !ensurePath(x, y)) return;
+            FPDFPath_LineTo(path, static_cast<float>(x), static_cast<float>(y));
+            currentX = x;
+            currentY = y;
+            includePoint(x, y);
+            previousCurve = 0;
+        }
+
+        void cubicTo(double x1, double y1, double x2, double y2, double x, double y) {
+            if (!path && !ensurePath(currentX, currentY)) return;
+            FPDFPath_BezierTo(
+                    path,
+                    static_cast<float>(x1),
+                    static_cast<float>(y1),
+                    static_cast<float>(x2),
+                    static_cast<float>(y2),
+                    static_cast<float>(x),
+                    static_cast<float>(y)
+            );
+            includePoint(x1, y1);
+            includePoint(x2, y2);
+            includePoint(x, y);
+            currentX = x;
+            currentY = y;
+            lastCubicX = x2;
+            lastCubicY = y2;
+            previousCurve = 'C';
+        }
+
+        void quadTo(double x1, double y1, double x, double y) {
+            const double c1x = currentX + (2.0 / 3.0) * (x1 - currentX);
+            const double c1y = currentY + (2.0 / 3.0) * (y1 - currentY);
+            const double c2x = x + (2.0 / 3.0) * (x1 - x);
+            const double c2y = y + (2.0 / 3.0) * (y1 - y);
+            cubicTo(c1x, c1y, c2x, c2y, x, y);
+            lastQuadX = x1;
+            lastQuadY = y1;
+            previousCurve = 'Q';
+        }
+
+        void arcTo(double rx, double ry, double xAxisRotation, bool largeArc, bool sweep, double x, double y) {
+            if (rx == 0.0 || ry == 0.0 ||
+                (fabs(currentX - x) < 0.0001 && fabs(currentY - y) < 0.0001)) {
+                lineTo(x, y);
+                return;
+            }
+
+            rx = fabs(rx);
+            ry = fabs(ry);
+            const double phi = xAxisRotation * M_PI / 180.0;
+            const double cosPhi = cos(phi);
+            const double sinPhi = sin(phi);
+            const double dx2 = (currentX - x) / 2.0;
+            const double dy2 = (currentY - y) / 2.0;
+            const double x1p = (cosPhi * dx2) + (sinPhi * dy2);
+            const double y1p = (-sinPhi * dx2) + (cosPhi * dy2);
+
+            double rxSq = rx * rx;
+            double rySq = ry * ry;
+            const double x1pSq = x1p * x1p;
+            const double y1pSq = y1p * y1p;
+            const double radiusScale = (x1pSq / rxSq) + (y1pSq / rySq);
+            if (radiusScale > 1.0) {
+                const double scale = sqrt(radiusScale);
+                rx *= scale;
+                ry *= scale;
+                rxSq = rx * rx;
+                rySq = ry * ry;
+            }
+
+            const double sign = (largeArc == sweep) ? -1.0 : 1.0;
+            const double denom = (rxSq * y1pSq) + (rySq * x1pSq);
+            double coef = 0.0;
+            if (denom > 0.0) {
+                coef = sign * sqrt(std::max(0.0, ((rxSq * rySq) - (rxSq * y1pSq) - (rySq * x1pSq)) / denom));
+            }
+            const double cxp = coef * ((rx * y1p) / ry);
+            const double cyp = coef * (-(ry * x1p) / rx);
+            const double cx = (cosPhi * cxp) - (sinPhi * cyp) + ((currentX + x) / 2.0);
+            const double cy = (sinPhi * cxp) + (cosPhi * cyp) + ((currentY + y) / 2.0);
+
+            auto vectorAngle = [](double ux, double uy, double vx, double vy) {
+                const double dot = (ux * vx) + (uy * vy);
+                const double len = sqrt((ux * ux + uy * uy) * (vx * vx + vy * vy));
+                if (len <= 0.0) return 0.0;
+                const double clamped = std::max(-1.0, std::min(1.0, dot / len));
+                double angle = acos(clamped);
+                if ((ux * vy - uy * vx) < 0.0) angle = -angle;
+                return angle;
+            };
+
+            const double ux = (x1p - cxp) / rx;
+            const double uy = (y1p - cyp) / ry;
+            const double vx = (-x1p - cxp) / rx;
+            const double vy = (-y1p - cyp) / ry;
+            double startAngle = vectorAngle(1.0, 0.0, ux, uy);
+            double sweepAngle = vectorAngle(ux, uy, vx, vy);
+            if (!sweep && sweepAngle > 0.0) sweepAngle -= 2.0 * M_PI;
+            if (sweep && sweepAngle < 0.0) sweepAngle += 2.0 * M_PI;
+
+            const int segments = std::max(4, static_cast<int>(ceil(fabs(sweepAngle) / (M_PI / 12.0))));
+            for (int i = 1; i <= segments; i++) {
+                const double theta = startAngle + (sweepAngle * (static_cast<double>(i) / segments));
+                const double cosTheta = cos(theta);
+                const double sinTheta = sin(theta);
+                const double px = cx + (rx * cosPhi * cosTheta) - (ry * sinPhi * sinTheta);
+                const double py = cy + (rx * sinPhi * cosTheta) + (ry * cosPhi * sinTheta);
+                lineTo(px, py);
+            }
+            currentX = x;
+            currentY = y;
+            previousCurve = 0;
+        }
+
+        void closePath() {
+            if (path) {
+                FPDFPath_Close(path);
+                currentX = startX;
+                currentY = startY;
+                includePoint(currentX, currentY);
+            }
+            previousCurve = 0;
+        }
+
+        bool parse() {
+            while (pos < data.size()) {
+                skipSeparators();
+                if (pos >= data.size()) break;
+                if (isCommand(data[pos])) {
+                    command = data[pos++];
+                } else if (command == 0) {
+                    return false;
+                }
+
+                const bool relative = std::islower(static_cast<unsigned char>(command));
+                const char upper = static_cast<char>(std::toupper(static_cast<unsigned char>(command)));
+                if (upper == 'Z') {
+                    closePath();
+                    continue;
+                }
+
+                if (upper == 'M') {
+                    bool first = true;
+                    while (hasNumberAhead()) {
+                        double x = 0.0, y = 0.0;
+                        if (!readNumber(&x) || !readNumber(&y)) return false;
+                        if (relative) {
+                            x += currentX;
+                            y += currentY;
+                        }
+                        if (first) {
+                            if (!ensurePath(x, y)) return false;
+                            first = false;
+                        } else {
+                            lineTo(x, y);
+                        }
+                    }
+                    continue;
+                }
+
+                while (hasNumberAhead()) {
+                    if (upper == 'L') {
+                        double x = 0.0, y = 0.0;
+                        if (!readNumber(&x) || !readNumber(&y)) return false;
+                        if (relative) { x += currentX; y += currentY; }
+                        lineTo(x, y);
+                    } else if (upper == 'H') {
+                        double x = 0.0;
+                        if (!readNumber(&x)) return false;
+                        if (relative) x += currentX;
+                        lineTo(x, currentY);
+                    } else if (upper == 'V') {
+                        double y = 0.0;
+                        if (!readNumber(&y)) return false;
+                        if (relative) y += currentY;
+                        lineTo(currentX, y);
+                    } else if (upper == 'C') {
+                        double x1 = 0.0, y1 = 0.0, x2 = 0.0, y2 = 0.0, x = 0.0, y = 0.0;
+                        if (!readNumber(&x1) || !readNumber(&y1) ||
+                            !readNumber(&x2) || !readNumber(&y2) ||
+                            !readNumber(&x) || !readNumber(&y)) return false;
+                        if (relative) {
+                            x1 += currentX; y1 += currentY;
+                            x2 += currentX; y2 += currentY;
+                            x += currentX; y += currentY;
+                        }
+                        cubicTo(x1, y1, x2, y2, x, y);
+                    } else if (upper == 'S') {
+                        double x2 = 0.0, y2 = 0.0, x = 0.0, y = 0.0;
+                        if (!readNumber(&x2) || !readNumber(&y2) || !readNumber(&x) || !readNumber(&y)) return false;
+                        double x1 = currentX;
+                        double y1 = currentY;
+                        if (previousCurve == 'C') {
+                            x1 = (2.0 * currentX) - lastCubicX;
+                            y1 = (2.0 * currentY) - lastCubicY;
+                        }
+                        if (relative) {
+                            x2 += currentX; y2 += currentY;
+                            x += currentX; y += currentY;
+                        }
+                        cubicTo(x1, y1, x2, y2, x, y);
+                    } else if (upper == 'Q') {
+                        double x1 = 0.0, y1 = 0.0, x = 0.0, y = 0.0;
+                        if (!readNumber(&x1) || !readNumber(&y1) || !readNumber(&x) || !readNumber(&y)) return false;
+                        if (relative) {
+                            x1 += currentX; y1 += currentY;
+                            x += currentX; y += currentY;
+                        }
+                        quadTo(x1, y1, x, y);
+                    } else if (upper == 'T') {
+                        double x = 0.0, y = 0.0;
+                        if (!readNumber(&x) || !readNumber(&y)) return false;
+                        double x1 = currentX;
+                        double y1 = currentY;
+                        if (previousCurve == 'Q') {
+                            x1 = (2.0 * currentX) - lastQuadX;
+                            y1 = (2.0 * currentY) - lastQuadY;
+                        }
+                        if (relative) { x += currentX; y += currentY; }
+                        quadTo(x1, y1, x, y);
+                    } else if (upper == 'A') {
+                        double rx = 0.0, ry = 0.0, xAxisRotation = 0.0, largeArc = 0.0, sweep = 0.0, x = 0.0, y = 0.0;
+                        if (!readNumber(&rx) || !readNumber(&ry) || !readNumber(&xAxisRotation) ||
+                            !readNumber(&largeArc) || !readNumber(&sweep) ||
+                            !readNumber(&x) || !readNumber(&y)) return false;
+                        if (relative) { x += currentX; y += currentY; }
+                        arcTo(rx, ry, xAxisRotation, largeArc != 0.0, sweep != 0.0, x, y);
+                    } else {
+                        return false;
+                    }
+                }
+            }
+            return path && hasPath;
+        }
+    };
+
+    SvgParser parser{pathData};
+    if (!parser.parse() || !parser.path) {
+        if (parser.path) FPDFPageObj_Destroy(parser.path);
+        return false;
+    }
+
+    auto clampColor = [](int value) -> int {
+        return std::max(0, std::min(255, value));
+    };
+    const int defaultAlpha = alpha > 0 ? alpha : 255;
+    const int iconR = clampColor(optIntValue("iconColorR", optIntValue("textColorR", r)));
+    const int iconG = clampColor(optIntValue("iconColorG", optIntValue("textColorG", g)));
+    const int iconB = clampColor(optIntValue("iconColorB", optIntValue("textColorB", b)));
+    const int iconA = clampColor(optIntValue("iconColorA", optIntValue("textColorA", defaultAlpha)));
+
+    const double rectWidth = fabs(rect.right - rect.left);
+    const double rectHeight = fabs(rect.top - rect.bottom);
+    const double svgWidth = parser.maxX - parser.minX;
+    const double svgHeight = parser.maxY - parser.minY;
+    if (rectWidth <= 0.0 || rectHeight <= 0.0 || svgWidth <= 0.0001 || svgHeight <= 0.0001) {
+        FPDFPageObj_Destroy(parser.path);
+        return false;
+    }
+
+    const double rotation = optDoubleValue("rotation", 0.0);
+    const double baseWidth = optDoubleValue("baseWidth", rectWidth);
+    const double baseHeight = optDoubleValue("baseHeight", rectHeight);
+    const double angleRad = rotation * M_PI / 180.0;
+    const double absCos = fabs(cos(angleRad));
+    const double absSin = fabs(sin(angleRad));
+    const double storedExpandedWidth = (baseWidth * absCos) + (baseHeight * absSin);
+    const double storedExpandedHeight = (baseWidth * absSin) + (baseHeight * absCos);
+    double fitScale = 1.0;
+    if (storedExpandedWidth > 0.0 && storedExpandedHeight > 0.0) {
+        fitScale = std::min(rectWidth / storedExpandedWidth, rectHeight / storedExpandedHeight);
+    }
+    const double drawWidth = std::max(baseWidth * fitScale, 1.0);
+    const double drawHeight = std::max(baseHeight * fitScale, 1.0);
+    const double scale = std::max(std::min(drawWidth / svgWidth, drawHeight / svgHeight), 0.0001);
+    const double centerX = (rect.left + rect.right) / 2.0;
+    const double centerY = (rect.top + rect.bottom) / 2.0;
+    const bool flipHorizontal = optBoolValue(
+            "effectiveFlipHorizontal",
+            optBoolValue("flipHorizontal", false)
+    );
+    const bool flipVertical = optBoolValue(
+            "effectiveFlipVertical",
+            optBoolValue("flipVertical", false)
+    );
+
+    const double pathCenterX = ((parser.minX + parser.maxX) / 2.0) * scale;
+    const double pathCenterY = ((parser.minY + parser.maxY) / 2.0) * scale;
+    const double cosA = cos(angleRad);
+    const double sinA = sin(angleRad);
+    const double flipX = flipHorizontal ? -1.0 : 1.0;
+    const double flipY = flipVertical ? 1.0 : -1.0;
+    const double matrixA = cosA * scale * flipX;
+    const double matrixB = sinA * scale * flipX;
+    const double matrixC = -sinA * scale * flipY;
+    const double matrixD = cosA * scale * flipY;
+    const double flippedPathCenterX = pathCenterX * flipX;
+    const double flippedPathCenterY = pathCenterY * flipY;
+    const double matrixE = centerX - ((flippedPathCenterX * cosA) - (flippedPathCenterY * sinA));
+    const double matrixF = centerY - ((flippedPathCenterX * sinA) + (flippedPathCenterY * cosA));
+
+    FPDFPageObj_SetFillColor(parser.path, iconR, iconG, iconB, iconA);
+    FPDFPath_SetDrawMode(parser.path, FPDF_FILLMODE_ALTERNATE, JNI_FALSE);
+    FPDFPageObj_Transform(parser.path, matrixA, matrixB, matrixC, matrixD, matrixE, matrixF);
+    FPDFAnnot_SetRect(annot, &rect);
+    FPDFAnnot_SetColor(annot, FPDFANNOT_COLORTYPE_Color, iconR, iconG, iconB, iconA);
+    FPDFAnnot_SetBorder(annot, 0, 0, 0);
+
+    if (!FPDFAnnot_AppendObject(annot, parser.path)) {
+        FPDFPageObj_Destroy(parser.path);
+        return false;
+    }
+
+    FPDFAnnot_UpdateObject(annot, parser.path);
+    SetAnnotWideStringValueFromJString(env, annot, "LufickImageMeta", jJsonStr);
+    SetAnnotWideStringValueFromJString(env, annot, "LufickShapeElementMeta", jJsonStr);
+    SetAnnotAsciiStringValue(annot, "LufickStampKind", "shape_element_svg");
+    FPDFAnnot_SetFlags(annot, FPDF_ANNOT_FLAG_PRINT | FPDF_ANNOT_FLAG_READONLY);
+    return true;
+}
+
+static bool processStickerStamp(
+        JNIEnv* env,
+        FPDF_DOCUMENT doc,
+        FPDF_ANNOTATION annot,
+        FS_RECTF rect,
+        jobject json,
+        jstring jJsonStr,
+        jmethodID optS,
+        jmethodID optD,
+        jmethodID optI,
+        jmethodID optB,
+        int r,
+        int g,
+        int b,
+        int alpha
+) {
+    if (!env || !doc || !annot || !json || !jJsonStr || !optS || !optD || !optI || !optB) {
+        return false;
+    }
+
+    auto optStringValue = [&](const char* key) -> jstring {
+        jstring jKey = env->NewStringUTF(key);
+        jstring value = (jstring)env->CallObjectMethod(json, optS, jKey);
+        env->DeleteLocalRef(jKey);
+        return value;
+    };
+
+    auto optDoubleValue = [&](const char* key, double fallback) -> double {
+        jstring jKey = env->NewStringUTF(key);
+        const double value = env->CallDoubleMethod(json, optD, jKey, fallback);
+        env->DeleteLocalRef(jKey);
+        return value;
+    };
+
+    auto optIntValue = [&](const char* key, int fallback) -> int {
+        jstring jKey = env->NewStringUTF(key);
+        const int value = env->CallIntMethod(json, optI, jKey, fallback);
+        env->DeleteLocalRef(jKey);
+        return value;
+    };
+
+    auto optBoolValue = [&](const char* key, bool fallback) -> bool {
+        jstring jKey = env->NewStringUTF(key);
+        const bool value = env->CallBooleanMethod(
+                json,
+                optB,
+                jKey,
+                fallback ? JNI_TRUE : JNI_FALSE
+        ) == JNI_TRUE;
+        env->DeleteLocalRef(jKey);
+        return value;
+    };
+
+    jstring jGlyph = optStringValue("glyph");
+    jstring jFontPath = optStringValue("fontPath");
+    const char* fontPath = jFontPath ? env->GetStringUTFChars(jFontPath, nullptr) : nullptr;
+
+    const std::string resolvedFontPath = fontPath ? fontPath : "";
+    const std::u16string glyph = JStringToUtf16(env, jGlyph);
+    uint32_t glyphCodepoint = static_cast<uint32_t>(std::max(optIntValue("glyphCode", 0), 0));
+    if (glyphCodepoint == 0 && !glyph.empty()) {
+        const uint16_t first = static_cast<uint16_t>(glyph[0]);
+        if (first >= 0xD800 && first <= 0xDBFF && glyph.size() > 1) {
+            const uint16_t second = static_cast<uint16_t>(glyph[1]);
+            if (second >= 0xDC00 && second <= 0xDFFF) {
+                glyphCodepoint = 0x10000 +
+                                 (((static_cast<uint32_t>(first) - 0xD800) << 10) |
+                                  (static_cast<uint32_t>(second) - 0xDC00));
+            }
+        } else {
+            glyphCodepoint = first;
+        }
+    }
+
+    auto cleanupStrings = [&]() {
+        if (fontPath) env->ReleaseStringUTFChars(jFontPath, fontPath);
+        if (jFontPath) env->DeleteLocalRef(jFontPath);
+        if (jGlyph) env->DeleteLocalRef(jGlyph);
+    };
+
+    if (glyphCodepoint == 0 || resolvedFontPath.empty()) {
+        cleanupStrings();
+        return false;
+    }
+
+    cleanupStrings();
+
+    std::vector<uint8_t> fontBytes;
+    if (!ReadFileBytes(resolvedFontPath.c_str(), &fontBytes)) {
+        return false;
+    }
+    TrueTypeGlyphReader glyphReader(fontBytes);
+    GlyphOutline glyphOutline;
+    if (!glyphReader.load() || !glyphReader.loadGlyphForCodepoint(glyphCodepoint, &glyphOutline)) {
+        return false;
+    }
+
+    const int defaultAlpha = alpha > 0 ? alpha : 255;
+    auto clampColor = [](int value) -> int {
+        return std::max(0, std::min(255, value));
+    };
+    const int iconR = clampColor(optIntValue("iconColorR", optIntValue("textColorR", r)));
+    const int iconG = clampColor(optIntValue("iconColorG", optIntValue("textColorG", g)));
+    const int iconB = clampColor(optIntValue("iconColorB", optIntValue("textColorB", b)));
+    const int iconA = clampColor(optIntValue("iconColorA", optIntValue("textColorA", defaultAlpha)));
+
+    const double rectWidth = fabs(rect.right - rect.left);
+    const double rectHeight = fabs(rect.top - rect.bottom);
+    if (rectWidth <= 0.0 || rectHeight <= 0.0) {
+        return false;
+    }
+
+    const double rotation = optDoubleValue("rotation", 0.0);
+    const double baseWidth = optDoubleValue("baseWidth", rectWidth);
+    const double baseHeight = optDoubleValue("baseHeight", rectHeight);
+    const double angleRad = rotation * M_PI / 180.0;
+    const double absCos = fabs(cos(angleRad));
+    const double absSin = fabs(sin(angleRad));
+    const double storedExpandedWidth = (baseWidth * absCos) + (baseHeight * absSin);
+    const double storedExpandedHeight = (baseWidth * absSin) + (baseHeight * absCos);
+    double fitScale = 1.0;
+    if (storedExpandedWidth > 0.0 && storedExpandedHeight > 0.0) {
+        fitScale = std::min(rectWidth / storedExpandedWidth, rectHeight / storedExpandedHeight);
+    }
+    const double drawWidth = std::max(baseWidth * fitScale, 1.0);
+    const double drawHeight = std::max(baseHeight * fitScale, 1.0);
+    const double centerX = (rect.left + rect.right) / 2.0;
+    const double centerY = (rect.top + rect.bottom) / 2.0;
+    const bool flipHorizontal = optBoolValue(
+            "effectiveFlipHorizontal",
+            optBoolValue("flipHorizontal", false)
+    );
+    const bool flipVertical = optBoolValue(
+            "effectiveFlipVertical",
+            optBoolValue("flipVertical", false)
+    );
+
+    FPDF_PAGEOBJECT pathObj = CreateGlyphPathObject(glyphOutline);
+    if (!pathObj) {
+        return false;
+    }
+
+    FPDFPageObj_SetFillColor(pathObj, iconR, iconG, iconB, iconA);
+    FPDFPath_SetDrawMode(pathObj, FPDF_FILLMODE_WINDING, JNI_FALSE);
+
+    double tL = glyphOutline.minX;
+    double tB = glyphOutline.minY;
+    double tR = glyphOutline.maxX;
+    double tT = glyphOutline.maxY;
+    double glyphWidth = tR - tL;
+    double glyphHeight = tT - tB;
+    if (glyphWidth <= 0.0001 || glyphHeight <= 0.0001) {
+        tL = 0.0f;
+        tB = 0.0f;
+        tR = 1.0f;
+        tT = 1.0f;
+        glyphWidth = 1.0;
+        glyphHeight = 1.0;
+    }
+
+    const double scale = std::max(
+            std::min(drawWidth / glyphWidth, drawHeight / glyphHeight),
+            0.0001
+    );
+    const double glyphCenterX = ((tL + tR) / 2.0) * scale;
+    const double glyphCenterY = ((tB + tT) / 2.0) * scale;
+    const double cosA = cos(angleRad);
+    const double sinA = sin(angleRad);
+    const double flipX = flipHorizontal ? -1.0 : 1.0;
+    const double flipY = flipVertical ? -1.0 : 1.0;
+    const double flippedGlyphCenterX = glyphCenterX * flipX;
+    const double flippedGlyphCenterY = glyphCenterY * flipY;
+    const double matrixA = cosA * scale * flipX;
+    const double matrixB = sinA * scale * flipX;
+    const double matrixC = -sinA * scale * flipY;
+    const double matrixD = cosA * scale * flipY;
+    const double matrixE = centerX - ((flippedGlyphCenterX * cosA) - (flippedGlyphCenterY * sinA));
+    const double matrixF = centerY - ((flippedGlyphCenterX * sinA) + (flippedGlyphCenterY * cosA));
+
+    FPDFPageObj_Transform(pathObj, matrixA, matrixB, matrixC, matrixD, matrixE, matrixF);
+    FPDFAnnot_SetRect(annot, &rect);
+    FPDFAnnot_SetColor(annot, FPDFANNOT_COLORTYPE_Color, iconR, iconG, iconB, iconA);
+    FPDFAnnot_SetBorder(annot, 0, 0, 0);
+
+    if (!FPDFAnnot_AppendObject(annot, pathObj)) {
+        FPDFPageObj_Destroy(pathObj);
+        return false;
+    }
+
+    FPDFAnnot_UpdateObject(annot, pathObj);
+    SetAnnotWideStringValueFromJString(env, annot, "LufickImageMeta", jJsonStr);
+    SetAnnotWideStringValueFromJString(env, annot, "LufickStickerMeta", jJsonStr);
+    SetAnnotAsciiStringValue(annot, "LufickStampKind", "sticker");
+    FPDFAnnot_SetFlags(annot, FPDF_ANNOT_FLAG_PRINT | FPDF_ANNOT_FLAG_READONLY);
+    return true;
+}
+
+static bool processImageOrPresetStamp(
         JNIEnv* env,
         jobject obj,
         FPDF_DOCUMENT doc,
@@ -4365,6 +5745,8 @@ static bool processImageStamp(
 
     jmethodID optS = env->GetMethodID(jsonClass, "optString", "(Ljava/lang/String;)Ljava/lang/String;");
     jmethodID optD = env->GetMethodID(jsonClass, "optDouble", "(Ljava/lang/String;D)D");
+    jmethodID optI = env->GetMethodID(jsonClass, "optInt", "(Ljava/lang/String;I)I");
+    jmethodID optB = env->GetMethodID(jsonClass, "optBoolean", "(Ljava/lang/String;Z)Z");
 
     jstring jImagePathKey = env->NewStringUTF("flattenedAssetPath");
     jstring jStampKindKey = env->NewStringUTF("stampKind");
@@ -4386,6 +5768,12 @@ static bool processImageStamp(
             (stampKind && strlen(stampKind) > 0) ? stampKind : "image";
     const std::string resolvedAssetFormat =
             (assetFormat && strlen(assetFormat) > 0) ? assetFormat : "";
+    auto toLowerAscii = [](std::string value) {
+        std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
+            return static_cast<char>(std::tolower(c));
+        });
+        return value;
+    };
 
     auto releaseJsonStrings = [&]() {
         if (assetFormat) env->ReleaseStringUTFChars(jAssetFormat, assetFormat);
@@ -4395,6 +5783,65 @@ static bool processImageStamp(
         if (imagePath) env->ReleaseStringUTFChars(jImagePath, imagePath);
         if (jImagePath) env->DeleteLocalRef(jImagePath);
     };
+
+    const std::string normalizedStampKind = toLowerAscii(resolvedStampKind);
+    const std::string normalizedAssetFormat = toLowerAscii(resolvedAssetFormat);
+    jstring jPresetStampKey = env->NewStringUTF("presetStamp");
+    const bool isPresetStamp = env->CallBooleanMethod(json, optB, jPresetStampKey, false);
+    env->DeleteLocalRef(jPresetStampKey);
+    const bool shouldSaveAsPresetStamp =
+            normalizedStampKind == "preset_stamp" ||
+            normalizedStampKind == "preset stamp" ||
+            isPresetStamp;
+    if (normalizedAssetFormat == "svg-path" ||
+        normalizedAssetFormat == "svg" ||
+        normalizedStampKind == "shape_element_svg") {
+        const bool savedSvgPath = processSvgPathStamp(
+                env,
+                annot,
+                rect,
+                json,
+                jJsonStr,
+                optS,
+                optD,
+                optI,
+                optB,
+                0,
+                0,
+                0,
+                255
+        );
+        releaseJsonStrings();
+        if (jSignatureSubtype) env->DeleteLocalRef(jSignatureSubtype);
+        env->DeleteLocalRef(json);
+        env->DeleteLocalRef(jJsonStr);
+        return savedSvgPath;
+    }
+    if (normalizedStampKind == "sticker" ||
+        normalizedAssetFormat == "font-glyph" ||
+        normalizedAssetFormat == "glyph-path") {
+        const bool savedSticker = processStickerStamp(
+                env,
+                doc,
+                annot,
+                rect,
+                json,
+                jJsonStr,
+                optS,
+                optD,
+                optI,
+                optB,
+                0,
+                0,
+                0,
+                255
+        );
+        releaseJsonStrings();
+        if (jSignatureSubtype) env->DeleteLocalRef(jSignatureSubtype);
+        env->DeleteLocalRef(json);
+        env->DeleteLocalRef(jJsonStr);
+        return savedSticker;
+    }
 
     if (!imagePath || strlen(imagePath) == 0) {
         releaseJsonStrings();
@@ -4429,14 +5876,7 @@ static bool processImageStamp(
         return value.size() >= suffix.size() &&
                value.compare(value.size() - suffix.size(), suffix.size(), suffix) == 0;
     };
-    auto toLowerAscii = [](std::string value) {
-        std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
-            return static_cast<char>(std::tolower(c));
-        });
-        return value;
-    };
 
-    const std::string normalizedAssetFormat = toLowerAscii(resolvedAssetFormat);
     const std::string normalizedPath = toLowerAscii(imagePath);
     bool preferJpegInline =
             normalizedAssetFormat == "jpg" ||
@@ -4494,7 +5934,15 @@ static bool processImageStamp(
     FPDFAnnot_UpdateObject(annot, imageObj);
     const jchar* rawJsonContent = env->GetStringChars(jJsonStr, nullptr);
     FPDFAnnot_SetStringValue(annot, "LufickImageMeta", (FPDF_WIDESTRING)rawJsonContent);
-    SetAnnotAsciiStringValue(annot, "LufickStampKind", resolvedStampKind.c_str());
+    SetAnnotAsciiStringValue(
+            annot,
+            "LufickStampKind",
+            shouldSaveAsPresetStamp ? "preset_stamp" : resolvedStampKind.c_str()
+    );
+    if (shouldSaveAsPresetStamp) {
+        FPDFAnnot_SetStringValue(annot, "LufickPresetStampMeta", (FPDF_WIDESTRING)rawJsonContent);
+        SetAnnotAsciiStringValue(annot, "LufickPresetStamp", "1");
+    }
     if (jSignatureSubtype && env->GetStringLength(jSignatureSubtype) > 0) {
         SetAnnotWideStringValueFromJString(env, annot, "LufickSignatureSubtype", jSignatureSubtype);
         if (JStringToUtf16(env, jSignatureSubtype) == u"Sign_Image") {
@@ -5210,8 +6658,21 @@ static void ResolveAnnotAppearanceColors(
         FPDF_PAGEOBJECT pageObject = FPDFAnnot_GetObject(annot, objectIndex);
         if (!pageObject) continue;
 
+        const bool isPathObject = FPDFPageObj_GetType(pageObject) == FPDF_PAGEOBJ_PATH;
+        bool pathHasFill = true;
+        bool pathHasStroke = true;
+        if (isPathObject) {
+            int fillMode = FPDF_FILLMODE_NONE;
+            FPDF_BOOL isStroked = false;
+            if (FPDFPath_GetDrawMode(pageObject, &fillMode, &isStroked)) {
+                pathHasFill = fillMode != FPDF_FILLMODE_NONE;
+                pathHasStroke = isStroked;
+            }
+        }
+
         unsigned int objR = 0, objG = 0, objB = 0, objA = 0;
-        if (!*hasFillColor &&
+        if (pathHasFill &&
+            !*hasFillColor &&
             FPDFPageObj_GetFillColor(pageObject, &objR, &objG, &objB, &objA) &&
             objA > 0) {
             *hasFillColor = true;
@@ -5222,7 +6683,8 @@ static void ResolveAnnotAppearanceColors(
         }
 
         objR = objG = objB = objA = 0;
-        if (!*hasStrokeColor &&
+        if (pathHasStroke &&
+            !*hasStrokeColor &&
             FPDFPageObj_GetStrokeColor(pageObject, &objR, &objG, &objB, &objA) &&
             objA > 0) {
             *hasStrokeColor = true;
@@ -6114,7 +7576,7 @@ static bool ApplyNativeAnnotationEditActions(
                         else if (typeInt == 10) processStickyNoteComment(env, obj, annot, textPropsField, r, g, b, alpha, jsonClass, jsonInit);
                         else if (typeInt == 5) processTextStamp(env, obj, doc, page, annot, rect, textPropsField, r, g, b, alpha, jsonClass, jsonInit);
                         else if (typeInt == 11) processFreeText(env, obj, doc, annot, rect, textPropsField, r, g, b, alpha, jsonClass, jsonInit);
-                        else if (typeInt == 9) processImageStamp(env, obj, doc, page, annot, rect, imagePropsField, jsonClass, jsonInit);
+                        else if (typeInt == 9) processImageOrPresetStamp(env, obj, doc, page, annot, rect, imagePropsField, jsonClass, jsonInit);
                         else if (typeInt == 7) {
                             processRegionHighlight(env, obj, page, annot, rect, r, g, b, alpha);
                         }
@@ -6357,7 +7819,7 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeSaveAnnotat
                     else if (typeInt == 10) processStickyNoteComment(env, obj, annot, textPropsField, r, g, b, alpha, jsonClass, jsonInit);
                     else if (typeInt == 5) processTextStamp(env, obj, doc, currentPage, annot, rect, textPropsField, r, g, b, alpha, jsonClass, jsonInit);
                     else if (typeInt == 11) processFreeText(env, obj, doc, annot, rect, textPropsField, r, g, b, alpha, jsonClass, jsonInit);
-                    else if (typeInt == 9) processImageStamp(env, obj, doc, currentPage, annot, rect, imagePropsField, jsonClass, jsonInit);
+                    else if (typeInt == 9) processImageOrPresetStamp(env, obj, doc, currentPage, annot, rect, imagePropsField, jsonClass, jsonInit);
                     else if (typeInt == 7) {
                         processRegionHighlight(env, obj, currentPage, annot, rect, r, g, b, alpha);
                     }
@@ -6777,6 +8239,10 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeGetAnnotati
             }
             borderWidth = ResolveAnnotAppearanceStrokeWidth(annot, borderWidth);
 
+            const int strokeRForProps = hasStrokeColor ? (int)r : 0;
+            const int strokeGForProps = hasStrokeColor ? (int)g : 0;
+            const int strokeBForProps = hasStrokeColor ? (int)b : 0;
+            const int strokeAlphaForProps = hasStrokeColor ? (int)a : 0;
             const int fillAlphaForProps = hasInteriorColor ? (int)interiorA : 0;
             std::ostringstream shapeProps;
             shapeProps << "{"
@@ -6793,10 +8259,10 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeGetAnnotati
                        << "\"height\":" << fabs(shapeRect.top - shapeRect.bottom) << ","
                        << "\"rotation\":0,"
                        << "\"strokeWidth\":" << borderWidth << ","
-                       << "\"strokeR\":" << (int)r << ","
-                       << "\"strokeG\":" << (int)g << ","
-                       << "\"strokeB\":" << (int)b << ","
-                       << "\"strokeA\":" << (int)a << ","
+                       << "\"strokeR\":" << strokeRForProps << ","
+                       << "\"strokeG\":" << strokeGForProps << ","
+                       << "\"strokeB\":" << strokeBForProps << ","
+                       << "\"strokeA\":" << strokeAlphaForProps << ","
                        << "\"fillR\":" << (hasInteriorColor ? (int)interiorR : 0) << ","
                        << "\"fillG\":" << (hasInteriorColor ? (int)interiorG : 0) << ","
                        << "\"fillB\":" << (hasInteriorColor ? (int)interiorB : 0) << ","
@@ -6814,7 +8280,11 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeGetAnnotati
 
         if (type == 5) {
             const std::u16string stampKind = ReadAnnotStringValueUtf16(annot, "LufickStampKind");
-            if (stampKind == u"image" || stampKind == u"signature") {
+            if (stampKind == u"image" ||
+                stampKind == u"signature" ||
+                stampKind == u"sticker" ||
+                stampKind == u"preset_stamp" ||
+                stampKind == u"shape_element_svg") {
                 type = 9;
                 r = 0;
                 g = 0;
