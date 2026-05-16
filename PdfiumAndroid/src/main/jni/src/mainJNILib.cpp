@@ -261,10 +261,17 @@ FPDF_BITMAP ConvertToFPDFBitmap(JNIEnv *env, jobject bitmap) {
                 for (uint32_t x = 0; x < info.width; ++x) {
                     const uint8_t* srcPixel = srcLine + (x * 4);
                     uint8_t* dstPixel = dstLine + (x * 4);
-                    dstPixel[0] = srcPixel[2];
-                    dstPixel[1] = srcPixel[1];
-                    dstPixel[2] = srcPixel[0];
-                    dstPixel[3] = srcPixel[3];
+                    if (srcPixel[3] == 0) {
+                        dstPixel[0] = 255;
+                        dstPixel[1] = 255;
+                        dstPixel[2] = 255;
+                        dstPixel[3] = 0;
+                    } else {
+                        dstPixel[0] = srcPixel[2];
+                        dstPixel[1] = srcPixel[1];
+                        dstPixel[2] = srcPixel[0];
+                        dstPixel[3] = srcPixel[3];
+                    }
                 }
             }
             break;
@@ -5854,14 +5861,17 @@ static bool processImageOrPresetStamp(
     jstring jRotationKey = env->NewStringUTF("rotation");
     jstring jBaseWidthKey = env->NewStringUTF("baseWidth");
     jstring jBaseHeightKey = env->NewStringUTF("baseHeight");
+    jstring jStretchToBoundsKey = env->NewStringUTF("stretchToBounds");
     const double rectWidth = fabs(rect.right - rect.left);
     const double rectHeight = fabs(rect.top - rect.bottom);
     const double rotation = env->CallDoubleMethod(json, optD, jRotationKey, 0.0);
     const double baseWidth = env->CallDoubleMethod(json, optD, jBaseWidthKey, rectWidth);
     const double baseHeight = env->CallDoubleMethod(json, optD, jBaseHeightKey, rectHeight);
+    const bool stretchToBounds = env->CallBooleanMethod(json, optB, jStretchToBoundsKey, false);
     env->DeleteLocalRef(jRotationKey);
     env->DeleteLocalRef(jBaseWidthKey);
     env->DeleteLocalRef(jBaseHeightKey);
+    env->DeleteLocalRef(jStretchToBoundsKey);
 
     FPDF_PAGEOBJECT imageObj = FPDFPageObj_NewImageObj(doc);
     if (!imageObj) {
@@ -5909,8 +5919,8 @@ static bool processImageOrPresetStamp(
     if (storedExpandedWidth > 0.0 && storedExpandedHeight > 0.0) {
         fitScale = std::min(rectWidth / storedExpandedWidth, rectHeight / storedExpandedHeight);
     }
-    const double drawWidth = std::max(baseWidth * fitScale, 1.0);
-    const double drawHeight = std::max(baseHeight * fitScale, 1.0);
+    const double drawWidth = std::max(stretchToBounds ? baseWidth : baseWidth * fitScale, 1.0);
+    const double drawHeight = std::max(stretchToBounds ? baseHeight : baseHeight * fitScale, 1.0);
     const double centerX = (rect.left + rect.right) / 2.0;
     const double centerY = (rect.top + rect.bottom) / 2.0;
     const double cosA = cos(angleRad);
