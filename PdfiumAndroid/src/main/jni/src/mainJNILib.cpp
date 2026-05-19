@@ -2268,6 +2268,72 @@ static PdfShapePoint PdfShapePointFromFraction(
     return RotatePdfShapePoint(point, centerX, centerY, rotationDegrees);
 }
 
+static std::vector<PdfShapePoint> ReadPdfShapePointsFromJson(
+        JNIEnv* env,
+        jobject json,
+        jclass jsonClass
+) {
+    std::vector<PdfShapePoint> points;
+    if (!env || !json || !jsonClass) return points;
+
+    jmethodID optArrayMethod = env->GetMethodID(jsonClass, "optJSONArray", "(Ljava/lang/String;)Lorg/json/JSONArray;");
+    if (!optArrayMethod) return points;
+
+    jstring pointsKey = env->NewStringUTF("points");
+    jobject pointsArray = env->CallObjectMethod(json, optArrayMethod, pointsKey);
+    env->DeleteLocalRef(pointsKey);
+    if (!pointsArray) return points;
+
+    jclass arrayClass = env->FindClass("org/json/JSONArray");
+    jmethodID lengthMethod = arrayClass ? env->GetMethodID(arrayClass, "length", "()I") : nullptr;
+    jmethodID optObjectMethod = arrayClass ? env->GetMethodID(arrayClass, "optJSONObject", "(I)Lorg/json/JSONObject;") : nullptr;
+    jmethodID optDoubleMethod = env->GetMethodID(jsonClass, "optDouble", "(Ljava/lang/String;D)D");
+    if (!lengthMethod || !optObjectMethod || !optDoubleMethod) {
+        env->DeleteLocalRef(pointsArray);
+        if (arrayClass) env->DeleteLocalRef(arrayClass);
+        return points;
+    }
+
+    jstring xKey = env->NewStringUTF("x");
+    jstring yKey = env->NewStringUTF("y");
+    const jint count = env->CallIntMethod(pointsArray, lengthMethod);
+    const jint safeCount = std::min(count, static_cast<jint>(64));
+    for (jint index = 0; index < safeCount; index++) {
+        jobject pointObject = env->CallObjectMethod(pointsArray, optObjectMethod, index);
+        if (!pointObject) continue;
+        const double x = env->CallDoubleMethod(pointObject, optDoubleMethod, xKey, 0.0);
+        const double y = env->CallDoubleMethod(pointObject, optDoubleMethod, yKey, 0.0);
+        points.push_back({static_cast<float>(x), static_cast<float>(y)});
+        env->DeleteLocalRef(pointObject);
+    }
+    env->DeleteLocalRef(xKey);
+    env->DeleteLocalRef(yKey);
+    env->DeleteLocalRef(pointsArray);
+    if (arrayClass) env->DeleteLocalRef(arrayClass);
+    return points;
+}
+
+static PdfShapePoint OffsetPdfShapePointFromLineEnd(
+        PdfShapePoint start,
+        PdfShapePoint end,
+        float backDistance,
+        float perpendicularDistance
+) {
+    const float dx = end.x - start.x;
+    const float dy = end.y - start.y;
+    const float length = fmax(hypotf(dx, dy), 0.001f);
+    const float ux = dx / length;
+    const float uy = dy / length;
+    return {
+            end.x - (ux * backDistance) - (uy * perpendicularDistance),
+            end.y - (uy * backDistance) + (ux * perpendicularDistance)
+    };
+}
+
+static float ResolvePdfArrowHeadLength(float strokeWidth, float lineLength) {
+    return fmax(13.0f, fmin(fmax(lineLength * 0.16f, strokeWidth * 9.0f), 24.0f));
+}
+
 static void AppendPdfShapePaintOperator(
         std::ostringstream& stream,
         bool allowFill,
@@ -2378,7 +2444,8 @@ static std::string BuildPdfShapeAppearanceStreamAscii(
         int fillB,
         int fillA,
         float strokeWidth,
-        const char* graphicsStateName = nullptr
+        const char* graphicsStateName = nullptr,
+        const std::vector<PdfShapePoint>* customPoints = nullptr
 ) {
     const float left = fmin(baseRect.left, baseRect.right);
     const float right = fmax(baseRect.left, baseRect.right);
@@ -2414,15 +2481,38 @@ static std::string BuildPdfShapeAppearanceStreamAscii(
         stream << point.x << ' ' << point.y << " l ";
     };
 
-    if (typeInt == 17 || typeInt == 18) {
-        const PdfShapePoint start = PdfShapePointFromFraction(baseRect, 0.08f, 0.50f, rotationDegrees);
-        const PdfShapePoint end = PdfShapePointFromFraction(baseRect, 0.92f, 0.50f, rotationDegrees);
+    const bool hasCustomVertexPoints =
+            customPoints && customPoints->size() >= 2 && (typeInt == 15 || typeInt == 16);
+    const bool hasCustomLinePoints =
+            customPoints && customPoints->size() >= 2 && (typeInt == 17 || typeInt == 18);
+
+    if (hasCustomVertexPoints) {
+        emitMove((*customPoints)[0]);
+        for (size_t index = 1; index < customPoints->size(); index++) {
+            emitLine((*customPoints)[index]);
+        }
+        if (typeInt == 15) {
+            stream << "h ";
+            AppendPdfShapePaintOperator(stream, true, fillA, strokeA, effectiveStrokeWidth);
+        } else {
+            stream << "S ";
+        }
+    } else if (typeInt == 17 || typeInt == 18) {
+        const PdfShapePoint start = hasCustomLinePoints
+                ? (*customPoints)[0]
+                : PdfShapePointFromFraction(baseRect, 0.08f, 0.50f, rotationDegrees);
+        const PdfShapePoint end = hasCustomLinePoints
+                ? (*customPoints)[1]
+                : PdfShapePointFromFraction(baseRect, 0.92f, 0.50f, rotationDegrees);
         emitMove(start);
         emitLine(end);
         if (typeInt == 18) {
-            emitMove(PdfShapePointFromFraction(baseRect, 0.72f, 0.30f, rotationDegrees));
+            const float lineLength = hypotf(end.x - start.x, end.y - start.y);
+            const float headLength = ResolvePdfArrowHeadLength(effectiveStrokeWidth, lineLength);
+            const float headHalfHeight = fmax(headLength * 0.42f, effectiveStrokeWidth * 2.0f);
+            emitMove(OffsetPdfShapePointFromLineEnd(start, end, headLength, headHalfHeight));
             emitLine(end);
-            emitMove(PdfShapePointFromFraction(baseRect, 0.72f, 0.70f, rotationDegrees));
+            emitMove(OffsetPdfShapePointFromLineEnd(start, end, headLength, -headHalfHeight));
             emitLine(end);
         }
         stream << "S ";
@@ -2490,7 +2580,8 @@ static std::u16string BuildPdfShapeAppearanceStream(
         int fillG,
         int fillB,
         int fillA,
-        float strokeWidth
+        float strokeWidth,
+        const std::vector<PdfShapePoint>* customPoints = nullptr
 ) {
     const std::string appearanceStream = BuildPdfShapeAppearanceStreamAscii(
             typeInt,
@@ -2504,7 +2595,9 @@ static std::u16string BuildPdfShapeAppearanceStream(
             fillG,
             fillB,
             fillA,
-            strokeWidth
+            strokeWidth,
+            nullptr,
+            customPoints
     );
     return AsciiToUtf16(appearanceStream.c_str());
 }
@@ -2672,6 +2765,25 @@ static bool ParsePdfShapeFloatMarker(
     return true;
 }
 
+static std::vector<PdfShapePoint> ReadPdfShapePointsFromMarkers(const std::string& objectText) {
+    std::vector<PdfShapePoint> points;
+    for (int index = 0; index < 64; index++) {
+        std::ostringstream xMarker;
+        xMarker << "/LufickPdfShapePoint" << index << "X";
+        std::ostringstream yMarker;
+        yMarker << "/LufickPdfShapePoint" << index << "Y";
+
+        float x = 0.0f;
+        float y = 0.0f;
+        if (!ParsePdfShapeFloatMarker(objectText, xMarker.str(), &x) ||
+            !ParsePdfShapeFloatMarker(objectText, yMarker.str(), &y)) {
+            break;
+        }
+        points.push_back({x, y});
+    }
+    return points;
+}
+
 static std::vector<PdfShapePoint> BuildNativePdfShapePatchPoints(
         int typeInt,
         const FS_RECTF& rect,
@@ -2724,11 +2836,14 @@ static std::string BuildNativePdfShapeDictionaryPatch(
         }
     }
 
-    const std::vector<PdfShapePoint> points = BuildNativePdfShapePatchPoints(
-            typeInt,
-            pointRect,
-            rotation
-    );
+    std::vector<PdfShapePoint> points = ReadPdfShapePointsFromMarkers(objectText);
+    if (points.empty()) {
+        points = BuildNativePdfShapePatchPoints(
+                typeInt,
+                pointRect,
+                rotation
+        );
+    }
     if (points.empty()) return std::string();
 
     std::ostringstream patch;
@@ -6024,6 +6139,7 @@ static bool processPdfShape(
     const int fillB = optIntValue("fillB", 0);
     const int requestedFillA = std::max(0, std::min(optIntValue("fillA", 0), 255));
     const int fillA = requestedFillA > 0 ? strokeA : 0;
+    const std::vector<PdfShapePoint> customPoints = ReadPdfShapePointsFromJson(env, json, jsonClass);
 
     FPDFAnnot_SetBorder(annot, 0, 0, fmax(strokeWidth, 0.0f));
     FPDFAnnot_SetColor(annot, FPDFANNOT_COLORTYPE_Color, strokeR, strokeG, strokeB, strokeA);
@@ -6061,7 +6177,19 @@ static bool processPdfShape(
         SetPdfShapeFloatMarker(annot, "LufickPdfShapeBaseTop", baseRect.top);
         SetPdfShapeFloatMarker(annot, "LufickPdfShapeBaseRight", baseRect.right);
         SetPdfShapeFloatMarker(annot, "LufickPdfShapeBaseBottom", baseRect.bottom);
-        static const std::string patchPad(2048, ' ');
+        if ((typeInt == 15 || typeInt == 16 || typeInt == 17 || typeInt == 18) && customPoints.size() >= 2) {
+            const size_t maxPointCount = (typeInt == 17 || typeInt == 18) ? 2 : 64;
+            const size_t pointCount = std::min(customPoints.size(), maxPointCount);
+            for (size_t index = 0; index < pointCount; index++) {
+                std::ostringstream xMarker;
+                xMarker << "LufickPdfShapePoint" << index << "X";
+                std::ostringstream yMarker;
+                yMarker << "LufickPdfShapePoint" << index << "Y";
+                SetPdfShapeFloatMarker(annot, xMarker.str().c_str(), customPoints[index].x);
+                SetPdfShapeFloatMarker(annot, yMarker.str().c_str(), customPoints[index].y);
+            }
+        }
+        static const std::string patchPad(8192, ' ');
         SetAnnotAsciiStringValue(annot, "LufickPdfShapePatchPad", patchPad.c_str());
     }
 
@@ -6101,7 +6229,8 @@ static bool processPdfShape(
                 fillG,
                 fillB,
                 fillA,
-                strokeWidth
+                strokeWidth,
+                customPoints.empty() ? nullptr : &customPoints
         );
         if (!appearanceStream.empty()) {
             FPDFAnnot_SetAP(
