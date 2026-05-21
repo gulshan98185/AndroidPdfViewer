@@ -40,6 +40,7 @@ class RenderingHandler extends Handler {
     static final int MSG_RENDER_TASK = 1;
 
     private static final String TAG = RenderingHandler.class.getName();
+    private static final long MAX_NATIVE_RENDER_PIXELS = 64L * 1024L * 1024L;
 
     private PDFView pdfView;
 
@@ -47,6 +48,7 @@ class RenderingHandler extends Handler {
     private Rect roundedRenderBounds = new Rect();
     private Matrix renderMatrix = new Matrix();
     private boolean running = false;
+    private volatile boolean rendering = false;
 
     RenderingHandler(Looper looper, PDFView pdfView) {
         super(looper);
@@ -100,13 +102,22 @@ class RenderingHandler extends Handler {
         Bitmap render;
         try {
             render = Bitmap.createBitmap(w, h, renderingTask.bestQuality ? Bitmap.Config.ARGB_8888 : Bitmap.Config.RGB_565);
-        } catch (IllegalArgumentException e) {
+        } catch (IllegalArgumentException | OutOfMemoryError e) {
             Log.e(TAG, "Cannot create bitmap", e);
             return null;
         }
         calculateBounds(w, h, renderingTask.bounds);
+        if (isNativeRenderTooLarge()) {
+            render.recycle();
+            return null;
+        }
 
-        pdfFile.renderPageBitmap(render, renderingTask.page, roundedRenderBounds, renderingTask.annotationRendering);
+        rendering = true;
+        try {
+            pdfFile.renderPageBitmap(render, renderingTask.page, roundedRenderBounds, renderingTask.annotationRendering);
+        } finally {
+            rendering = false;
+        }
 
         return new PagePart(renderingTask.page, render,
                 renderingTask.bounds, renderingTask.thumbnail,
@@ -123,6 +134,10 @@ class RenderingHandler extends Handler {
         renderBounds.round(roundedRenderBounds);
     }
 
+    private boolean isNativeRenderTooLarge() {
+        return (long) Math.abs(roundedRenderBounds.width()) * Math.abs(roundedRenderBounds.height()) > MAX_NATIVE_RENDER_PIXELS;
+    }
+
     void stop() {
         running = false;
     }
@@ -131,6 +146,9 @@ class RenderingHandler extends Handler {
         running = true;
     }
 
+    boolean isRendering() {
+        return rendering;
+    }
     private class RenderingTask {
 
         float width, height;
