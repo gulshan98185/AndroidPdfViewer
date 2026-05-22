@@ -6927,8 +6927,13 @@ static void ApplyExistingAnnotationColor(
     if (!annot) return;
 
     FPDFAnnot_SetColor(annot, FPDFANNOT_COLORTYPE_Color, r, g, b, alpha);
-    if (typeInt == 0) {
+    if (typeInt == 0 || typeInt == 4) {
         FPDFAnnot_SetColor(annot, FPDFANNOT_COLORTYPE_InteriorColor, r, g, b, alpha);
+    }
+    if (typeInt == 4) {
+        SetAnnotAsciiStringValue(annot, "LufickPdfRedaction", "1");
+    }
+    if (typeInt == 0) {
         const unsigned short blendMode[] = {'M','u','l','t','i','p','l','y',0};
         FPDFAnnot_SetStringValue(annot, "BM", (FPDF_WIDESTRING)blendMode);
     }
@@ -7709,8 +7714,9 @@ static bool ApplyNativeAnnotationEditActions(
                         FPDFAnnot_SetRect(annot, &rect);
                         if (typeInt == 3) processLink(env, obj, page, annot, rect, urlField);
                         else if (typeInt == 4) {
-                            FPDFAnnot_SetColor(annot, FPDFANNOT_COLORTYPE_Color, 0, 0, 0, 255);
-                            FPDFAnnot_SetColor(annot, FPDFANNOT_COLORTYPE_InteriorColor, 0, 0, 0, 255);
+                            FPDFAnnot_SetColor(annot, FPDFANNOT_COLORTYPE_Color, r, g, b, alpha);
+                            FPDFAnnot_SetColor(annot, FPDFANNOT_COLORTYPE_InteriorColor, r, g, b, alpha);
+                            SetAnnotAsciiStringValue(annot, "LufickPdfRedaction", "1");
                         }
                         else if (typeInt == 10) processStickyNoteComment(env, obj, annot, textPropsField, r, g, b, alpha, jsonClass, jsonInit);
                         else if (typeInt == 5) processTextStamp(env, obj, doc, page, annot, rect, textPropsField, r, g, b, alpha, jsonClass, jsonInit);
@@ -7952,8 +7958,9 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeSaveAnnotat
                     FPDFAnnot_SetRect(annot, &rect);
                     if (typeInt == 3) processLink(env, obj, currentPage, annot, rect, urlField);
                     else if (typeInt == 4) { // Redaction
-                        FPDFAnnot_SetColor(annot, FPDFANNOT_COLORTYPE_Color, 0, 0, 0, 255);
-                        FPDFAnnot_SetColor(annot, FPDFANNOT_COLORTYPE_InteriorColor, 0, 0, 0, 255);
+                        FPDFAnnot_SetColor(annot, FPDFANNOT_COLORTYPE_Color, r, g, b, alpha);
+                        FPDFAnnot_SetColor(annot, FPDFANNOT_COLORTYPE_InteriorColor, r, g, b, alpha);
+                        SetAnnotAsciiStringValue(annot, "LufickPdfRedaction", "1");
                     }
                     else if (typeInt == 10) processStickyNoteComment(env, obj, annot, textPropsField, r, g, b, alpha, jsonClass, jsonInit);
                     else if (typeInt == 5) processTextStamp(env, obj, doc, currentPage, annot, rect, textPropsField, r, g, b, alpha, jsonClass, jsonInit);
@@ -8326,7 +8333,9 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeGetAnnotati
                 a = interiorA;
             }
         } else if (subtype == FPDF_ANNOT_SQUARE && !IsPdfShapeNativeType(type)) {
+            const std::u16string redactionMarker = ReadAnnotStringValueUtf16(annot, "LufickPdfRedaction");
             const bool looksLikeRedaction =
+                    !redactionMarker.empty() ||
                     (hasStrokeColor && r == 0 && g == 0 && b == 0 && a == 255) &&
                     (!hasInteriorColor || (interiorR == 0 && interiorG == 0 && interiorB == 0 && interiorA == 255));
             const float visibleStrokeWidth = ResolveAnnotVisibleStrokeWidth(annot);
