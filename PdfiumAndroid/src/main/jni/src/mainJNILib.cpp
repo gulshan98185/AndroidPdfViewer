@@ -35,8 +35,12 @@ using namespace android;
 #include <functional>
 #include <iomanip>
 #include <fstream>
+#include <iterator>
 #include <cstdint>
+#include <chrono>
 #include <fpdf_text.h>
+
+#define WM_LOGE(...) do {} while (0)
 
 static Mutex sLibraryLock;
 
@@ -1408,6 +1412,13 @@ Java_com_shockwave_pdfium_PdfiumCore_nativeGetTextCount(
 #endif
 #define LOG_TAG "PDF_SAVE"
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
+#define WM_TIME_LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
+
+static long long WatermarkNowMs() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()
+    ).count();
+}
 
 typedef struct {
     FPDF_FILEWRITE base;
@@ -1496,6 +1507,39 @@ static bool processSvgPathStamp(JNIEnv* env, FPDF_ANNOTATION annot, FS_RECTF rec
 static bool processImageOrPresetStamp(JNIEnv* env, jobject obj, FPDF_DOCUMENT doc, FPDF_PAGE page, FPDF_ANNOTATION annot, FS_RECTF rect, jfieldID imagePropsField, jclass jsonClass, jmethodID jsonInit);
 static bool isSimplePdfStampBridgeAnnotation(JNIEnv* env, jobject obj, jfieldID dataPropsField, jclass jsonClass, jmethodID jsonInit);
 static bool processSimplePdfStamp(JNIEnv* env, jobject obj, FPDF_DOCUMENT doc, FPDF_PAGE page, FPDF_ANNOTATION annot, FS_RECTF rect, int typeInt, jfieldID dataPropsField, int r, int g, int b, int alpha, jclass jsonClass, jmethodID jsonInit);
+static bool processPageLevelTextWatermark(JNIEnv* env, jobject obj, FPDF_DOCUMENT doc, FPDF_PAGE page, jfieldID dataPropsField, jclass jsonClass, jmethodID jsonInit);
+struct RawPdfWatermarkSpec;
+static bool CollectPageLevelTextWatermarkPatternSpec(JNIEnv* env, jobject obj, jfieldID dataPropsField, jclass jsonClass, jmethodID jsonInit, RawPdfWatermarkSpec* outSpec);
+static bool PatchRawPdfWatermarkPatterns(JNIEnv* env, const char* outputPath, const std::vector<RawPdfWatermarkSpec>& specs);
+static bool AppendPageLevelTextWatermarkGlyphPaths(FPDF_PAGE page, const char* fontPath, const jchar* textContent, jsize textLength, int textR, int textG, int textB, int textA, bool isBold, double scale, double letterSpacing, double textHeight, double cosA, double sinA, double skewX, float minX, float maxX, float minY, float maxY, float centerX, float centerY, float tileWidth, float tileHeight, int maxStampObjects);
+
+static std::string ResolvePageLevelWatermarkFontPath(const char* requestedPath, bool isBold, bool isItalic) {
+    if (requestedPath && strlen(requestedPath) > 0 && access(requestedPath, R_OK) == 0) {
+        return std::string(requestedPath);
+    }
+
+    std::vector<const char*> candidates;
+    if (isBold && isItalic) {
+        candidates.push_back("/system/fonts/Roboto-BoldItalic.ttf");
+    }
+    if (isBold) {
+        candidates.push_back("/system/fonts/Roboto-Bold.ttf");
+    }
+    if (isItalic) {
+        candidates.push_back("/system/fonts/Roboto-Italic.ttf");
+    }
+    candidates.push_back("/system/fonts/Roboto-Regular.ttf");
+    candidates.push_back("/system/fonts/NotoSans-Regular.ttf");
+    candidates.push_back("/system/fonts/DroidSans.ttf");
+
+    for (const char* candidate : candidates) {
+        if (candidate && access(candidate, R_OK) == 0) {
+            return std::string(candidate);
+        }
+    }
+    return std::string();
+}
+
 static bool processPdfShape(JNIEnv* env, jobject obj, FPDF_ANNOTATION annot, FS_RECTF rect, int typeInt, jfieldID shapePropsField, int r, int g, int b, int alpha, jclass jsonClass, jmethodID jsonInit);
 static void processFreeHand(JNIEnv* env, jobject obj, FPDF_PAGE page, jfieldID fhDrawingProperties, int r, int g, int b, jclass jsonClass, jmethodID jsonInit);
 
@@ -2704,6 +2748,49 @@ struct PdfObjectReplacement {
     std::string body;
 };
 
+struct RawPdfWatermarkSpec {
+    int pageIndex = -1;
+    std::string text;
+    std::string objectId;
+    std::string fontName;
+    std::string fontPath;
+    float pageWidth = 0.0f;
+    float pageHeight = 0.0f;
+    float fontSize = 0.0f;
+    float patternWidth = 0.0f;
+    float patternHeight = 0.0f;
+    float repeatStepWidth = 0.0f;
+    float repeatStepHeight = 0.0f;
+    float contentWidth = 0.0f;
+    float contentHeight = 0.0f;
+    float baselineX = 0.0f;
+    float baselineY = 0.0f;
+    float rotation = 0.0f;
+    float opacity = 1.0f;
+    float characterSpacing = 0.0f;
+    bool isRepeated = true;
+    int textR = 0;
+    int textG = 0;
+    int textB = 0;
+    bool isBold = false;
+    bool isItalic = false;
+    bool isUnderline = false;
+    bool isStrikeout = false;
+    bool isIconImage = false;
+    bool isRasterImage = false;
+    std::string imagePath;
+    int imagePixelWidth = 0;
+    int imagePixelHeight = 0;
+};
+
+struct PdfObjectInfo {
+    int objectNumber = 0;
+    int generation = 0;
+    size_t start = 0;
+    size_t end = 0;
+    std::string body;
+};
+
 static int GetPdfBoxShapePatchTypeFromObject(const std::string& objectText) {
     if (objectText.find("/LufickPdfBoxShapePatchRectangle") != std::string::npos) return 12;
     if (objectText.find("/LufickPdfBoxShapePatchSquare") != std::string::npos) return 13;
@@ -3007,15 +3094,42 @@ static bool ParseLastStartXref(const std::string& data, long long* outStartXref)
     return true;
 }
 
+static bool FindBalancedPdfDictionary(
+        const std::string& data,
+        size_t dictStart,
+        size_t limit,
+        size_t* outStart,
+        size_t* outEnd
+);
+
 static bool ExtractLastTrailerDictionary(const std::string& data, std::string* outTrailer) {
     if (!outTrailer) return false;
     const size_t trailerPos = data.rfind("trailer");
-    if (trailerPos == std::string::npos) return false;
-    const size_t trailerStart = data.find("<<", trailerPos);
-    if (trailerStart == std::string::npos) return false;
+    size_t trailerStart = std::string::npos;
+    size_t searchLimit = data.size();
+    if (trailerPos != std::string::npos) {
+        trailerStart = data.find("<<", trailerPos);
+    } else {
+        long long startXref = 0;
+        if (!ParseLastStartXref(data, &startXref) ||
+            startXref < 0 ||
+            static_cast<size_t>(startXref) >= data.size()) {
+            return false;
+        }
+        const size_t streamPos = data.find("stream", static_cast<size_t>(startXref));
+        const size_t endObjPos = data.find("endobj", static_cast<size_t>(startXref));
+        if (streamPos == std::string::npos ||
+            endObjPos == std::string::npos ||
+            streamPos > endObjPos) {
+            return false;
+        }
+        trailerStart = data.find("<<", static_cast<size_t>(startXref));
+        searchLimit = streamPos;
+    }
+    if (trailerStart == std::string::npos || trailerStart >= searchLimit) return false;
 
     std::vector<size_t> stack;
-    for (size_t index = trailerStart; index + 1 < data.size(); index++) {
+    for (size_t index = trailerStart; index + 1 < searchLimit; index++) {
         if (data[index] == '<' && data[index + 1] == '<') {
             stack.push_back(index);
             index++;
@@ -3031,6 +3145,177 @@ static bool ExtractLastTrailerDictionary(const std::string& data, std::string* o
     return false;
 }
 
+static bool FindPdfDictionaryRawValueSegment(
+        const std::string& data,
+        size_t rangeStart,
+        size_t rangeEnd,
+        const std::string& key,
+        size_t* outStart,
+        size_t* outEnd
+) {
+    if (!outStart || !outEnd || rangeStart >= rangeEnd || rangeEnd > data.size()) return false;
+    const size_t keyPos = FindPdfKeyTokenInRange(data, rangeStart, rangeEnd, key);
+    if (keyPos == std::string::npos) return false;
+
+    size_t valueStart = keyPos + key.size() + 1;
+    while (valueStart < rangeEnd && std::isspace(static_cast<unsigned char>(data[valueStart]))) {
+        valueStart++;
+    }
+    if (valueStart >= rangeEnd) return false;
+
+    size_t valueEnd = valueStart;
+    if (data[valueStart] == '[') {
+        int depth = 1;
+        valueEnd = valueStart + 1;
+        while (valueEnd < rangeEnd && depth > 0) {
+            if (data[valueEnd] == '[') depth++;
+            else if (data[valueEnd] == ']') depth--;
+            valueEnd++;
+        }
+        if (depth != 0) return false;
+    } else if (valueStart + 1 < rangeEnd && data[valueStart] == '<' && data[valueStart + 1] == '<') {
+        size_t dictStart = 0;
+        if (!FindBalancedPdfDictionary(data, valueStart, rangeEnd, &dictStart, &valueEnd)) {
+            return false;
+        }
+    } else if (data[valueStart] == '<') {
+        valueEnd = data.find('>', valueStart + 1);
+        if (valueEnd == std::string::npos || valueEnd >= rangeEnd) return false;
+        valueEnd++;
+    } else if (data[valueStart] == '(') {
+        int depth = 1;
+        bool escaped = false;
+        valueEnd = valueStart + 1;
+        while (valueEnd < rangeEnd && depth > 0) {
+            const char ch = data[valueEnd++];
+            if (escaped) {
+                escaped = false;
+            } else if (ch == '\\') {
+                escaped = true;
+            } else if (ch == '(') {
+                depth++;
+            } else if (ch == ')') {
+                depth--;
+            }
+        }
+        if (depth != 0) return false;
+    } else {
+        const char* cursor = data.c_str() + valueStart;
+        char* end = nullptr;
+        const long firstNumber = std::strtol(cursor, &end, 10);
+        if (end != cursor) {
+            cursor = end;
+            while (cursor < data.c_str() + rangeEnd && std::isspace(static_cast<unsigned char>(*cursor))) cursor++;
+            char* secondEnd = nullptr;
+            std::strtol(cursor, &secondEnd, 10);
+            if (secondEnd != cursor) {
+                const char* afterSecond = secondEnd;
+                while (afterSecond < data.c_str() + rangeEnd &&
+                       std::isspace(static_cast<unsigned char>(*afterSecond))) {
+                    afterSecond++;
+                }
+                if (afterSecond < data.c_str() + rangeEnd && *afterSecond == 'R') {
+                    valueEnd = static_cast<size_t>((afterSecond + 1) - data.c_str());
+                } else {
+                    valueEnd = static_cast<size_t>(end - data.c_str());
+                }
+            } else {
+                valueEnd = static_cast<size_t>(end - data.c_str());
+            }
+            (void)firstNumber;
+        } else {
+            valueEnd = valueStart;
+            while (valueEnd < rangeEnd && !std::isspace(static_cast<unsigned char>(data[valueEnd])) &&
+                   data[valueEnd] != '/' && data[valueEnd] != '>' && data[valueEnd] != ']') {
+                valueEnd++;
+            }
+        }
+    }
+
+    *outStart = valueStart;
+    *outEnd = valueEnd;
+    return valueEnd > valueStart;
+}
+
+static bool ExtractPdfDictionaryRawValue(
+        const std::string& dictionary,
+        const std::string& key,
+        std::string* outValue
+) {
+    if (!outValue) return false;
+    size_t valueStart = 0;
+    size_t valueEnd = 0;
+    if (!FindPdfDictionaryRawValueSegment(dictionary, 0, dictionary.size(), key, &valueStart, &valueEnd)) {
+        return false;
+    }
+    *outValue = dictionary.substr(valueStart, valueEnd - valueStart);
+    return !outValue->empty();
+}
+
+static bool ParsePdfIndirectReferenceString(
+        const std::string& value,
+        int* outObjectNumber,
+        int* outGeneration
+) {
+    if (!outObjectNumber || !outGeneration) return false;
+    const char* cursor = value.c_str();
+    while (*cursor != '\0' && std::isspace(static_cast<unsigned char>(*cursor))) cursor++;
+    char* end = nullptr;
+    const long objectNumber = std::strtol(cursor, &end, 10);
+    if (end == cursor || objectNumber <= 0) return false;
+    cursor = end;
+    while (*cursor != '\0' && std::isspace(static_cast<unsigned char>(*cursor))) cursor++;
+    const long generation = std::strtol(cursor, &end, 10);
+    if (end == cursor || generation < 0) return false;
+    cursor = end;
+    while (*cursor != '\0' && std::isspace(static_cast<unsigned char>(*cursor))) cursor++;
+    if (*cursor != 'R') return false;
+    *outObjectNumber = static_cast<int>(objectNumber);
+    *outGeneration = static_cast<int>(generation);
+    return true;
+}
+
+static bool BuildClassicIncrementalTrailer(
+        const std::string& previousTrailer,
+        int maxObjectNumber,
+        long long previousStartXref,
+        std::string* outTrailer
+) {
+    if (!outTrailer || maxObjectNumber <= 0 || previousStartXref < 0) return false;
+
+    std::string sizeValue;
+    if (!ExtractPdfDictionaryRawValue(previousTrailer, "Size", &sizeValue)) {
+        LOGE("Incremental PDF append failed: previous trailer has no Size");
+        return false;
+    }
+    const long oldSize = std::strtol(sizeValue.c_str(), nullptr, 10);
+    const int newSize = std::max(static_cast<int>(oldSize), maxObjectNumber + 1);
+
+    std::string rootValue;
+    if (!ExtractPdfDictionaryRawValue(previousTrailer, "Root", &rootValue)) {
+        LOGE("Incremental PDF append failed: previous trailer has no Root");
+        return false;
+    }
+
+    std::ostringstream trailer;
+    trailer << "<< /Size " << newSize
+            << " /Root " << rootValue;
+
+    std::string value;
+    if (ExtractPdfDictionaryRawValue(previousTrailer, "Info", &value)) {
+        trailer << " /Info " << value;
+    }
+    if (ExtractPdfDictionaryRawValue(previousTrailer, "ID", &value)) {
+        trailer << " /ID " << value;
+    }
+    if (ExtractPdfDictionaryRawValue(previousTrailer, "Encrypt", &value)) {
+        trailer << " /Encrypt " << value;
+    }
+    trailer << " /Prev " << previousStartXref << " >>";
+    *outTrailer = trailer.str();
+    return true;
+}
+
 static bool AppendIncrementalPdfObjectUpdates(
         std::string* data,
         std::vector<PdfObjectReplacement>* replacements
@@ -3038,19 +3323,26 @@ static bool AppendIncrementalPdfObjectUpdates(
     if (!data || !replacements || replacements->empty()) return true;
 
     long long previousStartXref = 0;
-    if (!ParseLastStartXref(*data, &previousStartXref)) return false;
+    if (!ParseLastStartXref(*data, &previousStartXref)) {
+        LOGE("Incremental PDF append failed: unable to parse startxref");
+        return false;
+    }
+
+    int maxObjectNumber = 0;
+    for (const PdfObjectReplacement& replacement : *replacements) {
+        maxObjectNumber = std::max(maxObjectNumber, replacement.objectNumber);
+    }
+
+    std::string previousTrailer;
+    if (!ExtractLastTrailerDictionary(*data, &previousTrailer)) {
+        LOGE("Incremental PDF append failed: unable to extract previous trailer");
+        return false;
+    }
 
     std::string trailer;
-    if (!ExtractLastTrailerDictionary(*data, &trailer)) return false;
-
-    size_t prevStart = 0;
-    size_t prevEnd = 0;
-    if (FindPdfDictionaryValueSegment(trailer, 0, trailer.size(), "Prev", &prevStart, &prevEnd)) {
-        trailer.replace(prevStart, prevEnd - prevStart, prevEnd - prevStart, ' ');
+    if (!BuildClassicIncrementalTrailer(previousTrailer, maxObjectNumber, previousStartXref, &trailer)) {
+        return false;
     }
-    const size_t trailerInsert = trailer.rfind(">>");
-    if (trailerInsert == std::string::npos) return false;
-    trailer.insert(trailerInsert, "/Prev " + std::to_string(previousStartXref) + " ");
 
     std::sort(replacements->begin(), replacements->end(), [](const PdfObjectReplacement& first, const PdfObjectReplacement& second) {
         if (first.objectNumber != second.objectNumber) return first.objectNumber < second.objectNumber;
@@ -3091,6 +3383,1944 @@ static bool AppendIncrementalPdfObjectUpdates(
     data->append("\nstartxref\n");
     data->append(std::to_string(xrefStart));
     data->append("\n%%EOF\n");
+    return true;
+}
+
+static bool ReadFileToString(const char* path, std::string* outData) {
+    if (!path || !outData) return false;
+    std::ifstream input(path, std::ios::binary);
+    if (!input) return false;
+    *outData = std::string((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+    return !outData->empty();
+}
+
+static bool WriteStringToFile(const char* path, const std::string& data) {
+    if (!path) return false;
+    std::ofstream output(path, std::ios::binary | std::ios::trunc);
+    if (!output) return false;
+    output.write(data.data(), static_cast<std::streamsize>(data.size()));
+    return true;
+}
+
+static bool CopyFileBinary(const char* inputPath, const char* outputPath) {
+    if (!inputPath || !outputPath) return false;
+    std::ifstream input(inputPath, std::ios::binary);
+    std::ofstream output(outputPath, std::ios::binary | std::ios::trunc);
+    if (!input || !output) return false;
+    output << input.rdbuf();
+    return output.good();
+}
+
+static long long GetFileSizeForLog(const char* path) {
+    if (!path) return -1;
+    std::ifstream input(path, std::ios::binary | std::ios::ate);
+    if (!input) return -1;
+    return static_cast<long long>(input.tellg());
+}
+
+static bool ParsePdfObjectHeaderLine(const std::string& line, int* objectNumber, int* generation) {
+    if (!objectNumber || !generation) return false;
+    const char* cursor = line.c_str();
+    while (*cursor != '\0' && std::isspace(static_cast<unsigned char>(*cursor))) cursor++;
+    char* end = nullptr;
+    const long obj = std::strtol(cursor, &end, 10);
+    if (end == cursor || obj <= 0) return false;
+    cursor = end;
+    while (*cursor != '\0' && std::isspace(static_cast<unsigned char>(*cursor))) cursor++;
+    const long gen = std::strtol(cursor, &end, 10);
+    if (end == cursor || gen < 0) return false;
+    cursor = end;
+    while (*cursor != '\0' && std::isspace(static_cast<unsigned char>(*cursor))) cursor++;
+    if (strncmp(cursor, "obj", 3) != 0) return false;
+    *objectNumber = static_cast<int>(obj);
+    *generation = static_cast<int>(gen);
+    return true;
+}
+
+static std::vector<PdfObjectInfo> ScanPdfObjects(const std::string& data) {
+    std::vector<PdfObjectInfo> objects;
+    size_t searchPos = 0;
+    while (true) {
+        const size_t objPos = data.find(" obj", searchPos);
+        if (objPos == std::string::npos) break;
+        size_t lineStart = data.rfind('\n', objPos);
+        lineStart = (lineStart == std::string::npos) ? 0 : lineStart + 1;
+        const size_t lineEnd = data.find('\n', objPos);
+        if (lineEnd == std::string::npos) break;
+        const std::string header = data.substr(lineStart, lineEnd - lineStart);
+        int objectNumber = 0;
+        int generation = 0;
+        if (!ParsePdfObjectHeaderLine(header, &objectNumber, &generation)) {
+            searchPos = objPos + 4;
+            continue;
+        }
+        const size_t endObj = data.find("endobj", lineEnd);
+        if (endObj == std::string::npos) break;
+        const size_t bodyStart = lineEnd + 1;
+        PdfObjectInfo info;
+        info.objectNumber = objectNumber;
+        info.generation = generation;
+        info.start = lineStart;
+        info.end = endObj + strlen("endobj");
+        info.body = data.substr(bodyStart, endObj - bodyStart);
+        objects.push_back(info);
+        searchPos = info.end;
+    }
+    return objects;
+}
+
+static std::string PdfObjectRefKey(int objectNumber, int generation) {
+    return std::to_string(objectNumber) + ":" + std::to_string(generation);
+}
+
+static bool IsPdfPageObject(const PdfObjectInfo& object);
+static bool ContainsPdfNameValue(const std::string& objectBody, const std::string& key, const std::string& value);
+static bool FindTopLevelPdfDictionary(
+        const std::string& objectBody,
+        size_t* outStart,
+        size_t* outEnd
+);
+static const PdfObjectInfo* FindPdfObjectInfoByRef(
+        const std::vector<PdfObjectInfo>& objects,
+        int objectNumber,
+        int generation
+);
+
+static std::vector<PdfObjectInfo> BuildLatestPdfObjectsByRef(const std::vector<PdfObjectInfo>& objects) {
+    std::vector<PdfObjectInfo> latestObjects;
+    std::map<std::string, size_t> indexByRef;
+    for (const PdfObjectInfo& object : objects) {
+        const std::string key = PdfObjectRefKey(object.objectNumber, object.generation);
+        const auto existing = indexByRef.find(key);
+        if (existing == indexByRef.end()) {
+            indexByRef[key] = latestObjects.size();
+            latestObjects.push_back(object);
+        } else {
+            latestObjects[existing->second] = object;
+        }
+    }
+    return latestObjects;
+}
+
+static std::vector<PdfObjectInfo> BuildLatestPdfPageObjects(
+        const std::vector<PdfObjectInfo>& scannedObjects,
+        const std::vector<PdfObjectInfo>& latestObjects
+) {
+    std::vector<PdfObjectInfo> pages;
+    std::map<std::string, bool> seenPageRefs;
+    for (const PdfObjectInfo& object : scannedObjects) {
+        if (!IsPdfPageObject(object)) continue;
+        const std::string key = PdfObjectRefKey(object.objectNumber, object.generation);
+        if (seenPageRefs[key]) continue;
+        seenPageRefs[key] = true;
+        const PdfObjectInfo* latestObject = FindPdfObjectInfoByRef(
+                latestObjects,
+                object.objectNumber,
+                object.generation
+        );
+        pages.push_back(latestObject ? *latestObject : object);
+    }
+    return pages;
+}
+
+static std::vector<std::pair<int, int>> ParsePdfIndirectReferencesFromArray(const std::string& arrayValue) {
+    std::vector<std::pair<int, int>> refs;
+    const char* cursor = arrayValue.c_str();
+    const char* endOfString = cursor + arrayValue.size();
+    while (cursor < endOfString) {
+        while (cursor < endOfString &&
+               !std::isdigit(static_cast<unsigned char>(*cursor)) &&
+               *cursor != '+' &&
+               *cursor != '-') {
+            cursor++;
+        }
+        if (cursor >= endOfString) break;
+        char* firstEnd = nullptr;
+        const long objectNumber = std::strtol(cursor, &firstEnd, 10);
+        if (firstEnd == cursor || objectNumber <= 0) {
+            cursor++;
+            continue;
+        }
+        cursor = firstEnd;
+        while (cursor < endOfString && std::isspace(static_cast<unsigned char>(*cursor))) cursor++;
+        char* secondEnd = nullptr;
+        const long generation = std::strtol(cursor, &secondEnd, 10);
+        if (secondEnd == cursor || generation < 0) {
+            cursor = firstEnd;
+            continue;
+        }
+        cursor = secondEnd;
+        while (cursor < endOfString && std::isspace(static_cast<unsigned char>(*cursor))) cursor++;
+        if (cursor < endOfString && *cursor == 'R') {
+            refs.push_back({static_cast<int>(objectNumber), static_cast<int>(generation)});
+            cursor++;
+        }
+    }
+    return refs;
+}
+
+static bool AppendPdfPageTreePages(
+        const std::vector<PdfObjectInfo>& latestObjects,
+        int objectNumber,
+        int generation,
+        std::vector<PdfObjectInfo>* pages,
+        std::map<std::string, bool>* visited,
+        bool allowLeafFallback = false
+) {
+    if (!pages || !visited || objectNumber <= 0 || generation < 0) return false;
+    const std::string key = PdfObjectRefKey(objectNumber, generation);
+    if ((*visited)[key]) return true;
+    (*visited)[key] = true;
+
+    const PdfObjectInfo* object = FindPdfObjectInfoByRef(latestObjects, objectNumber, generation);
+    if (!object) return false;
+    if (IsPdfPageObject(*object)) {
+        pages->push_back(*object);
+        return true;
+    }
+    if (!ContainsPdfNameValue(object->body, "Type", "Pages")) {
+        if (allowLeafFallback) {
+            size_t dictStart = 0;
+            size_t dictEnd = 0;
+            if (FindTopLevelPdfDictionary(object->body, &dictStart, &dictEnd) &&
+                FindPdfKeyTokenInRange(object->body, dictStart, dictEnd, "Kids") == std::string::npos) {
+                WM_LOGE(
+                        "Native watermark page tree recovered leaf without /Type /Page obj=%d gen=%d bodyLen=%zu annots=%d resources=%d contents=%d",
+                        object->objectNumber,
+                        object->generation,
+                        object->body.size(),
+                        FindPdfKeyTokenInRange(object->body, dictStart, dictEnd, "Annots") != std::string::npos ? 1 : 0,
+                        FindPdfKeyTokenInRange(object->body, dictStart, dictEnd, "Resources") != std::string::npos ? 1 : 0,
+                        FindPdfKeyTokenInRange(object->body, dictStart, dictEnd, "Contents") != std::string::npos ? 1 : 0
+                );
+                pages->push_back(*object);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    std::string kidsArray;
+    if (!ExtractPdfDictionaryRawValue(object->body, "Kids", &kidsArray)) {
+        return false;
+    }
+    const std::vector<std::pair<int, int>> kids = ParsePdfIndirectReferencesFromArray(kidsArray);
+    if (kids.empty()) return false;
+    bool appendedAny = false;
+    for (const auto& kid : kids) {
+        const size_t before = pages->size();
+        if (AppendPdfPageTreePages(latestObjects, kid.first, kid.second, pages, visited, true) &&
+            pages->size() > before) {
+            appendedAny = true;
+        }
+    }
+    return appendedAny;
+}
+
+static std::vector<PdfObjectInfo> BuildPdfPageObjectsFromCatalog(
+        const std::string& data,
+        const std::vector<PdfObjectInfo>& latestObjects
+) {
+    std::vector<PdfObjectInfo> pages;
+    std::string trailer;
+    if (!ExtractLastTrailerDictionary(data, &trailer)) return pages;
+
+    std::string rootValue;
+    if (!ExtractPdfDictionaryRawValue(trailer, "Root", &rootValue)) return pages;
+    int rootObjectNumber = 0;
+    int rootGeneration = 0;
+    if (!ParsePdfIndirectReferenceString(rootValue, &rootObjectNumber, &rootGeneration)) return pages;
+
+    const PdfObjectInfo* rootObject = FindPdfObjectInfoByRef(latestObjects, rootObjectNumber, rootGeneration);
+    if (!rootObject) return pages;
+
+    std::string pagesValue;
+    if (!ExtractPdfDictionaryRawValue(rootObject->body, "Pages", &pagesValue)) return pages;
+    int pagesObjectNumber = 0;
+    int pagesGeneration = 0;
+    if (!ParsePdfIndirectReferenceString(pagesValue, &pagesObjectNumber, &pagesGeneration)) return pages;
+
+    std::map<std::string, bool> visited;
+    AppendPdfPageTreePages(latestObjects, pagesObjectNumber, pagesGeneration, &pages, &visited);
+    return pages;
+}
+
+static int GetMaxPdfObjectNumber(const std::vector<PdfObjectInfo>& objects) {
+    int maxObjectNumber = 0;
+    for (const PdfObjectInfo& object : objects) {
+        maxObjectNumber = std::max(maxObjectNumber, object.objectNumber);
+    }
+    return maxObjectNumber;
+}
+
+static bool FindBalancedPdfDictionary(
+        const std::string& data,
+        size_t dictStart,
+        size_t limit,
+        size_t* outStart,
+        size_t* outEnd
+) {
+    if (!outStart || !outEnd || dictStart + 1 >= limit || limit > data.size() ||
+        data[dictStart] != '<' || data[dictStart + 1] != '<') {
+        return false;
+    }
+    int depth = 0;
+    for (size_t index = dictStart; index + 1 < limit; index++) {
+        if (data[index] == '<' && data[index + 1] == '<') {
+            depth++;
+            index++;
+        } else if (data[index] == '>' && data[index + 1] == '>') {
+            depth--;
+            index++;
+            if (depth == 0) {
+                *outStart = dictStart;
+                *outEnd = index + 1;
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+static bool FindTopLevelPdfDictionary(
+        const std::string& objectBody,
+        size_t* outStart,
+        size_t* outEnd
+) {
+    const size_t dictStart = objectBody.find("<<");
+    const size_t streamPos = objectBody.find("stream");
+    const size_t limit = streamPos == std::string::npos ? objectBody.size() : streamPos;
+    if (dictStart == std::string::npos || dictStart >= limit) return false;
+    return FindBalancedPdfDictionary(objectBody, dictStart, limit, outStart, outEnd);
+}
+
+static bool FindDirectDictionaryValue(
+        const std::string& data,
+        size_t rangeStart,
+        size_t rangeEnd,
+        const std::string& key,
+        size_t* outStart,
+        size_t* outEnd
+) {
+    const size_t keyPos = FindPdfKeyTokenInRange(data, rangeStart, rangeEnd, key);
+    if (keyPos == std::string::npos) return false;
+    size_t valueStart = keyPos + key.size() + 1;
+    while (valueStart < rangeEnd && std::isspace(static_cast<unsigned char>(data[valueStart]))) {
+        valueStart++;
+    }
+    if (valueStart + 1 >= rangeEnd || data[valueStart] != '<' || data[valueStart + 1] != '<') {
+        return false;
+    }
+    return FindBalancedPdfDictionary(data, valueStart, rangeEnd, outStart, outEnd);
+}
+
+static bool ParseIndirectReferenceAt(
+        const std::string& data,
+        size_t valueStart,
+        size_t rangeEnd,
+        int* outObjectNumber,
+        int* outGeneration,
+        size_t* outValueEnd
+) {
+    if (!outObjectNumber || !outGeneration || !outValueEnd || valueStart >= rangeEnd) return false;
+    const char* cursor = data.c_str() + valueStart;
+    char* end = nullptr;
+    const long objectNumber = std::strtol(cursor, &end, 10);
+    if (end == cursor || objectNumber <= 0) return false;
+    cursor = end;
+    while (cursor < data.c_str() + rangeEnd && std::isspace(static_cast<unsigned char>(*cursor))) cursor++;
+    const long generation = std::strtol(cursor, &end, 10);
+    if (end == cursor || generation < 0) return false;
+    cursor = end;
+    while (cursor < data.c_str() + rangeEnd && std::isspace(static_cast<unsigned char>(*cursor))) cursor++;
+    if (cursor >= data.c_str() + rangeEnd || *cursor != 'R') return false;
+    cursor++;
+    *outObjectNumber = static_cast<int>(objectNumber);
+    *outGeneration = static_cast<int>(generation);
+    *outValueEnd = static_cast<size_t>(cursor - data.c_str());
+    return true;
+}
+
+static bool FindIndirectReferenceValue(
+        const std::string& data,
+        size_t rangeStart,
+        size_t rangeEnd,
+        const std::string& key,
+        int* outObjectNumber,
+        int* outGeneration,
+        size_t* outValueStart,
+        size_t* outValueEnd
+) {
+    const size_t keyPos = FindPdfKeyTokenInRange(data, rangeStart, rangeEnd, key);
+    if (keyPos == std::string::npos) return false;
+    size_t valueStart = keyPos + key.size() + 1;
+    while (valueStart < rangeEnd && std::isspace(static_cast<unsigned char>(data[valueStart]))) {
+        valueStart++;
+    }
+    if (outValueStart) *outValueStart = valueStart;
+    return ParseIndirectReferenceAt(data, valueStart, rangeEnd, outObjectNumber, outGeneration, outValueEnd);
+}
+
+static bool ContainsPdfNameValue(const std::string& objectBody, const std::string& key, const std::string& value) {
+    size_t dictStart = 0;
+    size_t dictEnd = 0;
+    if (!FindTopLevelPdfDictionary(objectBody, &dictStart, &dictEnd)) return false;
+    const size_t keyPos = FindPdfKeyTokenInRange(objectBody, dictStart, dictEnd, key);
+    if (keyPos == std::string::npos) return false;
+    size_t valueStart = keyPos + key.size() + 1;
+    while (valueStart < dictEnd && std::isspace(static_cast<unsigned char>(objectBody[valueStart]))) {
+        valueStart++;
+    }
+    if (valueStart >= dictEnd || objectBody[valueStart] != '/') return false;
+    const size_t nameStart = valueStart + 1;
+    size_t nameEnd = nameStart;
+    while (nameEnd < dictEnd && !IsPdfNameDelimiter(objectBody[nameEnd])) {
+        nameEnd++;
+    }
+    return objectBody.compare(nameStart, nameEnd - nameStart, value) == 0;
+}
+
+static bool IsPdfPageObject(const PdfObjectInfo& object) {
+    return ContainsPdfNameValue(object.body, "Type", "Page");
+}
+
+static bool IsPdfNameCharSafe(char ch) {
+    return std::isalnum(static_cast<unsigned char>(ch)) || ch == '_' || ch == '-';
+}
+
+static std::string MakePdfResourceName(const std::string& prefix, int index) {
+    std::ostringstream stream;
+    stream << prefix << index;
+    return stream.str();
+}
+
+static std::string EscapePdfLiteralString(const std::string& value) {
+    std::string escaped;
+    escaped.reserve(value.size());
+    for (char ch : value) {
+        switch (ch) {
+            case '\\': escaped += "\\\\"; break;
+            case '(': escaped += "\\("; break;
+            case ')': escaped += "\\)"; break;
+            case '\r': escaped += "\\r"; break;
+            case '\n': escaped += "\\n"; break;
+            case '\t': escaped += "\\t"; break;
+            default:
+                if (static_cast<unsigned char>(ch) < 32) {
+                    char buffer[8];
+                    snprintf(buffer, sizeof(buffer), "\\%03o", static_cast<unsigned char>(ch));
+                    escaped += buffer;
+                } else {
+                    escaped.push_back(ch);
+                }
+                break;
+        }
+    }
+    return escaped;
+}
+
+static std::string BuildPdfWatermarkPatternStream(
+        const RawPdfWatermarkSpec& spec,
+        const std::string& graphicsStateName
+) {
+    std::ostringstream stream;
+    stream << "q\n"
+           << "/" << graphicsStateName << " gs\n"
+           << FormatPdfFloat(spec.textR / 255.0f) << ' '
+           << FormatPdfFloat(spec.textG / 255.0f) << ' '
+           << FormatPdfFloat(spec.textB / 255.0f) << " rg\n"
+           << "BT\n";
+    if (fabs(spec.characterSpacing) > 0.0001f) {
+        stream << FormatPdfFloat(spec.characterSpacing) << " Tc\n";
+    }
+    stream << "/Fwm " << FormatPdfFloat(spec.fontSize) << " Tf\n"
+           << FormatPdfFloat(spec.baselineX) << ' ' << FormatPdfFloat(spec.baselineY) << " Td\n"
+           << "(" << EscapePdfLiteralString(spec.text) << ") Tj\n"
+           << "ET\n";
+    if (spec.isUnderline || spec.isStrikeout) {
+        const float decorationWidth = fmax(
+                spec.contentWidth > 0.0f ? spec.contentWidth : spec.repeatStepWidth,
+                spec.fontSize
+        );
+        const float decorationThickness = fmax(spec.fontSize * 0.06f, 0.5f);
+        const float maxDecorationY = fmax(spec.patternHeight - decorationThickness, 0.0f);
+        auto appendDecorationRect = [&](float y) {
+            const float clampedY = fmax(0.0f, fmin(y, maxDecorationY));
+            stream << FormatPdfFloat(spec.baselineX) << ' '
+                   << FormatPdfFloat(clampedY) << ' '
+                   << FormatPdfFloat(decorationWidth) << ' '
+                   << FormatPdfFloat(decorationThickness) << " re f\n";
+        };
+        if (spec.isUnderline) {
+            appendDecorationRect(spec.baselineY - (spec.fontSize * 0.12f));
+        }
+        if (spec.isStrikeout) {
+            appendDecorationRect(spec.baselineY + (spec.fontSize * 0.32f));
+        }
+    }
+    stream << "Q";
+    return stream.str();
+}
+
+static std::string BuildPdfWatermarkFontOutlinePatternStream(
+        const RawPdfWatermarkSpec& spec,
+        const std::string& graphicsStateName
+);
+
+static std::string BuildPdfSingleWatermarkFontOutlineContentStream(
+        const RawPdfWatermarkSpec& spec,
+        const std::string& graphicsStateName
+);
+
+static std::string BuildPdfSingleWatermarkContentStream(
+        const RawPdfWatermarkSpec& spec,
+        const std::string& fontName,
+        const std::string& graphicsStateName
+);
+
+static const char* GetWatermarkBaseFontName(const RawPdfWatermarkSpec& spec);
+
+static bool IsJpegImagePath(const std::string& imagePath) {
+    std::string normalized = imagePath;
+    std::transform(normalized.begin(), normalized.end(), normalized.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+    return (normalized.size() >= 4 && normalized.compare(normalized.size() - 4, 4, ".jpg") == 0) ||
+           (normalized.size() >= 5 && normalized.compare(normalized.size() - 5, 5, ".jpeg") == 0);
+}
+
+static std::string BuildPdfImageXObjectBody(
+        const std::string& imageStream,
+        int width,
+        int height,
+        const char* colorSpace,
+        const char* filter,
+        int smaskObjectNumber
+) {
+    std::ostringstream body;
+    body << "<< /Type /XObject /Subtype /Image /Width " << width
+         << " /Height " << height
+         << " /ColorSpace " << colorSpace
+         << " /BitsPerComponent 8 ";
+    if (filter && strlen(filter) > 0) {
+        body << "/Filter " << filter << ' ';
+    }
+    if (smaskObjectNumber > 0) {
+        body << "/SMask " << smaskObjectNumber << " 0 R ";
+    }
+    body << "/Length " << imageStream.size() << " >>\nstream\n";
+    std::string result = body.str();
+    result.append(imageStream);
+    result.append("\nendstream");
+    return result;
+}
+
+static bool BuildRasterWatermarkImageReplacements(
+        JNIEnv* env,
+        const RawPdfWatermarkSpec& spec,
+        int imageObjectNumber,
+        int smaskObjectNumber,
+        std::vector<PdfObjectReplacement>* replacements
+) {
+    if (!replacements || spec.imagePath.empty() || imageObjectNumber <= 0) return false;
+
+    if (IsJpegImagePath(spec.imagePath)) {
+        std::string jpegData;
+        if (!ReadFileToString(spec.imagePath.c_str(), &jpegData) || jpegData.empty()) return false;
+        const int width = std::max(spec.imagePixelWidth, 1);
+        const int height = std::max(spec.imagePixelHeight, 1);
+        replacements->push_back({
+                imageObjectNumber,
+                0,
+                BuildPdfImageXObjectBody(jpegData, width, height, "/DeviceRGB", "/DCTDecode", 0)
+        });
+        return true;
+    }
+
+    WM_LOGE("Native raster watermark requires prepared JPEG asset: path=%s", spec.imagePath.c_str());
+    return false;
+}
+
+static std::string BuildPdfWatermarkRasterImagePatternStream(
+        const RawPdfWatermarkSpec& spec,
+        const std::string& graphicsStateName,
+        const std::string& imageName
+) {
+    const float drawWidth = fmax(spec.contentWidth, 1.0f);
+    const float drawHeight = fmax(spec.contentHeight, 1.0f);
+    const float drawX = (spec.patternWidth - drawWidth) * 0.5f;
+    const float drawY = (spec.patternHeight - drawHeight) * 0.5f;
+    std::ostringstream stream;
+    stream << "q\n"
+           << "/" << graphicsStateName << " gs\n"
+           << FormatPdfFloat(drawWidth) << " 0 0 " << FormatPdfFloat(drawHeight) << ' '
+           << FormatPdfFloat(drawX) << ' ' << FormatPdfFloat(drawY) << " cm\n"
+           << "/" << imageName << " Do\n"
+           << "Q";
+    return stream.str();
+}
+
+static std::string BuildPdfSingleRasterWatermarkContentStream(
+        const RawPdfWatermarkSpec& spec,
+        const std::string& imageName,
+        const std::string& graphicsStateName
+) {
+    const double angleRad = spec.rotation * M_PI / 180.0;
+    const float cosA = static_cast<float>(cos(angleRad));
+    const float sinA = static_cast<float>(sin(angleRad));
+    const float drawWidth = fmax(spec.contentWidth, 1.0f);
+    const float drawHeight = fmax(spec.contentHeight, 1.0f);
+    const float a = cosA * drawWidth;
+    const float b = sinA * drawWidth;
+    const float c = -sinA * drawHeight;
+    const float d = cosA * drawHeight;
+    const float centerX = spec.pageWidth * 0.5f;
+    const float centerY = spec.pageHeight * 0.5f;
+    const float e = centerX - ((a + c) * 0.5f);
+    const float f = centerY - ((b + d) * 0.5f);
+    std::ostringstream stream;
+    stream << "q\n"
+           << "/" << graphicsStateName << " gs\n"
+           << FormatPdfFloat(a) << ' ' << FormatPdfFloat(b) << ' '
+           << FormatPdfFloat(c) << ' ' << FormatPdfFloat(d) << ' '
+           << FormatPdfFloat(e) << ' ' << FormatPdfFloat(f) << " cm\n"
+           << "/" << imageName << " Do\n"
+           << "Q";
+    return stream.str();
+}
+
+
+// Method creates one PDF /Pattern object, pattern contains the watermark text only once and reuse them later
+// This is the important compact part. Instead of writing “Text” hundreds of times on every page, the PDF has one reusable pattern.
+static std::string BuildPdfWatermarkPatternObjectBody(
+        const RawPdfWatermarkSpec& spec,
+        const std::string& graphicsStateName,
+        const std::string& imageName = "",
+        int imageObjectNumber = 0
+) {
+    std::string stream;
+    bool usedFontOutline = false;
+    if (spec.isRasterImage) {
+        stream = BuildPdfWatermarkRasterImagePatternStream(spec, graphicsStateName, imageName);
+    } else {
+        stream = BuildPdfWatermarkFontOutlinePatternStream(spec, graphicsStateName);
+        usedFontOutline = !stream.empty();
+    }
+    if (!usedFontOutline && !spec.isRasterImage) {
+        stream = BuildPdfWatermarkPatternStream(spec, graphicsStateName);
+    }
+    const double angleRad = spec.rotation * M_PI / 180.0;
+    const float cosA = static_cast<float>(cos(angleRad));
+    const float sinA = static_cast<float>(sin(angleRad));
+    const char* baseFontName = spec.isBold && spec.isItalic
+                               ? "Helvetica-BoldOblique"
+                               : (spec.isBold ? "Helvetica-Bold" : (spec.isItalic ? "Helvetica-Oblique" : "Helvetica"));
+    std::ostringstream body;
+    body << "<< /Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 "
+         << "/BBox [0 0 " << FormatPdfFloat(spec.patternWidth) << ' ' << FormatPdfFloat(spec.patternHeight) << "] "
+         << "/XStep " << FormatPdfFloat(spec.repeatStepWidth) << ' '
+         << "/YStep " << FormatPdfFloat(spec.repeatStepHeight) << ' '
+         << "/Matrix [" << FormatPdfFloat(cosA) << ' ' << FormatPdfFloat(sinA) << ' '
+         << FormatPdfFloat(-sinA) << ' ' << FormatPdfFloat(cosA) << " 0 0] "
+         << "/Resources << ";
+    if (!usedFontOutline && !spec.isRasterImage) {
+        body << "/Font << /Fwm << /Type /Font /Subtype /Type1 /BaseFont /" << baseFontName << " >> >> ";
+    }
+    if (spec.isRasterImage && !imageName.empty() && imageObjectNumber > 0) {
+        body << "/XObject << /" << imageName << ' ' << imageObjectNumber << " 0 R >> ";
+    }
+    body << "/ExtGState << /" << graphicsStateName << " << /Type /ExtGState /CA "
+         << FormatPdfFloat(spec.opacity) << " /ca " << FormatPdfFloat(spec.opacity) << " >> >> >> "
+         << "/Length " << stream.size() << " >>\n"
+         << "stream\n"
+         << stream
+         << "\nendstream";
+    return body.str();
+}
+
+static std::string BuildPdfSingleWatermarkPatternObjectBody(
+        const RawPdfWatermarkSpec& spec,
+        const std::string& graphicsStateName,
+        const std::string& imageName = "",
+        int imageObjectNumber = 0
+) {
+    const float patternWidth = fmax(spec.pageWidth, 1.0f);
+    const float patternHeight = fmax(spec.pageHeight, 1.0f);
+    const char* fontName = "Fwm";
+    const std::string stream = spec.isRasterImage
+                               ? BuildPdfSingleRasterWatermarkContentStream(spec, imageName, graphicsStateName)
+                               : BuildPdfSingleWatermarkContentStream(spec, fontName, graphicsStateName);
+    const char* baseFontName = GetWatermarkBaseFontName(spec);
+
+    std::ostringstream body;
+    body << "<< /Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 "
+         << "/BBox [0 0 " << FormatPdfFloat(patternWidth) << ' ' << FormatPdfFloat(patternHeight) << "] "
+         << "/XStep " << FormatPdfFloat(patternWidth) << ' '
+         << "/YStep " << FormatPdfFloat(patternHeight) << ' '
+         << "/Resources << ";
+    if (spec.isRasterImage && !imageName.empty() && imageObjectNumber > 0) {
+        body << "/XObject << /" << imageName << ' ' << imageObjectNumber << " 0 R >> ";
+    } else if (!spec.isRasterImage) {
+        body << "/Font << /" << fontName << " << /Type /Font /Subtype /Type1 /BaseFont /"
+             << baseFontName << " >> >> ";
+    }
+    body << "/ExtGState << /" << graphicsStateName << " << /Type /ExtGState /CA "
+         << FormatPdfFloat(spec.opacity) << " /ca " << FormatPdfFloat(spec.opacity) << " >> >> >> "
+         << "/Length " << stream.size() << " >>\n"
+         << "stream\n"
+         << stream
+         << "\nendstream";
+    return body.str();
+}
+
+static std::string BuildPdfWatermarkContentStream(
+        const RawPdfWatermarkSpec& spec,
+        const std::string& patternName
+) {
+    std::ostringstream stream;
+    stream << "q\n"
+           << "/Pattern cs\n"
+           << "/" << patternName << " scn\n"
+           << "0 0 " << FormatPdfFloat(spec.pageWidth) << ' ' << FormatPdfFloat(spec.pageHeight)
+           << " re f\n"
+           << "Q";
+    return stream.str();
+}
+
+static const char* GetWatermarkBaseFontName(const RawPdfWatermarkSpec& spec) {
+    const bool wantsSerif = spec.fontName.find("Serif") != std::string::npos ||
+                            spec.fontName.find("serif") != std::string::npos ||
+                            spec.fontName.find("Times") != std::string::npos;
+    const bool wantsMono = spec.fontName.find("Mono") != std::string::npos ||
+                           spec.fontName.find("mono") != std::string::npos ||
+                           spec.fontName.find("Courier") != std::string::npos;
+    if (wantsSerif) {
+        return spec.isBold && spec.isItalic
+               ? "Times-BoldItalic"
+               : (spec.isBold ? "Times-Bold" : (spec.isItalic ? "Times-Italic" : "Times-Roman"));
+    }
+    if (wantsMono) {
+        return spec.isBold && spec.isItalic
+               ? "Courier-BoldOblique"
+               : (spec.isBold ? "Courier-Bold" : (spec.isItalic ? "Courier-Oblique" : "Courier"));
+    }
+    return spec.isBold && spec.isItalic
+           ? "Helvetica-BoldOblique"
+           : (spec.isBold ? "Helvetica-Bold" : (spec.isItalic ? "Helvetica-Oblique" : "Helvetica"));
+}
+
+static std::string BuildPdfSingleWatermarkContentStream(
+        const RawPdfWatermarkSpec& spec,
+        const std::string& fontName,
+        const std::string& graphicsStateName
+) {
+    std::string outlineStream = BuildPdfSingleWatermarkFontOutlineContentStream(spec, graphicsStateName);
+    if (!outlineStream.empty()) {
+        return outlineStream;
+    }
+
+    const int textLength = std::max(1, static_cast<int>(spec.text.size()));
+    const float approximateTextWidth =
+            fmax((textLength * spec.fontSize * 0.55f) +
+                 (std::max(0, textLength - 1) * spec.characterSpacing), spec.fontSize);
+    const float localX = -approximateTextWidth * 0.5f;
+    const float localY = -spec.fontSize * 0.25f;
+    const double angleRad = spec.rotation * M_PI / 180.0;
+    const float cosA = static_cast<float>(cos(angleRad));
+    const float sinA = static_cast<float>(sin(angleRad));
+    const float centerX = spec.pageWidth * 0.5f;
+    const float centerY = spec.pageHeight * 0.5f;
+    const float textX = centerX + (localX * cosA) - (localY * sinA);
+    const float textY = centerY + (localX * sinA) + (localY * cosA);
+
+    std::ostringstream stream;
+    stream << "q\n"
+           << "/" << graphicsStateName << " gs\n"
+           << FormatPdfFloat(spec.textR / 255.0f) << ' '
+           << FormatPdfFloat(spec.textG / 255.0f) << ' '
+           << FormatPdfFloat(spec.textB / 255.0f) << " rg\n"
+           << "BT\n";
+    if (fabs(spec.characterSpacing) > 0.0001f) {
+        stream << FormatPdfFloat(spec.characterSpacing) << " Tc\n";
+    }
+    stream << "/" << fontName << ' ' << FormatPdfFloat(spec.fontSize) << " Tf\n"
+           << FormatPdfFloat(cosA) << ' ' << FormatPdfFloat(sinA) << ' '
+           << FormatPdfFloat(-sinA) << ' ' << FormatPdfFloat(cosA) << ' '
+           << FormatPdfFloat(textX) << ' ' << FormatPdfFloat(textY) << " Tm\n"
+           << "(" << EscapePdfLiteralString(spec.text) << ") Tj\n"
+           << "ET\n";
+    if (spec.isUnderline || spec.isStrikeout) {
+        const float decorationThickness = fmax(spec.fontSize * 0.06f, 0.5f);
+        auto appendDecorationRect = [&](float y) {
+            stream << "q\n"
+                   << FormatPdfFloat(cosA) << ' ' << FormatPdfFloat(sinA) << ' '
+                   << FormatPdfFloat(-sinA) << ' ' << FormatPdfFloat(cosA) << ' '
+                   << FormatPdfFloat(textX) << ' ' << FormatPdfFloat(textY) << " cm\n"
+                   << "0 " << FormatPdfFloat(y) << ' '
+                   << FormatPdfFloat(approximateTextWidth) << ' '
+                   << FormatPdfFloat(decorationThickness) << " re f\n"
+                   << "Q\n";
+        };
+        if (spec.isUnderline) {
+            appendDecorationRect(-spec.fontSize * 0.12f);
+        }
+        if (spec.isStrikeout) {
+            appendDecorationRect(spec.fontSize * 0.32f);
+        }
+    }
+    stream << "Q";
+    return stream.str();
+}
+
+static std::string BuildPdfWatermarkFontObjectBody(const RawPdfWatermarkSpec& spec) {
+    std::ostringstream body;
+    body << "<< /Type /Font /Subtype /Type1 /BaseFont /"
+         << GetWatermarkBaseFontName(spec)
+         << " >>";
+    return body.str();
+}
+
+static std::string BuildPdfWatermarkGraphicsStateObjectBody(const RawPdfWatermarkSpec& spec) {
+    std::ostringstream body;
+    body << "<< /Type /ExtGState /CA "
+         << FormatPdfFloat(spec.opacity)
+         << " /ca "
+         << FormatPdfFloat(spec.opacity)
+         << " >>";
+    return body.str();
+}
+
+static std::string GetCurrentPdfObjectBody(
+        const PdfObjectInfo& object,
+        std::vector<PdfObjectReplacement>* replacements
+);
+static bool UpsertPdfObjectReplacement(
+        std::vector<PdfObjectReplacement>* replacements,
+        int objectNumber,
+        int generation,
+        const std::string& body
+);
+
+static bool AddNameReferenceToTopLevelDictionary(
+        const std::string& body,
+        const std::string& name,
+        int objectNumber,
+        std::string* outBody
+) {
+    if (!outBody || objectNumber <= 0) return false;
+    size_t dictStart = 0;
+    size_t dictEnd = 0;
+    if (!FindTopLevelPdfDictionary(body, &dictStart, &dictEnd)) return false;
+    if (FindPdfKeyTokenInRange(body, dictStart, dictEnd, name) != std::string::npos) {
+        *outBody = body;
+        return true;
+    }
+    std::string updated = body;
+    updated.insert(dictEnd - 2, "/" + name + " " + std::to_string(objectNumber) + " 0 R ");
+    *outBody = updated;
+    return true;
+}
+
+static std::string DescribePdfDictionaryValueForLog(
+        const std::string& body,
+        size_t dictStart,
+        size_t dictEnd,
+        const std::string& key
+) {
+    size_t valueStart = 0;
+    size_t valueEnd = 0;
+    if (!FindPdfDictionaryRawValueSegment(body, dictStart, dictEnd, key, &valueStart, &valueEnd)) {
+        return "missing";
+    }
+    if (valueStart >= valueEnd || valueEnd > body.size()) {
+        return "invalid";
+    }
+    if (body[valueStart] == '[') {
+        return "array";
+    }
+    if (valueStart + 1 < valueEnd && body[valueStart] == '<' && body[valueStart + 1] == '<') {
+        return "direct-dict";
+    }
+    int objectNumber = 0;
+    int generation = 0;
+    size_t indirectEnd = 0;
+    if (ParseIndirectReferenceAt(body, valueStart, dictEnd, &objectNumber, &generation, &indirectEnd)) {
+        return "ref " + std::to_string(objectNumber) + " " + std::to_string(generation);
+    }
+    const size_t length = std::min<size_t>(valueEnd - valueStart, 24);
+    return "raw " + body.substr(valueStart, length);
+}
+
+static bool AddResourceReferenceToDictionaryRange(
+        std::string* body,
+        size_t resourcesStart,
+        size_t resourcesEnd,
+        const std::vector<PdfObjectInfo>& objects,
+        const std::string& categoryName,
+        const std::string& resourceName,
+        int resourceObjectNumber,
+        std::vector<PdfObjectReplacement>* replacements
+) {
+    if (!body || !replacements || resourcesStart >= resourcesEnd || resourcesEnd > body->size() ||
+        categoryName.empty() || resourceName.empty() || resourceObjectNumber <= 0) {
+        return false;
+    }
+
+    size_t categoryDictStart = 0;
+    size_t categoryDictEnd = 0;
+    if (FindDirectDictionaryValue(*body, resourcesStart, resourcesEnd, categoryName, &categoryDictStart, &categoryDictEnd)) {
+        if (FindPdfKeyTokenInRange(*body, categoryDictStart, categoryDictEnd, resourceName) != std::string::npos) {
+            return true;
+        }
+        body->insert(categoryDictEnd - 2, "/" + resourceName + " " + std::to_string(resourceObjectNumber) + " 0 R ");
+        return true;
+    }
+
+    int categoryObjectNumber = 0;
+    int categoryGeneration = 0;
+    size_t categoryValueStart = 0;
+    size_t categoryValueEnd = 0;
+    if (FindIndirectReferenceValue(
+            *body,
+            resourcesStart,
+            resourcesEnd,
+            categoryName,
+            &categoryObjectNumber,
+            &categoryGeneration,
+            &categoryValueStart,
+            &categoryValueEnd
+    )) {
+        const PdfObjectInfo* categoryObject = FindPdfObjectInfoByRef(
+                objects,
+                categoryObjectNumber,
+                categoryGeneration
+        );
+        if (!categoryObject) {
+            WM_LOGE(
+                    "Native watermark resource patch failed: indirect %s missing obj=%d gen=%d",
+                    categoryName.c_str(),
+                    categoryObjectNumber,
+                    categoryGeneration
+            );
+            return false;
+        }
+        std::string categoryBody = GetCurrentPdfObjectBody(*categoryObject, replacements);
+        if (!AddNameReferenceToTopLevelDictionary(
+                categoryBody,
+                resourceName,
+                resourceObjectNumber,
+                &categoryBody
+        )) {
+            return false;
+        }
+        return UpsertPdfObjectReplacement(
+                replacements,
+                categoryObjectNumber,
+                categoryGeneration,
+                categoryBody
+        );
+    }
+
+    body->insert(
+            resourcesEnd - 2,
+            "/" + categoryName + " << /" + resourceName + " " + std::to_string(resourceObjectNumber) + " 0 R >> "
+    );
+    return true;
+}
+
+static bool AddPatternToResourceDictionaryRange(
+        std::string* body,
+        size_t resourcesStart,
+        size_t resourcesEnd,
+        const std::vector<PdfObjectInfo>& objects,
+        const std::string& patternName,
+        int patternObjectNumber,
+        std::vector<PdfObjectReplacement>* replacements
+) {
+    if (!body || !replacements || resourcesStart >= resourcesEnd || resourcesEnd > body->size()) return false;
+
+    size_t patternDictStart = 0;
+    size_t patternDictEnd = 0;
+    if (FindDirectDictionaryValue(*body, resourcesStart, resourcesEnd, "Pattern", &patternDictStart, &patternDictEnd)) {
+        if (FindPdfKeyTokenInRange(*body, patternDictStart, patternDictEnd, patternName) != std::string::npos) {
+            WM_LOGE(
+                    "Native watermark resource patch: pattern already exists name=%s range=%zu-%zu",
+                    patternName.c_str(),
+                    patternDictStart,
+                    patternDictEnd
+            );
+            return true;
+        }
+        WM_LOGE(
+                "Native watermark resource patch: append to direct pattern name=%s patternObj=%d range=%zu-%zu",
+                patternName.c_str(),
+                patternObjectNumber,
+                patternDictStart,
+                patternDictEnd
+        );
+        body->insert(patternDictEnd - 2, "/" + patternName + " " + std::to_string(patternObjectNumber) + " 0 R ");
+        return true;
+    }
+
+    int existingPatternObjectNumber = 0;
+    int existingPatternGeneration = 0;
+    size_t patternValueStart = 0;
+    size_t patternValueEnd = 0;
+    if (FindIndirectReferenceValue(
+            *body,
+            resourcesStart,
+            resourcesEnd,
+            "Pattern",
+            &existingPatternObjectNumber,
+            &existingPatternGeneration,
+            &patternValueStart,
+            &patternValueEnd
+    )) {
+        const PdfObjectInfo* patternObject = FindPdfObjectInfoByRef(
+                objects,
+                existingPatternObjectNumber,
+                existingPatternGeneration
+        );
+        if (!patternObject) {
+            WM_LOGE(
+                    "Native watermark resource patch failed: indirect pattern missing obj=%d gen=%d",
+                    existingPatternObjectNumber,
+                    existingPatternGeneration
+            );
+            return false;
+        }
+        WM_LOGE(
+                "Native watermark resource patch: append to indirect pattern obj=%d gen=%d name=%s patternObj=%d",
+                existingPatternObjectNumber,
+                existingPatternGeneration,
+                patternName.c_str(),
+                patternObjectNumber
+        );
+        std::string patternBody = GetCurrentPdfObjectBody(*patternObject, replacements);
+        if (!AddNameReferenceToTopLevelDictionary(
+                patternBody,
+                patternName,
+                patternObjectNumber,
+                &patternBody
+        )) {
+            return false;
+        }
+        return UpsertPdfObjectReplacement(
+                replacements,
+                existingPatternObjectNumber,
+                existingPatternGeneration,
+                patternBody
+        );
+    }
+
+    WM_LOGE(
+            "Native watermark resource patch: create direct pattern name=%s patternObj=%d resourcesRange=%zu-%zu",
+            patternName.c_str(),
+            patternObjectNumber,
+            resourcesStart,
+            resourcesEnd
+    );
+    body->insert(resourcesEnd - 2, "/Pattern << /" + patternName + " " + std::to_string(patternObjectNumber) + " 0 R >> ");
+    return true;
+}
+
+static const PdfObjectInfo* FindPdfObjectInfoByRef(
+        const std::vector<PdfObjectInfo>& objects,
+        int objectNumber,
+        int generation
+) {
+    for (const PdfObjectInfo& object : objects) {
+        if (object.objectNumber == objectNumber && object.generation == generation) {
+            return &object;
+        }
+    }
+    return nullptr;
+}
+
+static PdfObjectReplacement* FindPdfObjectReplacement(
+        std::vector<PdfObjectReplacement>* replacements,
+        int objectNumber,
+        int generation
+) {
+    if (!replacements) return nullptr;
+    for (PdfObjectReplacement& replacement : *replacements) {
+        if (replacement.objectNumber == objectNumber && replacement.generation == generation) {
+            return &replacement;
+        }
+    }
+    return nullptr;
+}
+
+static std::string GetCurrentPdfObjectBody(
+        const PdfObjectInfo& object,
+        std::vector<PdfObjectReplacement>* replacements
+) {
+    PdfObjectReplacement* replacement = FindPdfObjectReplacement(replacements, object.objectNumber, object.generation);
+    return replacement ? replacement->body : object.body;
+}
+
+static bool UpsertPdfObjectReplacement(
+        std::vector<PdfObjectReplacement>* replacements,
+        int objectNumber,
+        int generation,
+        const std::string& body
+) {
+    if (!replacements || objectNumber <= 0 || generation < 0) return false;
+    PdfObjectReplacement* existing = FindPdfObjectReplacement(replacements, objectNumber, generation);
+    if (existing) {
+        existing->body = body;
+    } else {
+        replacements->push_back({objectNumber, generation, body});
+    }
+    return true;
+}
+
+// Method that adds the pattern into the page resource dictionary using this
+static bool AddPatternToPageResources(
+        const std::vector<PdfObjectInfo>& objects,
+        const std::string& patternName,
+        int patternObjectNumber,
+        std::string* pageBody,
+        std::vector<PdfObjectReplacement>* replacements,
+        int depth = 0
+) {
+    if (!pageBody || !replacements || depth > 8) return false;
+    size_t pageDictStart = 0;
+    size_t pageDictEnd = 0;
+    if (!FindTopLevelPdfDictionary(*pageBody, &pageDictStart, &pageDictEnd)) return false;
+
+    size_t resourcesStart = 0;
+    size_t resourcesEnd = 0;
+    if (FindDirectDictionaryValue(*pageBody, pageDictStart, pageDictEnd, "Resources", &resourcesStart, &resourcesEnd)) {
+        WM_LOGE(
+                "Native watermark resource patch: direct page resources depth=%d range=%zu-%zu",
+                depth,
+                resourcesStart,
+                resourcesEnd
+        );
+        return AddPatternToResourceDictionaryRange(
+                pageBody,
+                resourcesStart,
+                resourcesEnd,
+                objects,
+                patternName,
+                patternObjectNumber,
+                replacements
+        );
+    }
+
+    int resourceObjectNumber = 0;
+    int resourceGeneration = 0;
+    size_t valueStart = 0;
+    size_t valueEnd = 0;
+    if (!FindIndirectReferenceValue(
+            *pageBody,
+            pageDictStart,
+            pageDictEnd,
+            "Resources",
+            &resourceObjectNumber,
+            &resourceGeneration,
+             &valueStart,
+             &valueEnd
+     )) {
+        int parentObjectNumber = 0;
+        int parentGeneration = 0;
+        size_t parentValueStart = 0;
+        size_t parentValueEnd = 0;
+        if (!FindIndirectReferenceValue(
+                *pageBody,
+                pageDictStart,
+                pageDictEnd,
+                "Parent",
+                &parentObjectNumber,
+                &parentGeneration,
+                &parentValueStart,
+                &parentValueEnd
+        )) {
+            WM_LOGE(
+                    "Native watermark resource patch: create page resources depth=%d",
+                    depth
+            );
+            pageBody->insert(
+                    pageDictEnd - 2,
+                    "/Resources << /Pattern << /" + patternName + " " +
+                    std::to_string(patternObjectNumber) + " 0 R >> >> "
+            );
+            return true;
+        }
+        const PdfObjectInfo* parentObject = FindPdfObjectInfoByRef(objects, parentObjectNumber, parentGeneration);
+        if (!parentObject) {
+            WM_LOGE(
+                    "Native watermark resource patch failed: parent missing obj=%d gen=%d depth=%d",
+                    parentObjectNumber,
+                    parentGeneration,
+                    depth
+            );
+            return false;
+        }
+        WM_LOGE(
+                "Native watermark resource patch: inherited parent obj=%d gen=%d depth=%d",
+                parentObjectNumber,
+                parentGeneration,
+                depth
+        );
+        std::string parentBody = GetCurrentPdfObjectBody(*parentObject, replacements);
+        if (!AddPatternToPageResources(
+                objects,
+                patternName,
+                patternObjectNumber,
+                &parentBody,
+                replacements,
+                depth + 1
+        )) {
+            return false;
+        }
+        return UpsertPdfObjectReplacement(replacements, parentObjectNumber, parentGeneration, parentBody);
+    }
+
+    const PdfObjectInfo* resourceObject = FindPdfObjectInfoByRef(objects, resourceObjectNumber, resourceGeneration);
+    if (!resourceObject) {
+        WM_LOGE(
+                "Native watermark resource patch failed: resources object missing obj=%d gen=%d depth=%d",
+                resourceObjectNumber,
+                resourceGeneration,
+                depth
+        );
+        return false;
+    }
+    WM_LOGE(
+            "Native watermark resource patch: indirect resources obj=%d gen=%d depth=%d",
+            resourceObjectNumber,
+            resourceGeneration,
+            depth
+    );
+    std::string resourceBody = GetCurrentPdfObjectBody(*resourceObject, replacements);
+    size_t resourceDictStart = 0;
+    size_t resourceDictEnd = 0;
+    if (!FindTopLevelPdfDictionary(resourceBody, &resourceDictStart, &resourceDictEnd) ||
+        !AddPatternToResourceDictionaryRange(
+                &resourceBody,
+                resourceDictStart,
+                resourceDictEnd,
+                objects,
+                patternName,
+                patternObjectNumber,
+                replacements
+        )) {
+        return false;
+    }
+    return UpsertPdfObjectReplacement(replacements, resourceObjectNumber, resourceGeneration, resourceBody);
+}
+
+static bool AddSingleWatermarkToResourceDictionaryRange(
+        std::string* body,
+        size_t resourcesStart,
+        size_t resourcesEnd,
+        const std::vector<PdfObjectInfo>& objects,
+        const std::string& fontName,
+        int fontObjectNumber,
+        const std::string& graphicsStateName,
+        int graphicsStateObjectNumber,
+        std::vector<PdfObjectReplacement>* replacements
+) {
+    if (!AddResourceReferenceToDictionaryRange(
+            body,
+            resourcesStart,
+            resourcesEnd,
+            objects,
+            "Font",
+            fontName,
+            fontObjectNumber,
+            replacements
+    )) {
+        return false;
+    }
+
+    size_t updatedResourcesStart = 0;
+    size_t updatedResourcesEnd = 0;
+    if (!FindBalancedPdfDictionary(*body, resourcesStart, body->size(), &updatedResourcesStart, &updatedResourcesEnd)) {
+        updatedResourcesStart = resourcesStart;
+        updatedResourcesEnd = std::min(resourcesEnd, body->size());
+    }
+    return AddResourceReferenceToDictionaryRange(
+            body,
+            updatedResourcesStart,
+            updatedResourcesEnd,
+            objects,
+            "ExtGState",
+            graphicsStateName,
+            graphicsStateObjectNumber,
+            replacements
+    );
+}
+
+static bool AddSingleWatermarkToPageResources(
+        const std::vector<PdfObjectInfo>& objects,
+        const std::string& fontName,
+        int fontObjectNumber,
+        const std::string& graphicsStateName,
+        int graphicsStateObjectNumber,
+        std::string* pageBody,
+        std::vector<PdfObjectReplacement>* replacements,
+        int depth = 0
+) {
+    if (!pageBody || !replacements || depth > 8) return false;
+    size_t pageDictStart = 0;
+    size_t pageDictEnd = 0;
+    if (!FindTopLevelPdfDictionary(*pageBody, &pageDictStart, &pageDictEnd)) return false;
+
+    size_t resourcesStart = 0;
+    size_t resourcesEnd = 0;
+    if (FindDirectDictionaryValue(*pageBody, pageDictStart, pageDictEnd, "Resources", &resourcesStart, &resourcesEnd)) {
+        WM_LOGE("Native watermark single resource patch: direct page resources depth=%d", depth);
+        return AddSingleWatermarkToResourceDictionaryRange(
+                pageBody,
+                resourcesStart,
+                resourcesEnd,
+                objects,
+                fontName,
+                fontObjectNumber,
+                graphicsStateName,
+                graphicsStateObjectNumber,
+                replacements
+        );
+    }
+
+    int resourceObjectNumber = 0;
+    int resourceGeneration = 0;
+    size_t valueStart = 0;
+    size_t valueEnd = 0;
+    if (!FindIndirectReferenceValue(
+            *pageBody,
+            pageDictStart,
+            pageDictEnd,
+            "Resources",
+            &resourceObjectNumber,
+            &resourceGeneration,
+            &valueStart,
+            &valueEnd
+    )) {
+        int parentObjectNumber = 0;
+        int parentGeneration = 0;
+        size_t parentValueStart = 0;
+        size_t parentValueEnd = 0;
+        if (!FindIndirectReferenceValue(
+                *pageBody,
+                pageDictStart,
+                pageDictEnd,
+                "Parent",
+                &parentObjectNumber,
+                &parentGeneration,
+                &parentValueStart,
+                &parentValueEnd
+        )) {
+            pageBody->insert(
+                    pageDictEnd - 2,
+                    "/Resources << /Font << /" + fontName + " " + std::to_string(fontObjectNumber) +
+                    " 0 R >> /ExtGState << /" + graphicsStateName + " " +
+                    std::to_string(graphicsStateObjectNumber) + " 0 R >> >> "
+            );
+            return true;
+        }
+        const PdfObjectInfo* parentObject = FindPdfObjectInfoByRef(objects, parentObjectNumber, parentGeneration);
+        if (!parentObject) return false;
+        std::string parentBody = GetCurrentPdfObjectBody(*parentObject, replacements);
+        if (!AddSingleWatermarkToPageResources(
+                objects,
+                fontName,
+                fontObjectNumber,
+                graphicsStateName,
+                graphicsStateObjectNumber,
+                &parentBody,
+                replacements,
+                depth + 1
+        )) {
+            return false;
+        }
+        return UpsertPdfObjectReplacement(replacements, parentObjectNumber, parentGeneration, parentBody);
+    }
+
+    const PdfObjectInfo* resourceObject = FindPdfObjectInfoByRef(objects, resourceObjectNumber, resourceGeneration);
+    if (!resourceObject) return false;
+    std::string resourceBody = GetCurrentPdfObjectBody(*resourceObject, replacements);
+    size_t resourceDictStart = 0;
+    size_t resourceDictEnd = 0;
+    if (!FindTopLevelPdfDictionary(resourceBody, &resourceDictStart, &resourceDictEnd) ||
+        !AddSingleWatermarkToResourceDictionaryRange(
+                &resourceBody,
+                resourceDictStart,
+                resourceDictEnd,
+                objects,
+                fontName,
+                fontObjectNumber,
+                graphicsStateName,
+                graphicsStateObjectNumber,
+                replacements
+        )) {
+        return false;
+    }
+    return UpsertPdfObjectReplacement(replacements, resourceObjectNumber, resourceGeneration, resourceBody);
+}
+
+static bool AddRasterWatermarkToResourceDictionaryRange(
+        std::string* body,
+        size_t resourcesStart,
+        size_t resourcesEnd,
+        const std::vector<PdfObjectInfo>& objects,
+        const std::string& imageName,
+        int imageObjectNumber,
+        const std::string& graphicsStateName,
+        int graphicsStateObjectNumber,
+        std::vector<PdfObjectReplacement>* replacements
+) {
+    if (!AddResourceReferenceToDictionaryRange(
+            body,
+            resourcesStart,
+            resourcesEnd,
+            objects,
+            "XObject",
+            imageName,
+            imageObjectNumber,
+            replacements
+    )) {
+        return false;
+    }
+
+    size_t updatedResourcesStart = 0;
+    size_t updatedResourcesEnd = 0;
+    if (!FindBalancedPdfDictionary(*body, resourcesStart, body->size(), &updatedResourcesStart, &updatedResourcesEnd)) {
+        updatedResourcesStart = resourcesStart;
+        updatedResourcesEnd = std::min(resourcesEnd, body->size());
+    }
+    return AddResourceReferenceToDictionaryRange(
+            body,
+            updatedResourcesStart,
+            updatedResourcesEnd,
+            objects,
+            "ExtGState",
+            graphicsStateName,
+            graphicsStateObjectNumber,
+            replacements
+    );
+}
+
+static bool AddRasterWatermarkToPageResources(
+        const std::vector<PdfObjectInfo>& objects,
+        const std::string& imageName,
+        int imageObjectNumber,
+        const std::string& graphicsStateName,
+        int graphicsStateObjectNumber,
+        std::string* pageBody,
+        std::vector<PdfObjectReplacement>* replacements,
+        int depth = 0
+) {
+    if (!pageBody || !replacements || depth > 8) return false;
+    size_t pageDictStart = 0;
+    size_t pageDictEnd = 0;
+    if (!FindTopLevelPdfDictionary(*pageBody, &pageDictStart, &pageDictEnd)) return false;
+
+    size_t resourcesStart = 0;
+    size_t resourcesEnd = 0;
+    if (FindDirectDictionaryValue(*pageBody, pageDictStart, pageDictEnd, "Resources", &resourcesStart, &resourcesEnd)) {
+        return AddRasterWatermarkToResourceDictionaryRange(
+                pageBody,
+                resourcesStart,
+                resourcesEnd,
+                objects,
+                imageName,
+                imageObjectNumber,
+                graphicsStateName,
+                graphicsStateObjectNumber,
+                replacements
+        );
+    }
+
+    int resourceObjectNumber = 0;
+    int resourceGeneration = 0;
+    size_t valueStart = 0;
+    size_t valueEnd = 0;
+    if (!FindIndirectReferenceValue(
+            *pageBody,
+            pageDictStart,
+            pageDictEnd,
+            "Resources",
+            &resourceObjectNumber,
+            &resourceGeneration,
+            &valueStart,
+            &valueEnd
+    )) {
+        int parentObjectNumber = 0;
+        int parentGeneration = 0;
+        size_t parentValueStart = 0;
+        size_t parentValueEnd = 0;
+        if (!FindIndirectReferenceValue(
+                *pageBody,
+                pageDictStart,
+                pageDictEnd,
+                "Parent",
+                &parentObjectNumber,
+                &parentGeneration,
+                &parentValueStart,
+                &parentValueEnd
+        )) {
+            pageBody->insert(
+                    pageDictEnd - 2,
+                    "/Resources << /XObject << /" + imageName + " " + std::to_string(imageObjectNumber) +
+                    " 0 R >> /ExtGState << /" + graphicsStateName + " " +
+                    std::to_string(graphicsStateObjectNumber) + " 0 R >> >> "
+            );
+            return true;
+        }
+        const PdfObjectInfo* parentObject = FindPdfObjectInfoByRef(objects, parentObjectNumber, parentGeneration);
+        if (!parentObject) return false;
+        std::string parentBody = GetCurrentPdfObjectBody(*parentObject, replacements);
+        if (!AddRasterWatermarkToPageResources(
+                objects,
+                imageName,
+                imageObjectNumber,
+                graphicsStateName,
+                graphicsStateObjectNumber,
+                &parentBody,
+                replacements,
+                depth + 1
+        )) {
+            return false;
+        }
+        return UpsertPdfObjectReplacement(replacements, parentObjectNumber, parentGeneration, parentBody);
+    }
+
+    const PdfObjectInfo* resourceObject = FindPdfObjectInfoByRef(objects, resourceObjectNumber, resourceGeneration);
+    if (!resourceObject) return false;
+    std::string resourceBody = GetCurrentPdfObjectBody(*resourceObject, replacements);
+    size_t resourceDictStart = 0;
+    size_t resourceDictEnd = 0;
+    if (!FindTopLevelPdfDictionary(resourceBody, &resourceDictStart, &resourceDictEnd) ||
+        !AddRasterWatermarkToResourceDictionaryRange(
+                &resourceBody,
+                resourceDictStart,
+                resourceDictEnd,
+                objects,
+                imageName,
+                imageObjectNumber,
+                graphicsStateName,
+                graphicsStateObjectNumber,
+                replacements
+        )) {
+        return false;
+    }
+    return UpsertPdfObjectReplacement(replacements, resourceObjectNumber, resourceGeneration, resourceBody);
+}
+
+
+// Method that fill the whole page rectangle using the repeating watermark pattern.
+static bool AddWatermarkContentToPageBody(
+        const std::string& originalBody,
+        int contentObjectNumber,
+        std::string* outBody
+) {
+    if (!outBody) return false;
+    std::string body = originalBody;
+    size_t dictStart = 0;
+    size_t dictEnd = 0;
+    if (!FindTopLevelPdfDictionary(body, &dictStart, &dictEnd)) return false;
+
+    const size_t contentsKey = FindPdfKeyTokenInRange(body, dictStart, dictEnd, "Contents");
+    if (contentsKey == std::string::npos) {
+        WM_LOGE("Native watermark content patch: no contents, inserting contentObj=%d", contentObjectNumber);
+        body.insert(dictEnd - 2, "/Contents " + std::to_string(contentObjectNumber) + " 0 R ");
+        *outBody = body;
+        return true;
+    }
+
+    size_t valueStart = contentsKey + strlen("/Contents");
+    while (valueStart < dictEnd && std::isspace(static_cast<unsigned char>(body[valueStart]))) {
+        valueStart++;
+    }
+    if (valueStart >= dictEnd) return false;
+
+    if (body[valueStart] == '[') {
+        const size_t arrayEnd = body.find(']', valueStart + 1);
+        if (arrayEnd == std::string::npos || arrayEnd >= dictEnd) return false;
+        WM_LOGE("Native watermark content patch: append to contents array contentObj=%d", contentObjectNumber);
+        body.insert(arrayEnd, " " + std::to_string(contentObjectNumber) + " 0 R");
+        *outBody = body;
+        return true;
+    }
+
+    int existingObjectNumber = 0;
+    int existingGeneration = 0;
+    size_t valueEnd = 0;
+    if (ParseIndirectReferenceAt(
+            body,
+            valueStart,
+            dictEnd,
+            &existingObjectNumber,
+            &existingGeneration,
+            &valueEnd
+    )) {
+        WM_LOGE(
+                "Native watermark content patch: convert contents ref %d %d to array with contentObj=%d",
+                existingObjectNumber,
+                existingGeneration,
+                contentObjectNumber
+        );
+        body.replace(
+                valueStart,
+                valueEnd - valueStart,
+                "[ " + std::to_string(existingObjectNumber) + " " + std::to_string(existingGeneration) +
+                " R " + std::to_string(contentObjectNumber) + " 0 R ]"
+        );
+        *outBody = body;
+        return true;
+    }
+
+    WM_LOGE(
+            "Native watermark content patch failed: unsupported contents value char=%d at=%zu",
+            static_cast<int>(static_cast<unsigned char>(body[valueStart])),
+            valueStart
+    );
+    return false;
+}
+
+struct RawPdfWatermarkPatternBinding {
+    int objectNumber = 0;
+    int imageObjectNumber = 0;
+    int imageSmaskObjectNumber = 0;
+    std::string patternName;
+    std::string graphicsStateName;
+    std::string imageName;
+};
+
+static std::string BuildRawPdfWatermarkPatternKey(const RawPdfWatermarkSpec& spec) {
+    std::ostringstream key;
+    key << (spec.isRepeated ? "REPEATED" : "SINGLE") << '|'
+        << FormatPdfFloat(spec.pageWidth) << 'x' << FormatPdfFloat(spec.pageHeight) << '|'
+        << spec.text << '|'
+        << spec.fontName << '|'
+        << spec.fontPath << '|'
+        << spec.textR << ',' << spec.textG << ',' << spec.textB << '|'
+        << FormatPdfFloat(spec.fontSize) << '|'
+        << FormatPdfFloat(spec.patternWidth) << 'x' << FormatPdfFloat(spec.patternHeight) << '|'
+        << FormatPdfFloat(spec.contentWidth) << 'x' << FormatPdfFloat(spec.contentHeight) << '|'
+        << FormatPdfFloat(spec.repeatStepWidth) << 'x' << FormatPdfFloat(spec.repeatStepHeight) << '|'
+        << FormatPdfFloat(spec.baselineX) << ',' << FormatPdfFloat(spec.baselineY) << '|'
+        << FormatPdfFloat(spec.rotation) << '|'
+        << FormatPdfFloat(spec.opacity) << '|'
+        << FormatPdfFloat(spec.characterSpacing) << '|'
+        << (spec.isBold ? "b" : "r") << (spec.isItalic ? "i" : "n")
+        << (spec.isUnderline ? "u" : "n") << (spec.isStrikeout ? "s" : "n")
+        << (spec.isRasterImage ? "raster" : (spec.isIconImage ? "icon" : "text")) << '|'
+        << spec.imagePath << '|'
+        << spec.imagePixelWidth << 'x' << spec.imagePixelHeight;
+    return key.str();
+}
+
+// Method that reads the saved PDF as bytes/text and scans PDF objects
+static bool PatchRawPdfWatermarkPatterns(JNIEnv* env, const char* outputPath, const std::vector<RawPdfWatermarkSpec>& specs) {
+    if (!outputPath || specs.empty()) return true;
+
+    const long long patchStartMs = WatermarkNowMs();
+    long long stepStartMs = patchStartMs;
+    WM_TIME_LOGE("WM_TIME patch start specs=%zu", specs.size());
+
+    std::string data;
+    if (!ReadFileToString(outputPath, &data)) {
+        WM_LOGE("Native watermark compact patch failed: unable to read output PDF");
+        return false;
+    }
+    WM_TIME_LOGE("WM_TIME patch read_pdf ms=%lld bytes=%zu", WatermarkNowMs() - stepStartMs, data.size());
+    stepStartMs = WatermarkNowMs();
+
+    std::vector<PdfObjectInfo> objects = ScanPdfObjects(data);
+    WM_TIME_LOGE("WM_TIME patch scan_objects ms=%lld objects=%zu", WatermarkNowMs() - stepStartMs, objects.size());
+    stepStartMs = WatermarkNowMs();
+    if (objects.empty()) {
+        WM_LOGE("Native watermark compact patch failed: no plain PDF objects found, bytes=%zu", data.size());
+        return false;
+    }
+
+    const std::vector<PdfObjectInfo> latestObjects = BuildLatestPdfObjectsByRef(objects);
+    WM_TIME_LOGE("WM_TIME patch latest_objects ms=%lld latest=%zu", WatermarkNowMs() - stepStartMs, latestObjects.size());
+    stepStartMs = WatermarkNowMs();
+    int maxSpecPageIndex = -1;
+    for (const RawPdfWatermarkSpec& spec : specs) {
+        maxSpecPageIndex = std::max(maxSpecPageIndex, spec.pageIndex);
+    }
+    std::vector<PdfObjectInfo> pages = BuildPdfPageObjectsFromCatalog(data, latestObjects);
+    bool usedCatalogPageTree = !pages.empty();
+    if (pages.empty()) {
+        pages = BuildLatestPdfPageObjects(objects, latestObjects);
+        usedCatalogPageTree = false;
+    } else if (maxSpecPageIndex >= 0 && static_cast<size_t>(maxSpecPageIndex) >= pages.size()) {
+        const std::vector<PdfObjectInfo> scannedPages = BuildLatestPdfPageObjects(objects, latestObjects);
+        WM_LOGE(
+                "Native watermark page discovery incomplete: catalogPages=%zu scannedPages=%zu maxSpecPage=%d",
+                pages.size(),
+                scannedPages.size(),
+                maxSpecPageIndex
+        );
+        if (scannedPages.size() > pages.size() && static_cast<size_t>(maxSpecPageIndex) < scannedPages.size()) {
+            pages = scannedPages;
+            usedCatalogPageTree = false;
+            WM_LOGE("Native watermark page discovery switched to scanned page objects");
+        }
+    }
+    WM_TIME_LOGE(
+            "WM_TIME patch discover_pages ms=%lld pages=%zu pageTree=%d",
+            WatermarkNowMs() - stepStartMs,
+            pages.size(),
+            usedCatalogPageTree ? 1 : 0
+    );
+    if (pages.empty()) {
+        WM_LOGE("Native watermark compact patch failed: no plain page dictionaries found, objects=%zu, bytes=%zu", objects.size(), data.size());
+        return false;
+    }
+    WM_LOGE(
+            "Native watermark compact patch start: specs=%zu objects=%zu latestObjects=%zu pages=%zu pageTree=%d nextObj=%d",
+            specs.size(),
+            objects.size(),
+            latestObjects.size(),
+            pages.size(),
+            usedCatalogPageTree ? 1 : 0,
+            GetMaxPdfObjectNumber(objects) + 1
+    );
+
+    std::vector<PdfObjectReplacement> replacements;
+    int nextObjectNumber = GetMaxPdfObjectNumber(objects) + 1;
+    std::map<std::string, RawPdfWatermarkPatternBinding> patternBindings;
+    int patchedCount = 0;
+
+    stepStartMs = WatermarkNowMs();
+    for (size_t specIndex = 0; specIndex < specs.size(); specIndex++) {
+        const RawPdfWatermarkSpec& spec = specs[specIndex];
+        if (spec.pageIndex < 0 || static_cast<size_t>(spec.pageIndex) >= pages.size() ||
+            (!spec.isRasterImage && spec.text.empty()) || spec.patternWidth <= 0.0f || spec.patternHeight <= 0.0f ||
+            (spec.isRasterImage && spec.imagePath.empty())) {
+            WM_LOGE(
+                    "Native watermark compact patch skip spec=%zu page=%d pages=%zu textLen=%zu raster=%d imagePathLen=%zu pattern=%fx%f",
+                    specIndex,
+                    spec.pageIndex,
+                    pages.size(),
+                    spec.text.size(),
+                    spec.isRasterImage ? 1 : 0,
+                    spec.imagePath.size(),
+                    spec.patternWidth,
+                    spec.patternHeight
+            );
+            continue;
+        }
+
+        const int contentObjectNumber = nextObjectNumber++;
+        RawPdfWatermarkPatternBinding binding;
+        std::string contentStream;
+        int fontObjectNumber = 0;
+        int graphicsStateObjectNumber = 0;
+        int imageObjectNumber = 0;
+        int imageSmaskObjectNumber = 0;
+        std::string fontName;
+        std::string imageName;
+        const std::string patternKey = BuildRawPdfWatermarkPatternKey(spec);
+        const auto existingPattern = patternBindings.find(patternKey);
+        if (existingPattern != patternBindings.end()) {
+            binding = existingPattern->second;
+        } else {
+            const int patternObjectNumber = nextObjectNumber++;
+            const int patternIndex = static_cast<int>(patternBindings.size()) + 1;
+            binding.objectNumber = patternObjectNumber;
+            binding.patternName = MakePdfResourceName("LufickWmP", patternIndex);
+            binding.graphicsStateName = MakePdfResourceName("LufickWmGS", patternIndex);
+            if (spec.isRasterImage) {
+                binding.imageObjectNumber = nextObjectNumber++;
+                binding.imageSmaskObjectNumber = nextObjectNumber++;
+                binding.imageName = MakePdfResourceName("LufickWmIm", patternIndex);
+            }
+            patternBindings[patternKey] = binding;
+        }
+        contentStream = BuildPdfWatermarkContentStream(spec, binding.patternName);
+        imageObjectNumber = binding.imageObjectNumber;
+        imageSmaskObjectNumber = binding.imageSmaskObjectNumber;
+        imageName = binding.imageName;
+
+        const PdfObjectInfo& page = pages[spec.pageIndex];
+        WM_LOGE(
+                "Native watermark compact patch page spec=%zu mode=%s page=%d obj=%d gen=%d patternObj=%d fontObj=%d imageObj=%d gsObj=%d contentObj=%d textLen=%zu raster=%d",
+                specIndex,
+                spec.isRepeated ? "REPEATED" : "SINGLE",
+                spec.pageIndex,
+                page.objectNumber,
+                page.generation,
+                binding.objectNumber,
+                fontObjectNumber,
+                imageObjectNumber,
+                graphicsStateObjectNumber,
+                contentObjectNumber,
+                spec.text.size(),
+                spec.isRasterImage ? 1 : 0
+        );
+        std::string pageBody = page.body;
+        int existingPageReplacementIndex = -1;
+        for (size_t replacementIndex = 0; replacementIndex < replacements.size(); replacementIndex++) {
+            if (replacements[replacementIndex].objectNumber == page.objectNumber &&
+                replacements[replacementIndex].generation == page.generation) {
+                pageBody = replacements[replacementIndex].body;
+                existingPageReplacementIndex = static_cast<int>(replacementIndex);
+                break;
+            }
+        }
+        size_t pageDictStart = 0;
+        size_t pageDictEnd = 0;
+        if (FindTopLevelPdfDictionary(pageBody, &pageDictStart, &pageDictEnd)) {
+            const bool hasAnnots = FindPdfKeyTokenInRange(pageBody, pageDictStart, pageDictEnd, "Annots") != std::string::npos;
+            WM_LOGE(
+                    "Native watermark page diagnostics: page=%d obj=%d gen=%d bodyLen=%zu existingReplacement=%d annots=%d resources=%s contents=%s",
+                    spec.pageIndex,
+                    page.objectNumber,
+                    page.generation,
+                    pageBody.size(),
+                    existingPageReplacementIndex >= 0 ? 1 : 0,
+                    hasAnnots ? 1 : 0,
+                    DescribePdfDictionaryValueForLog(pageBody, pageDictStart, pageDictEnd, "Resources").c_str(),
+                    DescribePdfDictionaryValueForLog(pageBody, pageDictStart, pageDictEnd, "Contents").c_str()
+            );
+        } else {
+            WM_LOGE(
+                    "Native watermark page diagnostics failed: no page dictionary page=%d obj=%d gen=%d bodyLen=%zu",
+                    spec.pageIndex,
+                    page.objectNumber,
+                    page.generation,
+                    pageBody.size()
+            );
+        }
+        const bool resourcesAdded = AddPatternToPageResources(
+                latestObjects,
+                binding.patternName,
+                binding.objectNumber,
+                &pageBody,
+                &replacements
+        );
+        if (!resourcesAdded) {
+            WM_LOGE(
+                    "Unable to add native watermark resources for page %d mode=%s obj=%d gen=%d bodyLen=%zu",
+                    spec.pageIndex,
+                    spec.isRepeated ? "REPEATED" : "SINGLE",
+                    page.objectNumber,
+                    page.generation,
+                    pageBody.size()
+            );
+            continue;
+        }
+        if (!AddWatermarkContentToPageBody(pageBody, contentObjectNumber, &pageBody)) {
+            WM_LOGE(
+                    "Unable to add native watermark content stream for page %d obj=%d gen=%d bodyLen=%zu",
+                    spec.pageIndex,
+                    page.objectNumber,
+                    page.generation,
+                    pageBody.size()
+            );
+            continue;
+        }
+        if (!FindPdfObjectReplacement(&replacements, binding.objectNumber, 0)) {
+            if (spec.isRasterImage && !FindPdfObjectReplacement(&replacements, binding.imageObjectNumber, 0)) {
+                if (!BuildRasterWatermarkImageReplacements(
+                        env,
+                        spec,
+                        binding.imageObjectNumber,
+                        binding.imageSmaskObjectNumber,
+                        &replacements
+                )) {
+                    WM_LOGE("Native watermark raster image object build failed: page=%d path=%s", spec.pageIndex, spec.imagePath.c_str());
+                    continue;
+                }
+            }
+            replacements.push_back({
+                    binding.objectNumber,
+                    0,
+                    spec.isRepeated
+                    ? BuildPdfWatermarkPatternObjectBody(
+                            spec,
+                            binding.graphicsStateName,
+                            binding.imageName,
+                            binding.imageObjectNumber
+                    )
+                    : BuildPdfSingleWatermarkPatternObjectBody(
+                            spec,
+                            binding.graphicsStateName,
+                            binding.imageName,
+                            binding.imageObjectNumber
+                    )
+            });
+        }
+        replacements.push_back({
+                contentObjectNumber,
+                0,
+                "<< /Length " + std::to_string(contentStream.size()) + " >>\nstream\n" +
+                contentStream + "\nendstream"
+        });
+        if (existingPageReplacementIndex >= 0) {
+            replacements[existingPageReplacementIndex].body = pageBody;
+        } else {
+            replacements.push_back({page.objectNumber, page.generation, pageBody});
+        }
+        WM_LOGE(
+                "Native watermark patched page result: page=%d obj=%d gen=%d replacements=%zu pageBodyLen=%zu",
+                spec.pageIndex,
+                page.objectNumber,
+                page.generation,
+                replacements.size(),
+                pageBody.size()
+        );
+        patchedCount++;
+    }
+    WM_TIME_LOGE(
+            "WM_TIME patch build_replacements ms=%lld patched=%d replacements=%zu",
+            WatermarkNowMs() - stepStartMs,
+            patchedCount,
+            replacements.size()
+    );
+
+    if (patchedCount <= 0) {
+        WM_LOGE("Native watermark compact patch failed: no page was patched, specs=%zu pages=%zu objects=%zu", specs.size(), pages.size(), objects.size());
+        return false;
+    }
+    const size_t replacementLogCount = std::min<size_t>(replacements.size(), 24);
+    for (size_t index = 0; index < replacementLogCount; index++) {
+        WM_LOGE(
+                "Native watermark replacement diagnostics: index=%zu obj=%d gen=%d bodyLen=%zu",
+                index,
+                replacements[index].objectNumber,
+                replacements[index].generation,
+                replacements[index].body.size()
+        );
+    }
+    if (replacements.size() > replacementLogCount) {
+        WM_LOGE(
+                "Native watermark replacement diagnostics: truncated total=%zu logged=%zu",
+                replacements.size(),
+                replacementLogCount
+        );
+    }
+    stepStartMs = WatermarkNowMs();
+    if (!AppendIncrementalPdfObjectUpdates(&data, &replacements)) {
+        WM_LOGE("Native watermark compact patch failed: unable to append incremental PDF updates, replacements=%zu patched=%d", replacements.size(), patchedCount);
+        return false;
+    }
+    WM_TIME_LOGE(
+            "WM_TIME patch append_incremental ms=%lld replacements=%zu",
+            WatermarkNowMs() - stepStartMs,
+            replacements.size()
+    );
+    stepStartMs = WatermarkNowMs();
+    if (!WriteStringToFile(outputPath, data)) {
+        WM_LOGE("Native watermark compact patch failed: unable to write patched PDF");
+        return false;
+    }
+    WM_TIME_LOGE(
+            "WM_TIME patch write_pdf ms=%lld finalBytes=%zu totalMs=%lld",
+            WatermarkNowMs() - stepStartMs,
+            data.size(),
+            WatermarkNowMs() - patchStartMs
+    );
+    WM_LOGE("Patched %d compact native PDF watermark pattern(s)", patchedCount);
     return true;
 }
 
@@ -3779,6 +6009,241 @@ static jstring GetBridgeDataPropertyJString(
     return jValue;
 }
 
+// Method use for Compact instruction set for the watermark
+static bool CollectPageLevelTextWatermarkPatternSpec(
+        JNIEnv* env,
+        jobject obj,
+        jfieldID dataPropsField,
+        jclass jsonClass,
+        jmethodID jsonInit,
+        RawPdfWatermarkSpec* outSpec
+) {
+    if (!outSpec) return false;
+    jstring jJsonStr = GetBridgeDataPropertyJString(env, obj, dataPropsField, jsonClass, jsonInit, "watermarkProperties");
+    if (!jJsonStr) {
+        WM_LOGE("Native watermark spec collect failed: missing watermarkProperties");
+        return false;
+    }
+
+    jobject json = env->NewObject(jsonClass, jsonInit, jJsonStr);
+    if (!json || env->ExceptionCheck()) {
+        env->ExceptionClear();
+        env->DeleteLocalRef(jJsonStr);
+        WM_LOGE("Native watermark spec collect failed: invalid watermarkProperties json");
+        return false;
+    }
+
+    jmethodID optS = env->GetMethodID(jsonClass, "optString", "(Ljava/lang/String;)Ljava/lang/String;");
+    jmethodID optD = env->GetMethodID(jsonClass, "optDouble", "(Ljava/lang/String;D)D");
+    jmethodID optI = env->GetMethodID(jsonClass, "optInt", "(Ljava/lang/String;I)I");
+    jmethodID optB = env->GetMethodID(jsonClass, "optBoolean", "(Ljava/lang/String;Z)Z");
+
+    auto optStringValue = [&](const char* key) -> jstring {
+        jstring jKey = env->NewStringUTF(key);
+        jstring value = (jstring)env->CallObjectMethod(json, optS, jKey);
+        env->DeleteLocalRef(jKey);
+        return value;
+    };
+    auto optDoubleValue = [&](const char* key, double fallback) -> double {
+        jstring jKey = env->NewStringUTF(key);
+        double value = env->CallDoubleMethod(json, optD, jKey, fallback);
+        env->DeleteLocalRef(jKey);
+        return value;
+    };
+    auto optIntValue = [&](const char* key, int fallback) -> int {
+        jstring jKey = env->NewStringUTF(key);
+        int value = env->CallIntMethod(json, optI, jKey, fallback);
+        env->DeleteLocalRef(jKey);
+        return value;
+    };
+    auto optBoolValue = [&](const char* key, bool fallback) -> bool {
+        jstring jKey = env->NewStringUTF(key);
+        bool value = env->CallBooleanMethod(json, optB, jKey, fallback ? JNI_TRUE : JNI_FALSE) == JNI_TRUE;
+        env->DeleteLocalRef(jKey);
+        return value;
+    };
+
+    jstring jType = optStringValue("watermarkType");
+    jstring jMode = optStringValue("watermarkMode");
+    jstring jText = optStringValue("text");
+    jstring jObjectId = optStringValue("objectId");
+    jstring jFont = optStringValue("font");
+    jstring jFontPath = optStringValue("fontPath");
+    jstring jImagePath = optStringValue("imagePath");
+
+    const char* typeStr = jType ? env->GetStringUTFChars(jType, nullptr) : nullptr;
+    const char* modeStr = jMode ? env->GetStringUTFChars(jMode, nullptr) : nullptr;
+    const bool isTextWatermark = !typeStr || strlen(typeStr) == 0 || strcmp(typeStr, "TEXT") == 0;
+    const bool isImageWatermark = typeStr && strcmp(typeStr, "IMAGE") == 0;
+    const bool isIconImageWatermark = isImageWatermark && optBoolValue("isIconImage", false);
+    const bool isRasterImageWatermark = isImageWatermark && !isIconImageWatermark;
+    const bool isRepeatedMode = !modeStr || strlen(modeStr) == 0 || strcmp(modeStr, "REPEATED") == 0;
+    if (typeStr) env->ReleaseStringUTFChars(jType, typeStr);
+    if (modeStr) env->ReleaseStringUTFChars(jMode, modeStr);
+
+    if ((!isTextWatermark && !isIconImageWatermark && !isRasterImageWatermark) ||
+        (!isRasterImageWatermark && (!jText || env->GetStringLength(jText) == 0)) ||
+        (isRasterImageWatermark && (!jImagePath || env->GetStringLength(jImagePath) == 0))) {
+        WM_LOGE(
+                "Native watermark spec collect skipped: isText=%d isIconImage=%d isRaster=%d isRepeated=%d hasText=%d hasImagePath=%d",
+                isTextWatermark ? 1 : 0,
+                isIconImageWatermark ? 1 : 0,
+                isRasterImageWatermark ? 1 : 0,
+                isRepeatedMode ? 1 : 0,
+                (jText && env->GetStringLength(jText) > 0) ? 1 : 0,
+                (jImagePath && env->GetStringLength(jImagePath) > 0) ? 1 : 0
+        );
+        if (jType) env->DeleteLocalRef(jType);
+        if (jMode) env->DeleteLocalRef(jMode);
+        if (jText) env->DeleteLocalRef(jText);
+        if (jObjectId) env->DeleteLocalRef(jObjectId);
+        if (jFont) env->DeleteLocalRef(jFont);
+        if (jFontPath) env->DeleteLocalRef(jFontPath);
+        if (jImagePath) env->DeleteLocalRef(jImagePath);
+        env->DeleteLocalRef(json);
+        env->DeleteLocalRef(jJsonStr);
+        return false;
+    }
+
+    const char* textChars = jText ? env->GetStringUTFChars(jText, nullptr) : nullptr;
+    const char* objectIdChars = jObjectId ? env->GetStringUTFChars(jObjectId, nullptr) : nullptr;
+    const char* fontChars = jFont ? env->GetStringUTFChars(jFont, nullptr) : nullptr;
+    const char* fontPathChars = jFontPath ? env->GetStringUTFChars(jFontPath, nullptr) : nullptr;
+    const char* imagePathChars = jImagePath ? env->GetStringUTFChars(jImagePath, nullptr) : nullptr;
+    RawPdfWatermarkSpec spec;
+    spec.text = textChars ? textChars : "";
+    spec.objectId = objectIdChars ? objectIdChars : "";
+    spec.fontName = fontChars ? fontChars : "";
+    spec.fontPath = fontPathChars ? fontPathChars : "";
+    spec.imagePath = imagePathChars ? imagePathChars : "";
+    spec.pageIndex = optIntValue("pdfPageIndex", optIntValue("sourcePageIndex", -1));
+    spec.pageWidth = fmax((float)optDoubleValue("pageWidth", 0.0), 0.0f);
+    spec.pageHeight = fmax((float)optDoubleValue("pageHeight", 0.0), 0.0f);
+    spec.isRepeated = isRepeatedMode;
+    spec.isRasterImage = isRasterImageWatermark;
+    spec.imagePixelWidth = std::max(0, optIntValue("imagePixelWidth", 0));
+    spec.imagePixelHeight = std::max(0, optIntValue("imagePixelHeight", 0));
+
+    const float canvasWidth = fmax((float)optDoubleValue("canvasWidth", spec.pageWidth), 0.0001f);
+    const float canvasHeight = fmax((float)optDoubleValue("canvasHeight", spec.pageHeight), 0.0001f);
+    const float pageScale = fmin(spec.pageWidth / canvasWidth, spec.pageHeight / canvasHeight);
+    const float inverseBgScale = fmax((float)optDoubleValue("inverseBgScale", 1.0), 0.0001f);
+    const float watermarkPdfScale = ((isIconImageWatermark || isRasterImageWatermark) ? 1.0f : inverseBgScale) * fmax(pageScale, 0.0001f);
+    const float modelTextSize = fmax((float)optDoubleValue("fontSize", 12.0), 0.1f);
+    spec.fontSize = fmax(modelTextSize * watermarkPdfScale, 1.0f);
+    spec.rotation = (float)optDoubleValue("rotation", 0.0);
+    spec.textR = std::max(0, std::min(optIntValue("textColorR", 0), 255));
+    spec.textG = std::max(0, std::min(optIntValue("textColorG", 0), 255));
+    spec.textB = std::max(0, std::min(optIntValue("textColorB", 0), 255));
+    const float rawOpacity = fmax(0.0f, fmin((float)optDoubleValue("opacity", 1.0), 1.0f));
+    const float repeatedWatermarkOpacityScale = 0.65f;
+    spec.opacity = (isIconImageWatermark || isRasterImageWatermark)
+                   ? fmax(0.0f, fmin(rawOpacity * repeatedWatermarkOpacityScale, 1.0f))
+                   : (spec.isRepeated ? fmax(0.0f, fmin(rawOpacity * repeatedWatermarkOpacityScale, 1.0f)) : rawOpacity);
+
+    spec.isBold = !isIconImageWatermark && !isRasterImageWatermark && optBoolValue("bold", false);
+    spec.isItalic = !isIconImageWatermark && !isRasterImageWatermark && optBoolValue("italic", false);
+    spec.isUnderline = !isIconImageWatermark && !isRasterImageWatermark && optBoolValue("underline", false);
+    spec.isStrikeout = !isIconImageWatermark && !isRasterImageWatermark && optBoolValue("strikeout", false);
+    spec.isIconImage = isIconImageWatermark;
+    const int textLength = std::max(1, (int)spec.text.size());
+    spec.characterSpacing = fmax((float)optDoubleValue("letterSpacing", 0.0) * spec.fontSize, 0.0f);
+    const float measuredTextWidth = (float)optDoubleValue("measuredTextWidth", 0.0);
+    const float measuredTextHeight = (float)optDoubleValue("measuredTextHeight", 0.0);
+    const float measuredFontAscent = (float)optDoubleValue("measuredFontAscent", -modelTextSize * 0.8f);
+    const float measuredFontDescent = (float)optDoubleValue("measuredFontDescent", modelTextSize * 0.2f);
+    const float measuredSpacingOffset = (float)optDoubleValue("measuredSpacingOffset", 0.0);
+    const float measuredPdfTextWidth = (measuredTextWidth + measuredSpacingOffset) * watermarkPdfScale;
+    const float measuredPdfTextHeight = measuredTextHeight * watermarkPdfScale;
+    const float measuredPdfAscent = measuredFontAscent * watermarkPdfScale;
+    const float measuredPdfDescent = measuredFontDescent * watermarkPdfScale;
+    const float approximateTextWidth = isRasterImageWatermark
+            ? fmax(measuredPdfTextWidth, 1.0f)
+            : fmax(
+                    measuredPdfTextWidth > 0.0f
+                    ? measuredPdfTextWidth
+                    : ((textLength * spec.fontSize * 0.55f) + (std::max(0, textLength - 1) * spec.characterSpacing)),
+                    spec.fontSize
+            );
+    const float textHeight = isRasterImageWatermark
+            ? fmax(measuredPdfTextHeight, 1.0f)
+            : fmax(measuredPdfTextHeight > 0.0f ? measuredPdfTextHeight : spec.fontSize * 1.15f, spec.fontSize);
+    const float glyphPadding = fmax(spec.fontSize * 0.18f, 1.0f);
+    const float repeatSpacing = fmax((float)optDoubleValue("lineSpacing", 1.0) * 20.0f * watermarkPdfScale, 0.0f);
+    const float horizontalSpacing = fmax((float)optDoubleValue("horizontalSpacing", 0.0) * watermarkPdfScale, 0.0f);
+    const float verticalSpacing = fmax((float)optDoubleValue("verticalSpacing", 0.0) * watermarkPdfScale, 0.0f);
+    spec.contentWidth = approximateTextWidth;
+    spec.contentHeight = textHeight;
+    spec.repeatStepWidth = isRasterImageWatermark
+            ? fmax(approximateTextWidth + horizontalSpacing, approximateTextWidth)
+            : fmax(
+                    approximateTextWidth + (isIconImageWatermark ? horizontalSpacing : repeatSpacing),
+                    spec.fontSize
+            );
+    spec.repeatStepHeight = isRasterImageWatermark
+            ? fmax(textHeight + verticalSpacing, textHeight)
+            : fmax(
+                    textHeight + (isIconImageWatermark ? verticalSpacing : repeatSpacing),
+                    spec.fontSize
+            );
+    spec.patternWidth = spec.repeatStepWidth + (glyphPadding * 3.0f);
+    spec.patternHeight = spec.repeatStepHeight + (glyphPadding * 3.0f);
+    spec.baselineX = glyphPadding + (spec.isItalic ? spec.fontSize * 0.25f : 0.0f);
+    spec.baselineY = glyphPadding - measuredPdfAscent;
+    if (spec.baselineY + measuredPdfDescent > spec.patternHeight - glyphPadding) {
+        spec.patternHeight = spec.baselineY + measuredPdfDescent + glyphPadding;
+    }
+
+    if (textChars) env->ReleaseStringUTFChars(jText, textChars);
+    if (objectIdChars) env->ReleaseStringUTFChars(jObjectId, objectIdChars);
+    if (fontChars) env->ReleaseStringUTFChars(jFont, fontChars);
+    if (fontPathChars) env->ReleaseStringUTFChars(jFontPath, fontPathChars);
+    if (imagePathChars) env->ReleaseStringUTFChars(jImagePath, imagePathChars);
+    if (jType) env->DeleteLocalRef(jType);
+    if (jMode) env->DeleteLocalRef(jMode);
+    if (jText) env->DeleteLocalRef(jText);
+    if (jObjectId) env->DeleteLocalRef(jObjectId);
+    if (jFont) env->DeleteLocalRef(jFont);
+    if (jFontPath) env->DeleteLocalRef(jFontPath);
+    if (jImagePath) env->DeleteLocalRef(jImagePath);
+    env->DeleteLocalRef(json);
+    env->DeleteLocalRef(jJsonStr);
+
+    if (spec.pageIndex < 0 || (!spec.isRasterImage && spec.text.empty()) ||
+        (spec.isRasterImage && spec.imagePath.empty()) || spec.pageWidth <= 0.0f || spec.pageHeight <= 0.0f) {
+        WM_LOGE(
+                "Native watermark spec collect failed: page=%d textLen=%zu raster=%d imagePathLen=%zu pageSize=%fx%f",
+                spec.pageIndex,
+                spec.text.size(),
+                spec.isRasterImage ? 1 : 0,
+                spec.imagePath.size(),
+                spec.pageWidth,
+                spec.pageHeight
+        );
+        return false;
+    }
+    WM_LOGE(
+            "Native watermark spec collected: page=%d mode=%s fontName=%s textLen=%zu raster=%d image=%dx%d font=%f pattern=%fx%f step=%fx%f baseline=%f rotation=%f opacity=%f",
+            spec.pageIndex,
+            spec.isRepeated ? "REPEATED" : "SINGLE",
+            spec.fontName.c_str(),
+            spec.text.size(),
+            spec.isRasterImage ? 1 : 0,
+            spec.imagePixelWidth,
+            spec.imagePixelHeight,
+            spec.fontSize,
+            spec.patternWidth,
+            spec.patternHeight,
+            spec.repeatStepWidth,
+            spec.repeatStepHeight,
+            spec.baselineY,
+            spec.rotation,
+            spec.opacity
+    );
+    *outSpec = spec;
+    return true;
+}
+
 static jstring BuildBridgeDataPropertiesJString(
         JNIEnv* env,
         jclass jsonClass,
@@ -4089,6 +6554,253 @@ static void processTextStamp(JNIEnv* env, jobject obj, FPDF_DOCUMENT doc, FPDF_P
     env->DeleteLocalRef(json);
 }
 
+static bool processPageLevelTextWatermark(
+        JNIEnv* env,
+        jobject obj,
+        FPDF_DOCUMENT doc,
+        FPDF_PAGE page,
+        jfieldID dataPropsField,
+        jclass jsonClass,
+        jmethodID jsonInit
+) {
+    jstring jJsonStr = GetBridgeDataPropertyJString(env, obj, dataPropsField, jsonClass, jsonInit, "watermarkProperties");
+    if (!jJsonStr) return false;
+
+    jobject json = env->NewObject(jsonClass, jsonInit, jJsonStr);
+    if (!json || env->ExceptionCheck()) {
+        env->ExceptionClear();
+        env->DeleteLocalRef(jJsonStr);
+        return false;
+    }
+
+    jmethodID optS = env->GetMethodID(jsonClass, "optString", "(Ljava/lang/String;)Ljava/lang/String;");
+    jmethodID optD = env->GetMethodID(jsonClass, "optDouble", "(Ljava/lang/String;D)D");
+    jmethodID optI = env->GetMethodID(jsonClass, "optInt", "(Ljava/lang/String;I)I");
+    jmethodID optB = env->GetMethodID(jsonClass, "optBoolean", "(Ljava/lang/String;Z)Z");
+
+    auto optStringValue = [&](const char* key) -> jstring {
+        jstring jKey = env->NewStringUTF(key);
+        jstring value = (jstring)env->CallObjectMethod(json, optS, jKey);
+        env->DeleteLocalRef(jKey);
+        return value;
+    };
+    auto optDoubleValue = [&](const char* key, double fallback) -> double {
+        jstring jKey = env->NewStringUTF(key);
+        double value = env->CallDoubleMethod(json, optD, jKey, fallback);
+        env->DeleteLocalRef(jKey);
+        return value;
+    };
+    auto optIntValue = [&](const char* key, int fallback) -> int {
+        jstring jKey = env->NewStringUTF(key);
+        int value = env->CallIntMethod(json, optI, jKey, fallback);
+        env->DeleteLocalRef(jKey);
+        return value;
+    };
+    auto optBoolValue = [&](const char* key, bool fallback) -> bool {
+        jstring jKey = env->NewStringUTF(key);
+        bool value = env->CallBooleanMethod(json, optB, jKey, fallback ? JNI_TRUE : JNI_FALSE) == JNI_TRUE;
+        env->DeleteLocalRef(jKey);
+        return value;
+    };
+
+    jstring jType = optStringValue("watermarkType");
+    jstring jMode = optStringValue("watermarkMode");
+    jstring jText = optStringValue("text");
+    jstring jFont = optStringValue("font");
+    jstring jFontPath = optStringValue("fontPath");
+
+    const char* typeStr = jType ? env->GetStringUTFChars(jType, nullptr) : nullptr;
+    const char* modeStr = jMode ? env->GetStringUTFChars(jMode, nullptr) : nullptr;
+    const bool isTextWatermark = !typeStr || strlen(typeStr) == 0 || strcmp(typeStr, "TEXT") == 0;
+    const bool isRepeatedMode = !modeStr || strlen(modeStr) == 0 || strcmp(modeStr, "REPEATED") == 0;
+    if (!isTextWatermark || !isRepeatedMode || !jText || env->GetStringLength(jText) == 0) {
+        if (typeStr) env->ReleaseStringUTFChars(jType, typeStr);
+        if (modeStr) env->ReleaseStringUTFChars(jMode, modeStr);
+        if (jType) env->DeleteLocalRef(jType);
+        if (jMode) env->DeleteLocalRef(jMode);
+        if (jText) env->DeleteLocalRef(jText);
+        if (jFont) env->DeleteLocalRef(jFont);
+        if (jFontPath) env->DeleteLocalRef(jFontPath);
+        env->DeleteLocalRef(json);
+        env->DeleteLocalRef(jJsonStr);
+        return false;
+    }
+    if (typeStr) env->ReleaseStringUTFChars(jType, typeStr);
+    if (modeStr) env->ReleaseStringUTFChars(jMode, modeStr);
+
+    const jchar* textContent = env->GetStringChars(jText, nullptr);
+    const char* fontName = jFont ? env->GetStringUTFChars(jFont, nullptr) : nullptr;
+    const char* fontPath = jFontPath ? env->GetStringUTFChars(jFontPath, nullptr) : nullptr;
+    const bool isBold = optBoolValue("bold", false);
+    const bool isItalic = optBoolValue("italic", false);
+    const std::string resolvedFontPath = ResolvePageLevelWatermarkFontPath(fontPath, isBold, isItalic);
+    const char* outlineFontPath = resolvedFontPath.empty() ? nullptr : resolvedFontPath.c_str();
+
+    FPDF_FONT loadedFont = nullptr;
+    if (outlineFontPath && strlen(outlineFontPath) > 0) {
+        FILE* f = fopen(outlineFontPath, "rb");
+        if (f) {
+            fseek(f, 0, SEEK_END);
+            long fSize = ftell(f);
+            rewind(f);
+            if (fSize > 0) {
+                std::vector<uint8_t> buffer(fSize);
+                fread(buffer.data(), 1, fSize, f);
+                loadedFont = FPDFText_LoadFont(doc, buffer.data(), fSize, FPDF_FONT_TRUETYPE, true);
+            }
+            fclose(f);
+        }
+    }
+
+    const float pageWidth = FPDF_GetPageWidth(page);
+    const float pageHeight = FPDF_GetPageHeight(page);
+    const float canvasWidth = fmax((float)optDoubleValue("canvasWidth", pageWidth), 0.0001f);
+    const float canvasHeight = fmax((float)optDoubleValue("canvasHeight", pageHeight), 0.0001f);
+    const float pageScale = fmin(pageWidth / canvasWidth, pageHeight / canvasHeight);
+    const float inverseBgScale = fmax((float)optDoubleValue("inverseBgScale", 1.0), 0.0001f);
+    const float textSize = fmax((float)optDoubleValue("fontSize", 12.0), 0.1f);
+    const float scale = fmax(0.1f, textSize * inverseBgScale * fmax(pageScale, 0.0001f));
+    const double rotation = optDoubleValue("rotation", 0.0);
+    const double angleRad = rotation * M_PI / 180.0;
+    const double cosA = cos(angleRad);
+    const double sinA = sin(angleRad);
+    const int textR = optIntValue("textColorR", 0);
+    const int textG = optIntValue("textColorG", 0);
+    const int textB = optIntValue("textColorB", 0);
+    const int textA = optIntValue("textColorA", 255);
+    const float letterSpacing = (float)optDoubleValue("letterSpacing", 0.0);
+    const jsize textLength = env->GetStringLength(jText);
+
+    if (!outlineFontPath || strlen(outlineFontPath) == 0) {
+        env->ReleaseStringChars(jText, textContent);
+        if (fontName) env->ReleaseStringUTFChars(jFont, fontName);
+        if (fontPath) env->ReleaseStringUTFChars(jFontPath, fontPath);
+        if (jType) env->DeleteLocalRef(jType);
+        if (jMode) env->DeleteLocalRef(jMode);
+        if (jText) env->DeleteLocalRef(jText);
+        if (jFont) env->DeleteLocalRef(jFont);
+        if (jFontPath) env->DeleteLocalRef(jFontPath);
+        env->DeleteLocalRef(json);
+        env->DeleteLocalRef(jJsonStr);
+        return false;
+    }
+
+    float tL = 0.0f;
+    float tB = 0.0f;
+    float tR = fmax((float)textLength * 0.6f, 1.0f);
+    float tT = 1.0f;
+    FPDF_PAGEOBJECT probeObj = loadedFont ? FPDFPageObj_CreateTextObj(doc, loadedFont, 1.0f) : nullptr;
+    if (probeObj) {
+        FPDFText_SetText(probeObj, (FPDF_WIDESTRING)textContent);
+        FPDFPageObj_GetBounds(probeObj, &tL, &tB, &tR, &tT);
+        FPDFPageObj_Destroy(probeObj);
+    }
+
+    float textWidth = fmax((tR - tL) * scale, scale);
+    const float textHeight = fmax((tT - tB) * scale, scale);
+    std::vector<float> charUnitWidths;
+    if (loadedFont && fabs(letterSpacing) > 0.0001f && textLength > 1) {
+        charUnitWidths.reserve(textLength);
+        float measuredWidth = 0.0f;
+        for (jsize charIndex = 0; charIndex < textLength; charIndex++) {
+            FPDF_PAGEOBJECT charProbeObj = FPDFPageObj_CreateTextObj(doc, loadedFont, 1.0f);
+            if (!charProbeObj) continue;
+            jchar singleChar[2] = {textContent[charIndex], 0};
+            FPDFText_SetText(charProbeObj, (FPDF_WIDESTRING)singleChar);
+            float cL = 0.0f, cB = 0.0f, cR = 0.0f, cT = 0.0f;
+            FPDFPageObj_GetBounds(charProbeObj, &cL, &cB, &cR, &cT);
+            FPDFPageObj_Destroy(charProbeObj);
+            const float charWidth = fmax(cR - cL, 0.0f);
+            charUnitWidths.push_back(charWidth);
+            measuredWidth += charWidth * scale;
+        }
+        const int letterGapCount = std::max(0, (int)textLength - 1);
+        measuredWidth += letterGapCount * letterSpacing * scale;
+        if (measuredWidth > 0.0f) {
+            textWidth = measuredWidth;
+        }
+    }
+    const float measuredTextWidth = (float)optDoubleValue("measuredTextWidth", 0.0);
+    const float measuredTextHeight = (float)optDoubleValue("measuredTextHeight", 0.0);
+    const float measuredSpacingOffset = (float)optDoubleValue("measuredSpacingOffset", 0.0);
+    if (measuredTextWidth > 0.0f) {
+        textWidth = fmax((measuredTextWidth + measuredSpacingOffset) * inverseBgScale * fmax(pageScale, 0.0001f), scale);
+    }
+    const float tileWidth = fmax(textWidth, scale);
+    const float tileHeight = fmax(
+            measuredTextHeight > 0.0f
+            ? measuredTextHeight * inverseBgScale * fmax(pageScale, 0.0001f)
+            : textHeight,
+            scale
+    );
+    const float centerX = pageWidth * 0.5f;
+    const float centerY = pageHeight * 0.5f;
+    const float diagonal = (float)hypot(pageWidth, pageHeight);
+    const float minX = centerX - diagonal;
+    const float maxX = centerX + diagonal;
+    const float minY = centerY - diagonal;
+    const float maxY = centerY + diagonal;
+    const float skewX = isItalic ? 0.25f : 0.0f;
+    const int maxStampTextObjects = 1200;
+    const int estimatedColumns = std::max(1, (int)ceil((maxX - minX) / fmax(tileWidth, 0.0001f)) + 1);
+    const int estimatedRows = std::max(1, (int)ceil((maxY - minY) / fmax(tileHeight, 0.0001f)) + 1);
+    const int estimatedTiles = estimatedColumns * estimatedRows;
+    if (estimatedTiles * std::max(1, (int)textLength) > maxStampTextObjects) {
+        charUnitWidths.clear();
+    }
+    if (AppendPageLevelTextWatermarkGlyphPaths(
+            page,
+            outlineFontPath,
+            textContent,
+            textLength,
+            textR,
+            textG,
+            textB,
+            textA,
+            isBold,
+            scale,
+            letterSpacing,
+            textHeight,
+            cosA,
+            sinA,
+            skewX,
+            minX,
+            maxX,
+            minY,
+            maxY,
+            centerX,
+            centerY,
+            tileWidth,
+            tileHeight,
+            maxStampTextObjects
+    )) {
+        WM_LOGE("Native edit watermark saved with font glyph paths font=%s path=%s", fontName ? fontName : "", outlineFontPath);
+        env->ReleaseStringChars(jText, textContent);
+        if (fontName) env->ReleaseStringUTFChars(jFont, fontName);
+        if (fontPath) env->ReleaseStringUTFChars(jFontPath, fontPath);
+        if (jType) env->DeleteLocalRef(jType);
+        if (jMode) env->DeleteLocalRef(jMode);
+        if (jText) env->DeleteLocalRef(jText);
+        if (jFont) env->DeleteLocalRef(jFont);
+        if (jFontPath) env->DeleteLocalRef(jFontPath);
+        env->DeleteLocalRef(json);
+        env->DeleteLocalRef(jJsonStr);
+        return true;
+    }
+
+    env->ReleaseStringChars(jText, textContent);
+    if (fontName) env->ReleaseStringUTFChars(jFont, fontName);
+    if (fontPath) env->ReleaseStringUTFChars(jFontPath, fontPath);
+    if (jType) env->DeleteLocalRef(jType);
+    if (jMode) env->DeleteLocalRef(jMode);
+    if (jText) env->DeleteLocalRef(jText);
+    if (jFont) env->DeleteLocalRef(jFont);
+    if (jFontPath) env->DeleteLocalRef(jFontPath);
+    env->DeleteLocalRef(json);
+    env->DeleteLocalRef(jJsonStr);
+    return false;
+}
+
 // --- HELPER 2B: REAL FREE TEXT ANNOTATION LOGIC ---
 static void processFreeText(JNIEnv* env, jobject obj, FPDF_DOCUMENT doc, FPDF_ANNOTATION annot, FS_RECTF rect, jfieldID textPropsField, int r, int g, int b, int alpha, jclass jsonClass, jmethodID jsonInit) {
     (void)doc;
@@ -4328,6 +7040,10 @@ public:
             return false;
         }
         return outline->hasBounds && !outline->contours.empty();
+    }
+
+    uint16_t getUnitsPerEm() const {
+        return unitsPerEm > 0 ? unitsPerEm : 1000;
     }
 
 private:
@@ -4892,6 +7608,606 @@ static FPDF_PAGEOBJECT CreateGlyphPathObject(const GlyphOutline& outline) {
     }
 
     return path;
+}
+
+static GlyphOutlineContour TranslateGlyphContour(
+        const GlyphOutlineContour& contour,
+        double offsetX,
+        double offsetY
+) {
+    GlyphOutlineContour translated;
+    translated.points.reserve(contour.points.size());
+    for (const auto& point : contour.points) {
+        translated.points.push_back({
+                point.x + offsetX,
+                point.y + offsetY,
+                point.onCurve
+        });
+    }
+    return translated;
+}
+
+static FPDF_PAGEOBJECT CreateWatermarkTextPathObject(
+        const std::vector<GlyphOutline>& glyphs,
+        const std::vector<bool>& spaces,
+        double unitsPerEm,
+        double letterSpacing
+) {
+    if (glyphs.empty() || glyphs.size() != spaces.size()) return nullptr;
+
+    FPDF_PAGEOBJECT path = nullptr;
+    double cursorX = 0.0;
+    const double letterSpacingUnits = letterSpacing * unitsPerEm;
+    for (size_t i = 0; i < glyphs.size(); i++) {
+        if (spaces[i]) {
+            cursorX += unitsPerEm * 0.35 + letterSpacingUnits;
+            continue;
+        }
+
+        const GlyphOutline& glyph = glyphs[i];
+        if (!glyph.hasBounds || glyph.contours.empty()) continue;
+
+        const double offsetX = cursorX - glyph.minX;
+        const double offsetY = -glyph.minY;
+        for (const auto& contour : glyph.contours) {
+            if (contour.points.empty()) continue;
+            GlyphOutlineContour translated = TranslateGlyphContour(contour, offsetX, offsetY);
+            if (!path) {
+                GlyphOutlinePoint start = translated.points.front();
+                if (!start.onCurve) {
+                    const GlyphOutlinePoint& last = translated.points.back();
+                    start = last.onCurve ? last : MidPoint(last, start);
+                }
+                path = FPDFPageObj_CreateNewPath(static_cast<float>(start.x), static_cast<float>(start.y));
+                if (!path) return nullptr;
+            }
+            AppendGlyphContourToPdfPath(path, translated);
+        }
+        cursorX += (glyph.maxX - glyph.minX) + letterSpacingUnits;
+    }
+
+    return path;
+}
+
+static std::vector<uint32_t> DecodeUtf8Codepoints(const std::string& text) {
+    std::vector<uint32_t> codepoints;
+    for (size_t i = 0; i < text.size();) {
+        const unsigned char ch = static_cast<unsigned char>(text[i]);
+        if (ch < 0x80) {
+            codepoints.push_back(ch);
+            i++;
+        } else if ((ch & 0xE0) == 0xC0 && i + 1 < text.size()) {
+            codepoints.push_back(((ch & 0x1F) << 6) | (static_cast<unsigned char>(text[i + 1]) & 0x3F));
+            i += 2;
+        } else if ((ch & 0xF0) == 0xE0 && i + 2 < text.size()) {
+            codepoints.push_back(
+                    ((ch & 0x0F) << 12) |
+                    ((static_cast<unsigned char>(text[i + 1]) & 0x3F) << 6) |
+                    (static_cast<unsigned char>(text[i + 2]) & 0x3F)
+            );
+            i += 3;
+        } else if ((ch & 0xF8) == 0xF0 && i + 3 < text.size()) {
+            codepoints.push_back(
+                    ((ch & 0x07) << 18) |
+                    ((static_cast<unsigned char>(text[i + 1]) & 0x3F) << 12) |
+                    ((static_cast<unsigned char>(text[i + 2]) & 0x3F) << 6) |
+                    (static_cast<unsigned char>(text[i + 3]) & 0x3F)
+            );
+            i += 4;
+        } else {
+            i++;
+        }
+    }
+    return codepoints;
+}
+
+static void AppendPdfPathQuadraticAsCubic(
+        std::ostringstream* stream,
+        double scaleX,
+        double scaleY,
+        double offsetX,
+        double offsetY,
+        const GlyphOutlinePoint& start,
+        const GlyphOutlinePoint& control,
+        const GlyphOutlinePoint& end
+) {
+    const double cp1X = start.x + ((control.x - start.x) * (2.0 / 3.0));
+    const double cp1Y = start.y + ((control.y - start.y) * (2.0 / 3.0));
+    const double cp2X = end.x + ((control.x - end.x) * (2.0 / 3.0));
+    const double cp2Y = end.y + ((control.y - end.y) * (2.0 / 3.0));
+    *stream << FormatPdfFloat(static_cast<float>(offsetX + cp1X * scaleX)) << ' '
+            << FormatPdfFloat(static_cast<float>(offsetY + cp1Y * scaleY)) << ' '
+            << FormatPdfFloat(static_cast<float>(offsetX + cp2X * scaleX)) << ' '
+            << FormatPdfFloat(static_cast<float>(offsetY + cp2Y * scaleY)) << ' '
+            << FormatPdfFloat(static_cast<float>(offsetX + end.x * scaleX)) << ' '
+            << FormatPdfFloat(static_cast<float>(offsetY + end.y * scaleY)) << " c\n";
+}
+
+static bool AppendGlyphContourToPdfStream(
+        std::ostringstream* stream,
+        const GlyphOutlineContour& contour,
+        double scaleX,
+        double scaleY,
+        double offsetX,
+        double offsetY
+) {
+    if (!stream || contour.points.empty()) return false;
+
+    const int pointCount = static_cast<int>(contour.points.size());
+    const GlyphOutlinePoint& first = contour.points.front();
+    const GlyphOutlinePoint& last = contour.points.back();
+    GlyphOutlinePoint start = first;
+    int index = 1;
+    int consumed = 1;
+    if (!first.onCurve) {
+        if (last.onCurve) {
+            start = last;
+            index = 0;
+        } else {
+            start = MidPoint(last, first);
+            index = 0;
+            consumed = 0;
+        }
+    }
+
+    *stream << FormatPdfFloat(static_cast<float>(offsetX + start.x * scaleX)) << ' '
+            << FormatPdfFloat(static_cast<float>(offsetY + start.y * scaleY)) << " m\n";
+    GlyphOutlinePoint current = start;
+    while (consumed < pointCount) {
+        const GlyphOutlinePoint& point = contour.points[index % pointCount];
+        if (point.onCurve) {
+            *stream << FormatPdfFloat(static_cast<float>(offsetX + point.x * scaleX)) << ' '
+                    << FormatPdfFloat(static_cast<float>(offsetY + point.y * scaleY)) << " l\n";
+            current = point;
+            index++;
+            consumed++;
+        } else {
+            const GlyphOutlinePoint& next = contour.points[(index + 1) % pointCount];
+            if (next.onCurve) {
+                AppendPdfPathQuadraticAsCubic(stream, scaleX, scaleY, offsetX, offsetY, current, point, next);
+                current = next;
+                index += 2;
+                consumed += 2;
+            } else {
+                const GlyphOutlinePoint midpoint = MidPoint(point, next);
+                AppendPdfPathQuadraticAsCubic(stream, scaleX, scaleY, offsetX, offsetY, current, point, midpoint);
+                current = midpoint;
+                index++;
+                consumed++;
+            }
+        }
+    }
+    *stream << "h\n";
+    return true;
+}
+
+static std::string BuildPdfWatermarkFontOutlinePatternStream(
+        const RawPdfWatermarkSpec& spec,
+        const std::string& graphicsStateName
+) {
+    if (spec.fontPath.empty() || spec.text.empty() || spec.fontSize <= 0.0f) return std::string();
+    std::vector<uint8_t> fontBytes;
+    if (!ReadFileBytes(spec.fontPath.c_str(), &fontBytes)) return std::string();
+    TrueTypeGlyphReader glyphReader(fontBytes);
+    if (!glyphReader.load()) return std::string();
+
+    const std::vector<uint32_t> codepoints = DecodeUtf8Codepoints(spec.text);
+    if (codepoints.empty()) return std::string();
+
+    const double unitsPerEm = std::max(1, static_cast<int>(glyphReader.getUnitsPerEm()));
+    const double glyphScale = spec.fontSize / unitsPerEm;
+    const double letterSpacingUnits = spec.characterSpacing > 0.0f ? spec.characterSpacing / glyphScale : 0.0;
+    std::vector<GlyphOutline> glyphs;
+    std::vector<bool> spaces;
+    glyphs.reserve(codepoints.size());
+    spaces.reserve(codepoints.size());
+    bool hasDrawableGlyph = false;
+    for (uint32_t codepoint : codepoints) {
+        if (codepoint == 0x20) {
+            glyphs.push_back(GlyphOutline());
+            spaces.push_back(true);
+            continue;
+        }
+        GlyphOutline outline;
+        if (!glyphReader.loadGlyphForCodepoint(codepoint, &outline) || !outline.hasBounds || outline.contours.empty()) {
+            glyphs.push_back(GlyphOutline());
+            spaces.push_back(true);
+            continue;
+        }
+        glyphs.push_back(outline);
+        spaces.push_back(false);
+        hasDrawableGlyph = true;
+    }
+    if (!hasDrawableGlyph) return std::string();
+
+    double runMinY = 0.0;
+    double runMaxY = 0.0;
+    bool hasRunBounds = false;
+    for (const GlyphOutline& glyph : glyphs) {
+        if (!glyph.hasBounds) continue;
+        runMinY = hasRunBounds ? std::min(runMinY, glyph.minY) : glyph.minY;
+        runMaxY = hasRunBounds ? std::max(runMaxY, glyph.maxY) : glyph.maxY;
+        hasRunBounds = true;
+    }
+    if (!hasRunBounds) return std::string();
+
+    double naturalRunWidth = 0.0;
+    for (size_t i = 0; i < glyphs.size(); i++) {
+        if (spaces[i]) {
+            naturalRunWidth += unitsPerEm * 0.35 + letterSpacingUnits;
+            continue;
+        }
+        const GlyphOutline& glyph = glyphs[i];
+        if (!glyph.hasBounds) continue;
+        naturalRunWidth += (glyph.maxX - glyph.minX) + letterSpacingUnits;
+    }
+    const double naturalRunWidthPdf = naturalRunWidth * glyphScale;
+    double glyphScaleX = glyphScale;
+    if (naturalRunWidthPdf > 0.0001 && spec.repeatStepWidth > 0.0f) {
+        const double targetContentWidth = std::max(
+                static_cast<double>(spec.fontSize),
+                spec.contentWidth > 0.0f
+                ? static_cast<double>(spec.contentWidth)
+                : static_cast<double>(spec.repeatStepWidth) - (static_cast<double>(spec.fontSize) * 0.08)
+        );
+        const double rawXScaleMultiplier = targetContentWidth / naturalRunWidthPdf;
+        const double xScaleMultiplier = spec.isIconImage
+                                        ? 1.14
+                                        : std::max(0.65, std::min(rawXScaleMultiplier, 1.55));
+        glyphScaleX = glyphScale * xScaleMultiplier;
+    }
+    double glyphScaleY = glyphScale;
+    const double naturalRunHeightPdf = (runMaxY - runMinY) * glyphScale;
+    if (spec.isIconImage && naturalRunHeightPdf > 0.0001) {
+//        const double iconHeightScale = 0.78;
+        const double targetContentHeight = std::max(
+                static_cast<double>(spec.fontSize),
+                spec.contentHeight > 0.0f ? static_cast<double>(spec.contentHeight) : static_cast<double>(spec.fontSize)
+        );
+        const double yScaleMultiplier = targetContentHeight / naturalRunHeightPdf;
+        glyphScaleY = glyphScale * yScaleMultiplier;
+    }
+
+    std::ostringstream stream;
+    stream << "q\n"
+           << "/" << graphicsStateName << " gs\n"
+           << FormatPdfFloat(spec.textR / 255.0f) << ' '
+           << FormatPdfFloat(spec.textG / 255.0f) << ' '
+           << FormatPdfFloat(spec.textB / 255.0f) << " rg\n";
+    double cursorX = 0.0;
+    const double verticalPadding = std::max(1.0, static_cast<double>(spec.fontSize) * 0.08);
+    const double preferredOffsetY = spec.isIconImage
+                                    ? (static_cast<double>(spec.patternHeight) - ((runMinY + runMaxY) * glyphScaleY)) * 0.5
+                                    : spec.baselineY - (runMinY * glyphScaleY);
+    const double minOffsetY = verticalPadding - (runMinY * glyphScaleY);
+    const double maxOffsetY = static_cast<double>(spec.patternHeight) - verticalPadding - (runMaxY * glyphScaleY);
+    double baselineOffsetY = preferredOffsetY;
+    if (maxOffsetY >= minOffsetY) {
+        baselineOffsetY = std::max(minOffsetY, std::min(preferredOffsetY, maxOffsetY));
+    } else {
+        baselineOffsetY = (static_cast<double>(spec.patternHeight) - ((runMinY + runMaxY) * glyphScaleY)) * 0.5;
+    }
+    for (size_t i = 0; i < glyphs.size(); i++) {
+        if (spaces[i]) {
+            cursorX += (unitsPerEm * 0.35 + letterSpacingUnits) * glyphScaleX;
+            continue;
+        }
+        const GlyphOutline& glyph = glyphs[i];
+        const double offsetX = spec.baselineX + cursorX - (glyph.minX * glyphScaleX);
+        for (const GlyphOutlineContour& contour : glyph.contours) {
+            AppendGlyphContourToPdfStream(&stream, contour, glyphScaleX, glyphScaleY, offsetX, baselineOffsetY);
+        }
+        cursorX += ((glyph.maxX - glyph.minX) + letterSpacingUnits) * glyphScaleX;
+    }
+    if (spec.isUnderline || spec.isStrikeout) {
+        const double decorationWidth = std::max(
+                cursorX,
+                static_cast<double>(spec.contentWidth > 0.0f ? spec.contentWidth : spec.fontSize)
+        );
+        const double decorationThickness = std::max(0.5, static_cast<double>(spec.fontSize) * 0.06);
+        const double maxDecorationY = std::max(0.0, static_cast<double>(spec.patternHeight) - decorationThickness);
+        auto appendDecorationRect = [&](double y) {
+            const double clampedY = std::max(0.0, std::min(y, maxDecorationY));
+            stream << FormatPdfFloat(spec.baselineX) << ' '
+                   << FormatPdfFloat(static_cast<float>(clampedY)) << ' '
+                   << FormatPdfFloat(static_cast<float>(decorationWidth)) << ' '
+                   << FormatPdfFloat(static_cast<float>(decorationThickness)) << " re\n";
+        };
+        if (spec.isUnderline) {
+            appendDecorationRect(baselineOffsetY - (static_cast<double>(spec.fontSize) * 0.12));
+        }
+        if (spec.isStrikeout) {
+            appendDecorationRect(baselineOffsetY + (static_cast<double>(spec.fontSize) * 0.32));
+        }
+    }
+    stream << "f\nQ";
+    WM_LOGE(
+            "Native compact watermark pattern uses font outlines font=%s path=%s xScale=%f naturalW=%f targetStep=%f yBounds=%f..%f offsetY=%f patternH=%f",
+            spec.fontName.c_str(),
+            spec.fontPath.c_str(),
+            glyphScaleX / glyphScale,
+            naturalRunWidthPdf,
+            spec.repeatStepWidth,
+            runMinY * glyphScaleY,
+            runMaxY * glyphScaleY,
+            baselineOffsetY,
+            spec.patternHeight
+    );
+    return stream.str();
+}
+
+static std::string BuildPdfSingleWatermarkFontOutlineContentStream(
+        const RawPdfWatermarkSpec& spec,
+        const std::string& graphicsStateName
+) {
+    if (spec.fontPath.empty() || spec.text.empty() || spec.fontSize <= 0.0f) return std::string();
+    std::vector<uint8_t> fontBytes;
+    if (!ReadFileBytes(spec.fontPath.c_str(), &fontBytes)) return std::string();
+    TrueTypeGlyphReader glyphReader(fontBytes);
+    if (!glyphReader.load()) return std::string();
+
+    const std::vector<uint32_t> codepoints = DecodeUtf8Codepoints(spec.text);
+    if (codepoints.empty()) return std::string();
+
+    const double unitsPerEm = std::max(1, static_cast<int>(glyphReader.getUnitsPerEm()));
+    const double glyphScale = spec.fontSize / unitsPerEm;
+    const double letterSpacingUnits = spec.characterSpacing > 0.0f ? spec.characterSpacing / glyphScale : 0.0;
+    std::vector<GlyphOutline> glyphs;
+    std::vector<bool> spaces;
+    glyphs.reserve(codepoints.size());
+    spaces.reserve(codepoints.size());
+    bool hasDrawableGlyph = false;
+    for (uint32_t codepoint : codepoints) {
+        if (codepoint == 0x20) {
+            glyphs.push_back(GlyphOutline());
+            spaces.push_back(true);
+            continue;
+        }
+        GlyphOutline outline;
+        if (!glyphReader.loadGlyphForCodepoint(codepoint, &outline) || !outline.hasBounds || outline.contours.empty()) {
+            glyphs.push_back(GlyphOutline());
+            spaces.push_back(true);
+            continue;
+        }
+        glyphs.push_back(outline);
+        spaces.push_back(false);
+        hasDrawableGlyph = true;
+    }
+    if (!hasDrawableGlyph) return std::string();
+
+    double runMinY = 0.0;
+    double runMaxY = 0.0;
+    bool hasRunBounds = false;
+    for (const GlyphOutline& glyph : glyphs) {
+        if (!glyph.hasBounds) continue;
+        runMinY = hasRunBounds ? std::min(runMinY, glyph.minY) : glyph.minY;
+        runMaxY = hasRunBounds ? std::max(runMaxY, glyph.maxY) : glyph.maxY;
+        hasRunBounds = true;
+    }
+    if (!hasRunBounds) return std::string();
+
+    double naturalRunWidth = 0.0;
+    for (size_t i = 0; i < glyphs.size(); i++) {
+        if (spaces[i]) {
+            naturalRunWidth += unitsPerEm * 0.35 + letterSpacingUnits;
+            continue;
+        }
+        const GlyphOutline& glyph = glyphs[i];
+        if (!glyph.hasBounds) continue;
+        naturalRunWidth += (glyph.maxX - glyph.minX) + letterSpacingUnits;
+    }
+    const double naturalRunWidthPdf = naturalRunWidth * glyphScale;
+    double glyphScaleX = glyphScale;
+    if (naturalRunWidthPdf > 0.0001 && spec.contentWidth > 0.0f) {
+        const double targetContentWidth = std::max(static_cast<double>(spec.fontSize), static_cast<double>(spec.contentWidth));
+        const double rawXScaleMultiplier = targetContentWidth / naturalRunWidthPdf;
+        const double xScaleMultiplier = spec.isIconImage
+                                        ? 1.15
+                                        : std::max(0.65, std::min(rawXScaleMultiplier, 1.55));
+        glyphScaleX = glyphScale * xScaleMultiplier;
+    }
+    double glyphScaleY = glyphScale;
+    const double naturalRunHeightPdf = (runMaxY - runMinY) * glyphScale;
+    if (spec.isIconImage && naturalRunHeightPdf > 0.0001) {
+        const double iconHeightScale = 1.0;
+        const double targetContentHeight = std::max(
+                static_cast<double>(spec.fontSize),
+                spec.contentHeight > 0.0f ? static_cast<double>(spec.contentHeight) : static_cast<double>(spec.fontSize)
+        ) * iconHeightScale;
+        const double yScaleMultiplier = targetContentHeight / naturalRunHeightPdf;
+        glyphScaleY = glyphScale * yScaleMultiplier;
+    }
+    const double visualRunWidth = naturalRunWidth * glyphScaleX;
+    const double drawX = -visualRunWidth * 0.5;
+    const double drawY = spec.isIconImage ? -((runMinY + runMaxY) * glyphScaleY) * 0.5 : 0.0;
+    const double angleRad = spec.rotation * M_PI / 180.0;
+    const float cosA = static_cast<float>(cos(angleRad));
+    const float sinA = static_cast<float>(sin(angleRad));
+    const float centerX = spec.pageWidth * 0.5f;
+    const float centerY = spec.pageHeight * 0.5f;
+
+    std::ostringstream stream;
+    stream << "q\n"
+           << "/" << graphicsStateName << " gs\n"
+           << FormatPdfFloat(spec.textR / 255.0f) << ' '
+           << FormatPdfFloat(spec.textG / 255.0f) << ' '
+           << FormatPdfFloat(spec.textB / 255.0f) << " rg\n"
+           << FormatPdfFloat(cosA) << ' ' << FormatPdfFloat(sinA) << ' '
+           << FormatPdfFloat(-sinA) << ' ' << FormatPdfFloat(cosA) << ' '
+           << FormatPdfFloat(centerX) << ' ' << FormatPdfFloat(centerY) << " cm\n";
+
+    double cursorX = 0.0;
+    for (size_t i = 0; i < glyphs.size(); i++) {
+        if (spaces[i]) {
+            cursorX += (unitsPerEm * 0.35 + letterSpacingUnits) * glyphScaleX;
+            continue;
+        }
+        const GlyphOutline& glyph = glyphs[i];
+        const double offsetX = drawX + cursorX - (glyph.minX * glyphScaleX);
+        for (const GlyphOutlineContour& contour : glyph.contours) {
+            AppendGlyphContourToPdfStream(&stream, contour, glyphScaleX, glyphScaleY, offsetX, drawY);
+        }
+        cursorX += ((glyph.maxX - glyph.minX) + letterSpacingUnits) * glyphScaleX;
+    }
+    if (spec.isUnderline || spec.isStrikeout) {
+        const double decorationWidth = std::max(cursorX, static_cast<double>(spec.fontSize));
+        const double decorationThickness = std::max(0.5, static_cast<double>(spec.fontSize) * 0.06);
+        auto appendDecorationRect = [&](double y) {
+            stream << FormatPdfFloat(static_cast<float>(drawX)) << ' '
+                   << FormatPdfFloat(static_cast<float>(y)) << ' '
+                   << FormatPdfFloat(static_cast<float>(decorationWidth)) << ' '
+                   << FormatPdfFloat(static_cast<float>(decorationThickness)) << " re\n";
+        };
+        if (spec.isUnderline) {
+            appendDecorationRect(-(static_cast<double>(spec.fontSize) * 0.12));
+        }
+        if (spec.isStrikeout) {
+            appendDecorationRect(static_cast<double>(spec.fontSize) * 0.32);
+        }
+    }
+    stream << "f\nQ";
+    WM_LOGE(
+            "Native single watermark uses font outlines font=%s path=%s xScale=%f yScale=%f naturalW=%f visualW=%f rotation=%f underline=%d strikeout=%d",
+            spec.fontName.c_str(),
+            spec.fontPath.c_str(),
+            glyphScaleX / glyphScale,
+            glyphScaleY / glyphScale,
+            naturalRunWidthPdf,
+            visualRunWidth,
+            spec.rotation,
+            spec.isUnderline ? 1 : 0,
+            spec.isStrikeout ? 1 : 0
+    );
+    return stream.str();
+}
+
+static bool AppendPageLevelTextWatermarkGlyphPaths(
+        FPDF_PAGE page,
+        const char* fontPath,
+        const jchar* textContent,
+        jsize textLength,
+        int textR,
+        int textG,
+        int textB,
+        int textA,
+        bool isBold,
+        double scale,
+        double letterSpacing,
+        double textHeight,
+        double cosA,
+        double sinA,
+        double skewX,
+        float minX,
+        float maxX,
+        float minY,
+        float maxY,
+        float centerX,
+        float centerY,
+        float tileWidth,
+        float tileHeight,
+        int maxStampObjects
+) {
+    if (!page || !fontPath || strlen(fontPath) == 0 || !textContent || textLength <= 0) {
+        return false;
+    }
+
+    std::vector<uint8_t> fontBytes;
+    if (!ReadFileBytes(fontPath, &fontBytes)) {
+        return false;
+    }
+
+    TrueTypeGlyphReader glyphReader(fontBytes);
+    if (!glyphReader.load()) {
+        return false;
+    }
+
+    std::vector<uint32_t> codepoints;
+    codepoints.reserve(textLength);
+    for (jsize charIndex = 0; charIndex < textLength; charIndex++) {
+        const uint16_t first = static_cast<uint16_t>(textContent[charIndex]);
+        if (first >= 0xD800 && first <= 0xDBFF && charIndex + 1 < textLength) {
+            const uint16_t second = static_cast<uint16_t>(textContent[charIndex + 1]);
+            if (second >= 0xDC00 && second <= 0xDFFF) {
+                codepoints.push_back(
+                        0x10000 +
+                        (((static_cast<uint32_t>(first) - 0xD800) << 10) |
+                         (static_cast<uint32_t>(second) - 0xDC00))
+                );
+                charIndex++;
+                continue;
+            }
+        }
+        codepoints.push_back(first);
+    }
+    if (codepoints.empty()) return false;
+
+    const double unitsPerEm = std::max(1, (int)glyphReader.getUnitsPerEm());
+    const double glyphScale = scale / unitsPerEm;
+    std::vector<GlyphOutline> glyphRun;
+    std::vector<bool> spaceRun;
+    glyphRun.reserve(codepoints.size());
+    spaceRun.reserve(codepoints.size());
+    bool hasDrawableGlyph = false;
+    for (uint32_t codepoint : codepoints) {
+        if (codepoint == 0x20) {
+            glyphRun.push_back(GlyphOutline());
+            spaceRun.push_back(true);
+            continue;
+        }
+
+        GlyphOutline loadedOutline;
+        if (!glyphReader.loadGlyphForCodepoint(codepoint, &loadedOutline)) {
+            glyphRun.push_back(GlyphOutline());
+            spaceRun.push_back(true);
+            continue;
+        }
+        glyphRun.push_back(loadedOutline);
+        spaceRun.push_back(false);
+        hasDrawableGlyph = true;
+    }
+    if (!hasDrawableGlyph) return false;
+
+    int objectCount = 0;
+    bool appendedAny = false;
+
+    for (float gridY = minY; gridY <= maxY && objectCount < maxStampObjects; gridY += tileHeight) {
+        for (float gridX = minX; gridX <= maxX && objectCount < maxStampObjects; gridX += tileWidth) {
+            const float dx = gridX - centerX;
+            const float dy = gridY - centerY;
+            const float finalX = centerX + (float)(dx * cosA - dy * sinA);
+            const float finalY = centerY + (float)(dx * sinA + dy * cosA);
+
+            FPDF_PAGEOBJECT pathObj = CreateWatermarkTextPathObject(
+                    glyphRun,
+                    spaceRun,
+                    unitsPerEm,
+                    letterSpacing
+            );
+            if (!pathObj) continue;
+
+            FPDFPageObj_SetFillColor(pathObj, textR, textG, textB, textA);
+            if (isBold) {
+                FPDFPageObj_SetStrokeColor(pathObj, textR, textG, textB, textA);
+                FPDFPageObj_SetStrokeWidth(pathObj, textHeight * 0.05f);
+            }
+            FPDFPath_SetDrawMode(pathObj, FPDF_FILLMODE_WINDING, isBold ? JNI_TRUE : JNI_FALSE);
+            FPDFPageObj_Transform(
+                    pathObj,
+                    (float)(cosA * glyphScale),
+                    (float)(sinA * glyphScale),
+                    (float)((-sinA + skewX) * glyphScale),
+                    (float)(cosA * glyphScale),
+                    finalX,
+                    finalY
+            );
+
+            FPDFPage_InsertObject(page, pathObj);
+            objectCount++;
+            appendedAny = true;
+        }
+    }
+
+    return appendedAny;
 }
 //------------------------------------------------------------------------------------------------------
 
@@ -8641,6 +11957,88 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeSaveAnnotat
     return success ? JNI_TRUE : JNI_FALSE;
 }
 
+JNIEXPORT jboolean JNICALL
+Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeSaveEdit(
+        JNIEnv* env,
+    jobject thiz,
+    jstring inputPath_,
+    jstring outputPath_,
+    jobjectArray watermarksArray
+) {
+    const long long saveStartMs = WatermarkNowMs();
+    long long stepStartMs = saveStartMs;
+    const char* inputPath = env->GetStringUTFChars(inputPath_, 0);
+    const char* outputPath = env->GetStringUTFChars(outputPath_, 0);
+
+    WM_TIME_LOGE("WM_TIME save init_paths ms=%lld", WatermarkNowMs() - stepStartMs);
+    stepStartMs = WatermarkNowMs();
+
+    jclass watermarkClass = env->FindClass("com/cv/lufick/compose_editor/data_class/PdfWatermarkNative");
+    jfieldID dataPropsField = env->GetFieldID(watermarkClass, "dataProperties", "Ljava/lang/String;");
+    jclass jsonClass = env->FindClass("org/json/JSONObject");
+    jmethodID jsonInit = env->GetMethodID(jsonClass, "<init>", "(Ljava/lang/String;)V");
+
+    const int watermarkCount = watermarksArray ? env->GetArrayLength(watermarksArray) : 0;
+    std::vector<RawPdfWatermarkSpec> rawWatermarkSpecs;
+    rawWatermarkSpecs.reserve(std::max(0, watermarkCount));
+
+    for (int i = 0; i < watermarkCount; i++) {
+        jobject obj = env->GetObjectArrayElement(watermarksArray, i);
+        if (!obj) continue;
+
+        RawPdfWatermarkSpec spec;
+        if (CollectPageLevelTextWatermarkPatternSpec(env, obj, dataPropsField, jsonClass, jsonInit, &spec)) {
+            rawWatermarkSpecs.push_back(spec);
+        }
+        env->DeleteLocalRef(obj);
+    }
+    WM_TIME_LOGE(
+            "WM_TIME save collect_specs ms=%lld watermarkCount=%d compactSpecs=%zu",
+            WatermarkNowMs() - stepStartMs,
+            watermarkCount,
+            rawWatermarkSpecs.size()
+    );
+    stepStartMs = WatermarkNowMs();
+
+    /*
+     * Watermark-only save does not need a full PDFium rewrite. Keep the source PDF
+     * bytes as-is, then append our compact watermark objects incrementally below.
+     */
+//    FILE* file = fopen(outputPath, "wb");
+//    PdfFileWriter writer{ {1, WriteBlock}, file };
+//    int success = (file) ? FPDF_SaveAsCopy(doc, (FPDF_FILEWRITE*)&writer, FPDF_NO_INCREMENTAL) : JNI_FALSE;
+//    if (file) fclose(file);
+    int success = CopyFileBinary(inputPath, outputPath) ? JNI_TRUE : JNI_FALSE;
+    WM_TIME_LOGE("WM_TIME save copy_pdf ms=%lld success=%d", WatermarkNowMs() - stepStartMs, success ? 1 : 0);
+    stepStartMs = WatermarkNowMs();
+
+    if (success && watermarkCount > 0 && rawWatermarkSpecs.empty()) {
+        success = JNI_FALSE;
+    }
+    if (success && !rawWatermarkSpecs.empty()) {
+        const bool watermarkPatched = PatchRawPdfWatermarkPatterns(env, outputPath, rawWatermarkSpecs);
+        WM_TIME_LOGE(
+                "WM_TIME save patch_watermark ms=%lld success=%d",
+                WatermarkNowMs() - stepStartMs,
+                watermarkPatched ? 1 : 0
+        );
+        if (!watermarkPatched) {
+            success = JNI_FALSE;
+        }
+    }
+
+    stepStartMs = WatermarkNowMs();
+    WM_TIME_LOGE(
+            "WM_TIME save finish ms=%lld totalMs=%lld success=%d",
+            WatermarkNowMs() - stepStartMs,
+            WatermarkNowMs() - saveStartMs,
+            success ? 1 : 0
+    );
+    env->ReleaseStringUTFChars(inputPath_, inputPath);
+    env->ReleaseStringUTFChars(outputPath_, outputPath);
+    return success ? JNI_TRUE : JNI_FALSE;
+}
+
 // dummy native save testing
 JNIEXPORT jboolean JNICALL
 Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeDummySave(
@@ -9249,8 +12647,8 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeGetAnnotati
                         jSimplePdfStampProps
                 );
                 jobject annotObj = env->NewObject(annotClass, constructor,
-                                                  type, pageIndex, (float)dLeft, (float)dTop, (float)dRight, (float)dBottom,
-                                                  (int)r, (int)g, (int)b, (int)a, jLinkUrl, nullptr, jDataProps, nullptr, i, 0);
+                                                   type, pageIndex, (float)dLeft, (float)dTop, (float)dRight, (float)dBottom,
+                                                   (int)r, (int)g, (int)b, (int)a, jLinkUrl, nullptr, jDataProps, nullptr, i, 0);
 
                 if (annotObj) tempCollector.push_back(annotObj);
                 loadedNativeAnnotBounds.push_back({
@@ -9323,8 +12721,8 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeGetAnnotati
                             nullptr
                     );
                     jobject annotObj = env->NewObject(annotClass, constructor,
-                                                      type, pageIndex, (float)dLeft, (float)dTop, (float)dRight, (float)dBottom,
-                                                      (int)r, (int)g, (int)b, (int)a, jLinkUrl, jMarkupRects, jDataProps, nullptr, i, 0);
+                                                       type, pageIndex, (float)dLeft, (float)dTop, (float)dRight, (float)dBottom,
+                                                       (int)r, (int)g, (int)b, (int)a, jLinkUrl, jMarkupRects, jDataProps, nullptr, i, 0);
 
                     if (annotObj) tempCollector.push_back(annotObj);
                     if (jDataProps) env->DeleteLocalRef(jDataProps);
