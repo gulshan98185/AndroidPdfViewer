@@ -28,6 +28,7 @@ using namespace android;
 #include <sstream>
 #include <vector>
 #include <map>
+#include <set>
 #include <algorithm>
 #include <cctype>
 #include <cstdlib>
@@ -1511,6 +1512,7 @@ static bool processPageLevelTextWatermark(JNIEnv* env, jobject obj, FPDF_DOCUMEN
 struct RawPdfWatermarkSpec;
 static bool CollectPageLevelTextWatermarkPatternSpec(JNIEnv* env, jobject obj, jfieldID dataPropsField, jclass jsonClass, jmethodID jsonInit, RawPdfWatermarkSpec* outSpec);
 static bool PatchRawPdfWatermarkPatterns(JNIEnv* env, const char* outputPath, const std::vector<RawPdfWatermarkSpec>& specs);
+static bool PatchToolkitWatermarkDocumentMetadata(const char* outputPath, const std::string& metadataJson);
 static bool AppendPageLevelTextWatermarkGlyphPaths(FPDF_PAGE page, const char* fontPath, const jchar* textContent, jsize textLength, int textR, int textG, int textB, int textA, bool isBold, double scale, double letterSpacing, double textHeight, double cosA, double sinA, double skewX, float minX, float maxX, float minY, float maxY, float centerX, float centerY, float tileWidth, float tileHeight, int maxStampObjects);
 
 static std::string ResolvePageLevelWatermarkFontPath(const char* requestedPath, bool isBold, bool isItalic) {
@@ -2765,6 +2767,8 @@ struct RawPdfWatermarkSpec {
     float contentHeight = 0.0f;
     float baselineX = 0.0f;
     float baselineY = 0.0f;
+    float centerX = 0.0f;
+    float centerY = 0.0f;
     float rotation = 0.0f;
     float opacity = 1.0f;
     float characterSpacing = 0.0f;
@@ -3279,7 +3283,8 @@ static bool BuildClassicIncrementalTrailer(
         const std::string& previousTrailer,
         int maxObjectNumber,
         long long previousStartXref,
-        std::string* outTrailer
+        std::string* outTrailer,
+        const std::string* overrideInfoRef = nullptr
 ) {
     if (!outTrailer || maxObjectNumber <= 0 || previousStartXref < 0) return false;
 
@@ -3302,7 +3307,9 @@ static bool BuildClassicIncrementalTrailer(
             << " /Root " << rootValue;
 
     std::string value;
-    if (ExtractPdfDictionaryRawValue(previousTrailer, "Info", &value)) {
+    if (overrideInfoRef && !overrideInfoRef->empty()) {
+        trailer << " /Info " << *overrideInfoRef;
+    } else if (ExtractPdfDictionaryRawValue(previousTrailer, "Info", &value)) {
         trailer << " /Info " << value;
     }
     if (ExtractPdfDictionaryRawValue(previousTrailer, "ID", &value)) {
@@ -3318,7 +3325,8 @@ static bool BuildClassicIncrementalTrailer(
 
 static bool AppendIncrementalPdfObjectUpdates(
         std::string* data,
-        std::vector<PdfObjectReplacement>* replacements
+        std::vector<PdfObjectReplacement>* replacements,
+        const std::string* overrideInfoRef = nullptr
 ) {
     if (!data || !replacements || replacements->empty()) return true;
 
@@ -3340,7 +3348,7 @@ static bool AppendIncrementalPdfObjectUpdates(
     }
 
     std::string trailer;
-    if (!BuildClassicIncrementalTrailer(previousTrailer, maxObjectNumber, previousStartXref, &trailer)) {
+    if (!BuildClassicIncrementalTrailer(previousTrailer, maxObjectNumber, previousStartXref, &trailer, overrideInfoRef)) {
         return false;
     }
 
@@ -3819,6 +3827,46 @@ static std::string EscapePdfLiteralString(const std::string& value) {
     return escaped;
 }
 
+static bool PatchToolkitWatermarkDocumentMetadata(const char* outputPath, const std::string& metadataJson) {
+    if (!outputPath) return false;
+
+    std::string data;
+    if (!ReadFileToString(outputPath, &data)) {
+        WM_LOGE("Toolkit watermark metadata patch failed: unable to read output PDF");
+        return false;
+    }
+
+    std::vector<PdfObjectInfo> objects = ScanPdfObjects(data);
+    if (objects.empty()) {
+        WM_LOGE("Toolkit watermark metadata patch failed: no PDF objects found");
+        return false;
+    }
+
+    const int infoObjectNumber = GetMaxPdfObjectNumber(objects) + 1;
+    std::ostringstream infoBody;
+    infoBody << "<< /CVToolkitWatermark (" << EscapePdfLiteralString(metadataJson) << ") >>";
+
+    std::vector<PdfObjectReplacement> replacements;
+    replacements.push_back({
+            infoObjectNumber,
+            0,
+            infoBody.str()
+    });
+
+    const std::string infoRef = std::to_string(infoObjectNumber) + " 0 R";
+    if (!AppendIncrementalPdfObjectUpdates(&data, &replacements, &infoRef)) {
+        WM_LOGE("Toolkit watermark metadata patch failed: unable to append Info object");
+        return false;
+    }
+
+    if (!WriteStringToFile(outputPath, data)) {
+        WM_LOGE("Toolkit watermark metadata patch failed: unable to write output PDF");
+        return false;
+    }
+    WM_LOGE("Patched toolkit watermark document metadata bytes=%zu", metadataJson.size());
+    return true;
+}
+
 static std::string BuildPdfWatermarkPatternStream(
         const RawPdfWatermarkSpec& spec,
         const std::string& graphicsStateName
@@ -3974,8 +4022,8 @@ static std::string BuildPdfSingleRasterWatermarkContentStream(
     const float b = sinA * drawWidth;
     const float c = -sinA * drawHeight;
     const float d = cosA * drawHeight;
-    const float centerX = spec.pageWidth * 0.5f;
-    const float centerY = spec.pageHeight * 0.5f;
+    const float centerX = spec.centerX > 0.0f ? spec.centerX : (spec.pageWidth * 0.5f);
+    const float centerY = spec.centerY > 0.0f ? spec.centerY : (spec.pageHeight * 0.5f);
     const float e = centerX - ((a + c) * 0.5f);
     const float f = centerY - ((b + d) * 0.5f);
     std::ostringstream stream;
@@ -4128,8 +4176,8 @@ static std::string BuildPdfSingleWatermarkContentStream(
     const double angleRad = spec.rotation * M_PI / 180.0;
     const float cosA = static_cast<float>(cos(angleRad));
     const float sinA = static_cast<float>(sin(angleRad));
-    const float centerX = spec.pageWidth * 0.5f;
-    const float centerY = spec.pageHeight * 0.5f;
+    const float centerX = spec.centerX > 0.0f ? spec.centerX : (spec.pageWidth * 0.5f);
+    const float centerY = spec.centerY > 0.0f ? spec.centerY : (spec.pageHeight * 0.5f);
     const float textX = centerX + (localX * cosA) - (localY * sinA);
     const float textY = centerY + (localX * sinA) + (localY * cosA);
 
@@ -4913,10 +4961,128 @@ static bool AddRasterWatermarkToPageResources(
 
 
 // Method that fill the whole page rectangle using the repeating watermark pattern.
+static bool IsToolkitWatermarkContentObject(const PdfObjectInfo& object) {
+    return object.body.find("/Pattern cs") != std::string::npos &&
+           object.body.find("/LufickWmP") != std::string::npos;
+}
+
+static std::set<int> CollectToolkitWatermarkContentObjectNumbers(const std::vector<PdfObjectInfo>& objects) {
+    std::set<int> objectNumbers;
+    for (const PdfObjectInfo& object : objects) {
+        if (IsToolkitWatermarkContentObject(object)) {
+            objectNumbers.insert(object.objectNumber);
+        }
+    }
+    return objectNumbers;
+}
+
+static bool IsToolkitWatermarkContentRef(int objectNumber, const std::set<int>& toolkitContentObjects) {
+    return objectNumber > 0 && toolkitContentObjects.find(objectNumber) != toolkitContentObjects.end();
+}
+
+static bool RebuildContentsArrayWithoutToolkitWatermarks(
+        const std::string& body,
+        size_t arrayStart,
+        size_t arrayEnd,
+        const std::set<int>& toolkitContentObjects,
+        int contentObjectNumber,
+        std::string* outArray
+) {
+    if (!outArray || arrayStart >= arrayEnd || arrayEnd > body.size()) return false;
+    std::vector<std::pair<int, int>> refs;
+    size_t cursor = arrayStart + 1;
+    while (cursor < arrayEnd) {
+        while (cursor < arrayEnd && std::isspace(static_cast<unsigned char>(body[cursor]))) cursor++;
+        if (cursor >= arrayEnd) break;
+
+        int objectNumber = 0;
+        int generation = 0;
+        size_t refEnd = cursor;
+        if (!ParseIndirectReferenceAt(body, cursor, arrayEnd, &objectNumber, &generation, &refEnd)) {
+            return false;
+        }
+        if (!IsToolkitWatermarkContentRef(objectNumber, toolkitContentObjects)) {
+            refs.push_back({objectNumber, generation});
+        }
+        cursor = refEnd;
+    }
+
+    std::ostringstream rebuilt;
+    rebuilt << "[";
+    for (const auto& ref : refs) {
+        rebuilt << " " << ref.first << " " << ref.second << " R";
+    }
+    if (contentObjectNumber > 0) {
+        rebuilt << " " << contentObjectNumber << " 0 R";
+    }
+    rebuilt << " ]";
+    *outArray = rebuilt.str();
+    return true;
+}
+
+static bool RemoveToolkitWatermarkContentFromPageBody(
+        const std::string& originalBody,
+        std::string* outBody,
+        const std::set<int>& toolkitContentObjects
+) {
+    if (!outBody || toolkitContentObjects.empty()) return false;
+    std::string body = originalBody;
+    size_t dictStart = 0;
+    size_t dictEnd = 0;
+    if (!FindTopLevelPdfDictionary(body, &dictStart, &dictEnd)) return false;
+
+    const size_t contentsKey = FindPdfKeyTokenInRange(body, dictStart, dictEnd, "Contents");
+    if (contentsKey == std::string::npos) return false;
+
+    size_t valueStart = contentsKey + strlen("/Contents");
+    while (valueStart < dictEnd && std::isspace(static_cast<unsigned char>(body[valueStart]))) {
+        valueStart++;
+    }
+    if (valueStart >= dictEnd) return false;
+
+    if (body[valueStart] == '[') {
+        const size_t arrayEnd = body.find(']', valueStart + 1);
+        if (arrayEnd == std::string::npos || arrayEnd >= dictEnd) return false;
+        std::string rebuiltArray;
+        if (!RebuildContentsArrayWithoutToolkitWatermarks(
+                body,
+                valueStart,
+                arrayEnd,
+                toolkitContentObjects,
+                0,
+                &rebuiltArray
+        )) {
+            return false;
+        }
+        if (rebuiltArray == body.substr(valueStart, arrayEnd - valueStart + 1)) return false;
+        body.replace(valueStart, arrayEnd - valueStart + 1, rebuiltArray);
+        *outBody = body;
+        return true;
+    }
+
+    int existingObjectNumber = 0;
+    int existingGeneration = 0;
+    size_t valueEnd = 0;
+    if (ParseIndirectReferenceAt(
+            body,
+            valueStart,
+            dictEnd,
+            &existingObjectNumber,
+            &existingGeneration,
+            &valueEnd
+    ) && IsToolkitWatermarkContentRef(existingObjectNumber, toolkitContentObjects)) {
+        body.replace(valueStart, valueEnd - valueStart, "[]");
+        *outBody = body;
+        return true;
+    }
+    return false;
+}
+
 static bool AddWatermarkContentToPageBody(
         const std::string& originalBody,
         int contentObjectNumber,
-        std::string* outBody
+        std::string* outBody,
+        const std::set<int>& toolkitContentObjects
 ) {
     if (!outBody) return false;
     std::string body = originalBody;
@@ -4942,7 +5108,20 @@ static bool AddWatermarkContentToPageBody(
         const size_t arrayEnd = body.find(']', valueStart + 1);
         if (arrayEnd == std::string::npos || arrayEnd >= dictEnd) return false;
         WM_LOGE("Native watermark content patch: append to contents array contentObj=%d", contentObjectNumber);
-        body.insert(arrayEnd, " " + std::to_string(contentObjectNumber) + " 0 R");
+        std::string rebuiltArray;
+        if (!toolkitContentObjects.empty() &&
+            RebuildContentsArrayWithoutToolkitWatermarks(
+                    body,
+                    valueStart,
+                    arrayEnd,
+                    toolkitContentObjects,
+                    contentObjectNumber,
+                    &rebuiltArray
+            )) {
+            body.replace(valueStart, arrayEnd - valueStart + 1, rebuiltArray);
+        } else {
+            body.insert(arrayEnd, " " + std::to_string(contentObjectNumber) + " 0 R");
+        }
         *outBody = body;
         return true;
     }
@@ -4964,12 +5143,12 @@ static bool AddWatermarkContentToPageBody(
                 existingGeneration,
                 contentObjectNumber
         );
-        body.replace(
-                valueStart,
-                valueEnd - valueStart,
-                "[ " + std::to_string(existingObjectNumber) + " " + std::to_string(existingGeneration) +
-                " R " + std::to_string(contentObjectNumber) + " 0 R ]"
-        );
+        const bool existingIsToolkitWatermark = IsToolkitWatermarkContentRef(existingObjectNumber, toolkitContentObjects);
+        const std::string replacement = existingIsToolkitWatermark
+                                        ? std::to_string(contentObjectNumber) + " 0 R"
+                                        : "[ " + std::to_string(existingObjectNumber) + " " + std::to_string(existingGeneration) +
+                                          " R " + std::to_string(contentObjectNumber) + " 0 R ]";
+        body.replace(valueStart, valueEnd - valueStart, replacement);
         *outBody = body;
         return true;
     }
@@ -5017,7 +5196,7 @@ static std::string BuildRawPdfWatermarkPatternKey(const RawPdfWatermarkSpec& spe
 
 // Method that reads the saved PDF as bytes/text and scans PDF objects
 static bool PatchRawPdfWatermarkPatterns(JNIEnv* env, const char* outputPath, const std::vector<RawPdfWatermarkSpec>& specs) {
-    if (!outputPath || specs.empty()) return true;
+    if (!outputPath) return false;
 
     const long long patchStartMs = WatermarkNowMs();
     long long stepStartMs = patchStartMs;
@@ -5042,6 +5221,11 @@ static bool PatchRawPdfWatermarkPatterns(JNIEnv* env, const char* outputPath, co
     const std::vector<PdfObjectInfo> latestObjects = BuildLatestPdfObjectsByRef(objects);
     WM_TIME_LOGE("WM_TIME patch latest_objects ms=%lld latest=%zu", WatermarkNowMs() - stepStartMs, latestObjects.size());
     stepStartMs = WatermarkNowMs();
+    const std::set<int> toolkitWatermarkContentObjects = CollectToolkitWatermarkContentObjectNumbers(latestObjects);
+    WM_LOGE(
+            "Native watermark compact patch found %zu previous toolkit watermark content stream(s)",
+            toolkitWatermarkContentObjects.size()
+    );
     int maxSpecPageIndex = -1;
     for (const RawPdfWatermarkSpec& spec : specs) {
         maxSpecPageIndex = std::max(maxSpecPageIndex, spec.pageIndex);
@@ -5091,6 +5275,21 @@ static bool PatchRawPdfWatermarkPatterns(JNIEnv* env, const char* outputPath, co
     int patchedCount = 0;
 
     stepStartMs = WatermarkNowMs();
+    if (specs.empty()) {
+        for (const PdfObjectInfo& page : pages) {
+            std::string pageBody = GetCurrentPdfObjectBody(page, &replacements);
+            if (RemoveToolkitWatermarkContentFromPageBody(
+                    pageBody,
+                    &pageBody,
+                    toolkitWatermarkContentObjects
+            )) {
+                if (!UpsertPdfObjectReplacement(&replacements, page.objectNumber, page.generation, pageBody)) {
+                    return false;
+                }
+                patchedCount++;
+            }
+        }
+    }
     for (size_t specIndex = 0; specIndex < specs.size(); specIndex++) {
         const RawPdfWatermarkSpec& spec = specs[specIndex];
         if (spec.pageIndex < 0 || static_cast<size_t>(spec.pageIndex) >= pages.size() ||
@@ -5127,12 +5326,13 @@ static bool PatchRawPdfWatermarkPatterns(JNIEnv* env, const char* outputPath, co
             const int patternObjectNumber = nextObjectNumber++;
             const int patternIndex = static_cast<int>(patternBindings.size()) + 1;
             binding.objectNumber = patternObjectNumber;
-            binding.patternName = MakePdfResourceName("LufickWmP", patternIndex);
-            binding.graphicsStateName = MakePdfResourceName("LufickWmGS", patternIndex);
+            const int resourceNameIndex = nextObjectNumber + patternIndex;
+            binding.patternName = MakePdfResourceName("LufickWmP", resourceNameIndex);
+            binding.graphicsStateName = MakePdfResourceName("LufickWmGS", resourceNameIndex);
             if (spec.isRasterImage) {
                 binding.imageObjectNumber = nextObjectNumber++;
                 binding.imageSmaskObjectNumber = nextObjectNumber++;
-                binding.imageName = MakePdfResourceName("LufickWmIm", patternIndex);
+                binding.imageName = MakePdfResourceName("LufickWmIm", resourceNameIndex);
             }
             patternBindings[patternKey] = binding;
         }
@@ -5209,7 +5409,12 @@ static bool PatchRawPdfWatermarkPatterns(JNIEnv* env, const char* outputPath, co
             );
             continue;
         }
-        if (!AddWatermarkContentToPageBody(pageBody, contentObjectNumber, &pageBody)) {
+        if (!AddWatermarkContentToPageBody(
+                pageBody,
+                contentObjectNumber,
+                &pageBody,
+                toolkitWatermarkContentObjects
+        )) {
             WM_LOGE(
                     "Unable to add native watermark content stream for page %d obj=%d gen=%d bodyLen=%zu",
                     spec.pageIndex,
@@ -6119,6 +6324,10 @@ static bool CollectPageLevelTextWatermarkPatternSpec(
     spec.pageIndex = optIntValue("pdfPageIndex", optIntValue("sourcePageIndex", -1));
     spec.pageWidth = fmax((float)optDoubleValue("pageWidth", 0.0), 0.0f);
     spec.pageHeight = fmax((float)optDoubleValue("pageHeight", 0.0), 0.0f);
+    const float centerNormX = fmax(0.0f, fmin((float)optDoubleValue("centerNormX", 0.5), 1.0f));
+    const float centerNormY = fmax(0.0f, fmin((float)optDoubleValue("centerNormY", 0.5), 1.0f));
+    spec.centerX = spec.pageWidth * centerNormX;
+    spec.centerY = spec.pageHeight * (1.0f - centerNormY);
     spec.isRepeated = isRepeatedMode;
     spec.isRasterImage = isRasterImageWatermark;
     spec.imagePixelWidth = std::max(0, optIntValue("imagePixelWidth", 0));
@@ -6174,16 +6383,18 @@ static bool CollectPageLevelTextWatermarkPatternSpec(
     const float verticalSpacing = fmax((float)optDoubleValue("verticalSpacing", 0.0) * watermarkPdfScale, 0.0f);
     spec.contentWidth = approximateTextWidth;
     spec.contentHeight = textHeight;
+    const float textRepeatHorizontalSpacing = horizontalSpacing > 0.0f ? horizontalSpacing : repeatSpacing;
+    const float textRepeatVerticalSpacing = verticalSpacing > 0.0f ? verticalSpacing : repeatSpacing;
     spec.repeatStepWidth = isRasterImageWatermark
             ? fmax(approximateTextWidth + horizontalSpacing, approximateTextWidth)
             : fmax(
-                    approximateTextWidth + (isIconImageWatermark ? horizontalSpacing : repeatSpacing),
+                    approximateTextWidth + (isIconImageWatermark ? horizontalSpacing : textRepeatHorizontalSpacing),
                     spec.fontSize
             );
     spec.repeatStepHeight = isRasterImageWatermark
             ? fmax(textHeight + verticalSpacing, textHeight)
             : fmax(
-                    textHeight + (isIconImageWatermark ? verticalSpacing : repeatSpacing),
+                    textHeight + (isIconImageWatermark ? verticalSpacing : textRepeatVerticalSpacing),
                     spec.fontSize
             );
     spec.patternWidth = spec.repeatStepWidth + (glyphPadding * 3.0f);
@@ -8023,8 +8234,8 @@ static std::string BuildPdfSingleWatermarkFontOutlineContentStream(
     const double angleRad = spec.rotation * M_PI / 180.0;
     const float cosA = static_cast<float>(cos(angleRad));
     const float sinA = static_cast<float>(sin(angleRad));
-    const float centerX = spec.pageWidth * 0.5f;
-    const float centerY = spec.pageHeight * 0.5f;
+    const float centerX = spec.centerX > 0.0f ? spec.centerX : (spec.pageWidth * 0.5f);
+    const float centerY = spec.centerY > 0.0f ? spec.centerY : (spec.pageHeight * 0.5f);
 
     std::ostringstream stream;
     stream << "q\n"
@@ -11981,10 +12192,23 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeSaveEdit(
     const int watermarkCount = watermarksArray ? env->GetArrayLength(watermarksArray) : 0;
     std::vector<RawPdfWatermarkSpec> rawWatermarkSpecs;
     rawWatermarkSpecs.reserve(std::max(0, watermarkCount));
+    std::string toolkitWatermarkMetadataJson;
 
     for (int i = 0; i < watermarkCount; i++) {
         jobject obj = env->GetObjectArrayElement(watermarksArray, i);
         if (!obj) continue;
+
+        if (toolkitWatermarkMetadataJson.empty()) {
+            jstring jMetadata = GetBridgeDataPropertyJString(env, obj, dataPropsField, jsonClass, jsonInit, "toolkitDocumentMetadata");
+            if (jMetadata) {
+                const char* metadataChars = env->GetStringUTFChars(jMetadata, nullptr);
+                if (metadataChars && strlen(metadataChars) > 0) {
+                    toolkitWatermarkMetadataJson = metadataChars;
+                }
+                if (metadataChars) env->ReleaseStringUTFChars(jMetadata, metadataChars);
+                env->DeleteLocalRef(jMetadata);
+            }
+        }
 
         RawPdfWatermarkSpec spec;
         if (CollectPageLevelTextWatermarkPatternSpec(env, obj, dataPropsField, jsonClass, jsonInit, &spec)) {
@@ -12025,6 +12249,25 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeSaveEdit(
         if (!watermarkPatched) {
             success = JNI_FALSE;
         }
+    }
+    if (success && watermarkCount == 0 && !PatchRawPdfWatermarkPatterns(env, outputPath, rawWatermarkSpecs)) {
+        success = JNI_FALSE;
+    }
+    if (success && !toolkitWatermarkMetadataJson.empty()) {
+        stepStartMs = WatermarkNowMs();
+        const bool metadataPatched = PatchToolkitWatermarkDocumentMetadata(outputPath, toolkitWatermarkMetadataJson);
+        WM_TIME_LOGE(
+                "WM_TIME save patch_toolkit_metadata ms=%lld success=%d bytes=%zu",
+                WatermarkNowMs() - stepStartMs,
+                metadataPatched ? 1 : 0,
+                toolkitWatermarkMetadataJson.size()
+        );
+        if (!metadataPatched) {
+            success = JNI_FALSE;
+        }
+    }
+    if (success && watermarkCount == 0 && !PatchToolkitWatermarkDocumentMetadata(outputPath, "")) {
+        success = JNI_FALSE;
     }
 
     stepStartMs = WatermarkNowMs();
