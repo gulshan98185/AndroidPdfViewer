@@ -1403,6 +1403,7 @@ Java_com_shockwave_pdfium_PdfiumCore_nativeGetTextCount(
 #include "fpdf_save.h"
 #include "fpdf_annot.h"
 #include "fpdf_edit.h"
+#include "fpdf_transformpage.h"
 #include "fpdfview.h"
 #include <jni.h>
 #include <vector>
@@ -12659,6 +12660,119 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeSavePdfEdit
     env->ReleaseStringUTFChars(inputPath_, inputPath);
     env->ReleaseStringUTFChars(outputPath_, outputPath);
     LOGE("PDF_EDIT_NATIVE nativeSavePdfEditObjects finish success=%d", success ? 1 : 0);
+    return success ? JNI_TRUE : JNI_FALSE;
+}
+
+static float ClampCropPercent(float value) {
+    if (value < 0.0f) return 0.0f;
+    if (value > 95.0f) return 95.0f;
+    return value;
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeSavePdfCrop(
+        JNIEnv* env,
+        jobject thiz,
+        jstring inputPath_,
+        jstring outputPath_,
+        jobjectArray cropsArray
+) {
+    const char* inputPath = env->GetStringUTFChars(inputPath_, 0);
+    const char* outputPath = env->GetStringUTFChars(outputPath_, 0);
+
+    FPDF_DOCUMENT doc = FPDF_LoadDocument(inputPath, nullptr);
+    if (!doc) {
+        env->ReleaseStringUTFChars(inputPath_, inputPath);
+        env->ReleaseStringUTFChars(outputPath_, outputPath);
+        return JNI_FALSE;
+    }
+
+    const int cropCount = cropsArray ? env->GetArrayLength(cropsArray) : 0;
+    if (cropCount <= 0) {
+        FPDF_CloseDocument(doc);
+        env->ReleaseStringUTFChars(inputPath_, inputPath);
+        env->ReleaseStringUTFChars(outputPath_, outputPath);
+        return JNI_FALSE;
+    }
+
+    jclass cropClass = env->FindClass("com/cv/lufick/compose_editor/data_class/PdfCropNative");
+    if (!cropClass) {
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        FPDF_CloseDocument(doc);
+        env->ReleaseStringUTFChars(inputPath_, inputPath);
+        env->ReleaseStringUTFChars(outputPath_, outputPath);
+        return JNI_FALSE;
+    }
+
+    jfieldID pageIndexField = env->GetFieldID(cropClass, "pageIndex", "I");
+    jfieldID leftPercentField = env->GetFieldID(cropClass, "leftPercent", "F");
+    jfieldID topPercentField = env->GetFieldID(cropClass, "topPercent", "F");
+    jfieldID rightPercentField = env->GetFieldID(cropClass, "rightPercent", "F");
+    jfieldID bottomPercentField = env->GetFieldID(cropClass, "bottomPercent", "F");
+    if (!pageIndexField || !leftPercentField || !topPercentField || !rightPercentField ||
+        !bottomPercentField) {
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        FPDF_CloseDocument(doc);
+        env->ReleaseStringUTFChars(inputPath_, inputPath);
+        env->ReleaseStringUTFChars(outputPath_, outputPath);
+        return JNI_FALSE;
+    }
+
+    const int pageCount = FPDF_GetPageCount(doc);
+    bool appliedAnyCrop = false;
+    bool failed = false;
+
+    for (int i = 0; i < cropCount; i++) {
+        jobject cropObj = env->GetObjectArrayElement(cropsArray, i);
+        if (!cropObj) continue;
+
+        const int pageIndex = env->GetIntField(cropObj, pageIndexField);
+        const float leftPercent = ClampCropPercent(env->GetFloatField(cropObj, leftPercentField));
+        const float topPercent = ClampCropPercent(env->GetFloatField(cropObj, topPercentField));
+        const float rightPercent = ClampCropPercent(env->GetFloatField(cropObj, rightPercentField));
+        const float bottomPercent = ClampCropPercent(env->GetFloatField(cropObj, bottomPercentField));
+        env->DeleteLocalRef(cropObj);
+
+        if (pageIndex < 0 || pageIndex >= pageCount) {
+            failed = true;
+            break;
+        }
+
+        FPDF_PAGE page = FPDF_LoadPage(doc, pageIndex);
+        if (!page) {
+            failed = true;
+            break;
+        }
+
+        const float pageWidth = static_cast<float>(FPDF_GetPageWidth(page));
+        const float pageHeight = static_cast<float>(FPDF_GetPageHeight(page));
+        const float cropLeft = pageWidth * (leftPercent / 100.0f);
+        const float cropRight = pageWidth - (pageWidth * (rightPercent / 100.0f));
+        const float cropBottom = pageHeight * (bottomPercent / 100.0f);
+        const float cropTop = pageHeight - (pageHeight * (topPercent / 100.0f));
+
+        if (cropLeft >= cropRight || cropBottom >= cropTop) {
+            FPDF_ClosePage(page);
+            failed = true;
+            break;
+        }
+
+        FPDFPage_SetCropBox(page, cropLeft, cropBottom, cropRight, cropTop);
+        FPDF_ClosePage(page);
+        appliedAnyCrop = true;
+    }
+
+    int success = JNI_FALSE;
+    if (!failed && appliedAnyCrop) {
+        FILE* file = fopen(outputPath, "wb");
+        PdfFileWriter writer{ {1, WriteBlock}, file };
+        success = (file) ? FPDF_SaveAsCopy(doc, (FPDF_FILEWRITE*)&writer, FPDF_NO_INCREMENTAL) : JNI_FALSE;
+        if (file) fclose(file);
+    }
+
+    FPDF_CloseDocument(doc);
+    env->ReleaseStringUTFChars(inputPath_, inputPath);
+    env->ReleaseStringUTFChars(outputPath_, outputPath);
     return success ? JNI_TRUE : JNI_FALSE;
 }
 
