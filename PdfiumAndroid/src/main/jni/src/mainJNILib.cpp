@@ -6605,7 +6605,12 @@ static void processTextStamp(JNIEnv* env, jobject obj, FPDF_DOCUMENT doc, FPDF_P
     const int textB = optIntValue("textColorB", b);
     const int textA = optIntValue("textColorA", defaultAlpha);
 
-    const char16_t* textContent = (const char16_t*)env->GetStringChars(jText, nullptr);
+    const jsize textLength = env->GetStringLength(jText);
+    const jchar* rawTextContent = env->GetStringChars(jText, nullptr);
+    std::vector<unsigned short> textContent(textLength + 1, 0);
+    if (rawTextContent) {
+        memcpy(textContent.data(), rawTextContent, textLength * sizeof(jchar));
+    }
     const char* fontName = jFont ? env->GetStringUTFChars(jFont, nullptr) : nullptr;
     const char* alignStr = env->GetStringUTFChars(jAlign, nullptr);
     const char* fontPath = jFontPath ? env->GetStringUTFChars(jFontPath, nullptr) : nullptr;
@@ -6669,7 +6674,7 @@ static void processTextStamp(JNIEnv* env, jobject obj, FPDF_DOCUMENT doc, FPDF_P
     // more closely than treating the editor size as a PDF point size directly.
     FPDF_PAGEOBJECT textObj = FPDFPageObj_CreateTextObj(doc, loadedFont, 1.0f);
     if (textObj) {
-        FPDFText_SetText(textObj, (FPDF_WIDESTRING)textContent);
+        FPDFText_SetText(textObj, (FPDF_WIDESTRING)textContent.data());
         FPDFPageObj_SetFillColor(textObj, textR, textG, textB, textA);
         float tL, tB, tR, tT; FPDFPageObj_GetBounds(textObj, &tL, &tB, &tR, &tT);
         float bW = tR - tL, bH = tT - tB;
@@ -6729,7 +6734,7 @@ static void processTextStamp(JNIEnv* env, jobject obj, FPDF_DOCUMENT doc, FPDF_P
     env->DeleteLocalRef(jSignatureSubtypeKey);
     env->ReleaseStringChars(jJsonStr, rawJsonContent);
     FPDFAnnot_SetFlags(annot, FPDF_ANNOT_FLAG_PRINT | FPDF_ANNOT_FLAG_READONLY);
-    env->ReleaseStringChars(jText, (const jchar*)textContent);
+    if (rawTextContent) env->ReleaseStringChars(jText, rawTextContent);
     if (fontName) env->ReleaseStringUTFChars(jFont, fontName);
     env->ReleaseStringUTFChars(jAlign, alignStr);
     if (fontPath) env->ReleaseStringUTFChars(jFontPath, fontPath);
@@ -7086,13 +7091,18 @@ static void processFreeText(JNIEnv* env, jobject obj, FPDF_DOCUMENT doc, FPDF_PA
         return;
     }
 
-    const char16_t* textContent = (const char16_t*)env->GetStringChars(jText, nullptr);
+    const jsize textLength = env->GetStringLength(jText);
+    const jchar* rawTextContent = env->GetStringChars(jText, nullptr);
+    std::vector<unsigned short> textContent(textLength + 1, 0);
+    if (rawTextContent) {
+        memcpy(textContent.data(), rawTextContent, textLength * sizeof(jchar));
+    }
     const char* fontName = jFont ? env->GetStringUTFChars(jFont, nullptr) : nullptr;
     const char* alignStr = jAlign ? env->GetStringUTFChars(jAlign, nullptr) : "center";
     const char* fontPath = jFontPath ? env->GetStringUTFChars(jFontPath, nullptr) : nullptr;
     LOGE(
             "PDF_EDIT_NATIVE processFreeText props textLen=%d font=%s fontPath=%s size=%f box=%fx%f rotation=%f alpha=%d color=%d,%d,%d,%d",
-            env->GetStringLength(jText),
+            textLength,
             fontName ? fontName : "",
             fontPath ? fontPath : "",
             jsonSize,
@@ -7155,7 +7165,7 @@ static void processFreeText(JNIEnv* env, jobject obj, FPDF_DOCUMENT doc, FPDF_PA
 
     FPDF_PAGEOBJECT textObj = FPDFPageObj_CreateTextObj(doc, loadedFont, 1.0f);
     if (textObj) {
-        FPDFText_SetText(textObj, (FPDF_WIDESTRING)textContent);
+        FPDFText_SetText(textObj, (FPDF_WIDESTRING)textContent.data());
         FPDFPageObj_SetFillColor(textObj, textR, textG, textB, textA);
         float tL, tB, tR, tT; FPDFPageObj_GetBounds(textObj, &tL, &tB, &tR, &tT);
         float bW = tR - tL, bH = tT - tB;
@@ -7219,7 +7229,7 @@ static void processFreeText(JNIEnv* env, jobject obj, FPDF_DOCUMENT doc, FPDF_PA
     }
 
     LOGE("PDF_EDIT_NATIVE processFreeText finish pageObjectsAfter=%d", page ? FPDFPage_CountObjects(page) : -1);
-    env->ReleaseStringChars(jText, (const jchar*)textContent);
+    if (rawTextContent) env->ReleaseStringChars(jText, rawTextContent);
     if (fontName) env->ReleaseStringUTFChars(jFont, fontName);
     if (jAlign && alignStr) env->ReleaseStringUTFChars(jAlign, alignStr);
     if (fontPath) env->ReleaseStringUTFChars(jFontPath, fontPath);
@@ -12764,6 +12774,380 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeSavePdfCrop
 
     int success = JNI_FALSE;
     if (!failed && appliedAnyCrop) {
+        FILE* file = fopen(outputPath, "wb");
+        PdfFileWriter writer{ {1, WriteBlock}, file };
+        success = (file) ? FPDF_SaveAsCopy(doc, (FPDF_FILEWRITE*)&writer, FPDF_NO_INCREMENTAL) : JNI_FALSE;
+        if (file) fclose(file);
+    }
+
+    FPDF_CloseDocument(doc);
+    env->ReleaseStringUTFChars(inputPath_, inputPath);
+    env->ReleaseStringUTFChars(outputPath_, outputPath);
+    return success ? JNI_TRUE : JNI_FALSE;
+}
+
+static bool NativePageIndexRequested(const std::set<int>& requestedPages, int pageIndex) {
+    return requestedPages.empty() || requestedPages.find(pageIndex) != requestedPages.end();
+}
+
+static bool NativeResolvePageSize(FPDF_PAGE page, float* left, float* bottom, float* width, float* height) {
+    if (!page || !left || !bottom || !width || !height) return false;
+
+    float mediaLeft = 0.0f;
+    float mediaBottom = 0.0f;
+    float mediaRight = 0.0f;
+    float mediaTop = 0.0f;
+    if (FPDFPage_GetMediaBox(page, &mediaLeft, &mediaBottom, &mediaRight, &mediaTop) &&
+        mediaRight > mediaLeft &&
+        mediaTop > mediaBottom) {
+        *left = mediaLeft;
+        *bottom = mediaBottom;
+        *width = mediaRight - mediaLeft;
+        *height = mediaTop - mediaBottom;
+        return true;
+    }
+
+    *left = 0.0f;
+    *bottom = 0.0f;
+    *width = static_cast<float>(FPDF_GetPageWidth(page));
+    *height = static_cast<float>(FPDF_GetPageHeight(page));
+    return *width > 0.0f && *height > 0.0f;
+}
+
+struct NativeTextMarkupGeometry {
+    int annotIndex = -1;
+    int subtype = -1;
+    std::vector<FS_QUADPOINTSF> attachmentPoints;
+};
+
+static FS_POINTF NativeTransformPoint(const FS_MATRIX& matrix, float x, float y) {
+    FS_POINTF point;
+    point.x = (matrix.a * x) + (matrix.c * y) + matrix.e;
+    point.y = (matrix.b * x) + (matrix.d * y) + matrix.f;
+    return point;
+}
+
+static FS_RECTF NativeNormalizeRect(
+        const FS_POINTF& first,
+        const FS_POINTF& second,
+        const FS_POINTF& third,
+        const FS_POINTF& fourth
+) {
+    FS_RECTF rect;
+    rect.left = std::min({first.x, second.x, third.x, fourth.x});
+    rect.right = std::max({first.x, second.x, third.x, fourth.x});
+    rect.bottom = std::min({first.y, second.y, third.y, fourth.y});
+    rect.top = std::max({first.y, second.y, third.y, fourth.y});
+    return rect;
+}
+
+static FS_QUADPOINTSF NativeTransformQuad(const FS_MATRIX& matrix, const FS_QUADPOINTSF& quad) {
+    const FS_POINTF p1 = NativeTransformPoint(matrix, quad.x1, quad.y1);
+    const FS_POINTF p2 = NativeTransformPoint(matrix, quad.x2, quad.y2);
+    const FS_POINTF p3 = NativeTransformPoint(matrix, quad.x3, quad.y3);
+    const FS_POINTF p4 = NativeTransformPoint(matrix, quad.x4, quad.y4);
+
+    FS_QUADPOINTSF transformed;
+    transformed.x1 = p1.x;
+    transformed.y1 = p1.y;
+    transformed.x2 = p2.x;
+    transformed.y2 = p2.y;
+    transformed.x3 = p3.x;
+    transformed.y3 = p3.y;
+    transformed.x4 = p4.x;
+    transformed.y4 = p4.y;
+    return transformed;
+}
+
+static bool NativeIsTextMarkupSubtype(int subtype) {
+    return subtype == FPDF_ANNOT_HIGHLIGHT ||
+           subtype == FPDF_ANNOT_UNDERLINE ||
+           subtype == FPDF_ANNOT_STRIKEOUT ||
+           subtype == FPDF_ANNOT_SQUIGGLY;
+}
+
+static int NativeTextMarkupSubtypeToTypeInt(int subtype) {
+    switch (subtype) {
+        case FPDF_ANNOT_UNDERLINE:
+            return 1;
+        case FPDF_ANNOT_STRIKEOUT:
+            return 2;
+        case FPDF_ANNOT_SQUIGGLY:
+            return 8;
+        case FPDF_ANNOT_HIGHLIGHT:
+        default:
+            return 0;
+    }
+}
+
+static FS_RECTF NativeQuadBounds(const FS_QUADPOINTSF& quad) {
+    const FS_POINTF p1 = {quad.x1, quad.y1};
+    const FS_POINTF p2 = {quad.x2, quad.y2};
+    const FS_POINTF p3 = {quad.x3, quad.y3};
+    const FS_POINTF p4 = {quad.x4, quad.y4};
+    return NativeNormalizeRect(p1, p2, p3, p4);
+}
+
+static void NativeExpandRect(FS_RECTF* base, const FS_RECTF& add) {
+    if (!base) return;
+    base->left = std::min(base->left, add.left);
+    base->right = std::max(base->right, add.right);
+    base->bottom = std::min(base->bottom, add.bottom);
+    base->top = std::max(base->top, add.top);
+}
+
+static std::vector<NativeTextMarkupGeometry> NativeCollectTextMarkupGeometry(FPDF_PAGE page) {
+    std::vector<NativeTextMarkupGeometry> geometries;
+    if (!page) return geometries;
+
+    const int annotCount = FPDFPage_GetAnnotCount(page);
+    for (int annotIndex = 0; annotIndex < annotCount; annotIndex++) {
+        FPDF_ANNOTATION annot = FPDFPage_GetAnnot(page, annotIndex);
+        if (annot) {
+            const int subtype = FPDFAnnot_GetSubtype(annot);
+            if (NativeIsTextMarkupSubtype(subtype)) {
+                NativeTextMarkupGeometry geometry;
+                geometry.annotIndex = annotIndex;
+                geometry.subtype = subtype;
+                const int quadCount = FPDFAnnot_CountAttachmentPoints(annot);
+                geometry.attachmentPoints.reserve(std::max(quadCount, 0));
+                for (int quadIndex = 0; quadIndex < quadCount; quadIndex++) {
+                    FS_QUADPOINTSF quad;
+                    if (FPDFAnnot_GetAttachmentPoints(annot, quadIndex, &quad)) {
+                        geometry.attachmentPoints.push_back(quad);
+                    }
+                }
+                if (!geometry.attachmentPoints.empty()) {
+                    geometries.push_back(std::move(geometry));
+                }
+            }
+            FPDFPage_CloseAnnot(annot);
+        }
+    }
+    return geometries;
+}
+
+static void NativeFixTextMarkupAfterPageSizeScale(
+        FPDF_PAGE page,
+        const FS_MATRIX& matrix,
+        const std::vector<NativeTextMarkupGeometry>& geometries
+) {
+    if (!page || geometries.empty()) return;
+
+    const int annotCount = FPDFPage_GetAnnotCount(page);
+    for (const NativeTextMarkupGeometry& geometry : geometries) {
+        if (geometry.annotIndex < 0 || geometry.annotIndex >= annotCount) continue;
+        FPDF_ANNOTATION annot = FPDFPage_GetAnnot(page, geometry.annotIndex);
+        if (!annot) continue;
+        if (FPDFAnnot_GetSubtype(annot) != geometry.subtype) {
+            FPDFPage_CloseAnnot(annot);
+            continue;
+        }
+
+        bool hasBounds = false;
+        FS_RECTF bounds = {0.0f, 0.0f, 0.0f, 0.0f};
+        std::vector<FS_RECTF> transformedQuadBounds;
+        const int currentQuadCount = FPDFAnnot_CountAttachmentPoints(annot);
+        const int quadCount = static_cast<int>(geometry.attachmentPoints.size());
+        transformedQuadBounds.reserve(std::max(quadCount, 0));
+        for (int quadIndex = 0; quadIndex < quadCount; quadIndex++) {
+            FS_QUADPOINTSF transformedQuad = NativeTransformQuad(
+                    matrix,
+                    geometry.attachmentPoints[quadIndex]
+            );
+            if (quadIndex < currentQuadCount) {
+                FPDFAnnot_SetAttachmentPoints(annot, quadIndex, &transformedQuad);
+            }
+            const FS_RECTF quadBounds = NativeQuadBounds(transformedQuad);
+            transformedQuadBounds.push_back(quadBounds);
+            if (!hasBounds) {
+                bounds = quadBounds;
+                hasBounds = true;
+            } else {
+                NativeExpandRect(&bounds, quadBounds);
+            }
+        }
+
+        if (hasBounds) {
+            FPDFAnnot_SetRect(annot, &bounds);
+            FPDFAnnot_SetAP(annot, FPDF_ANNOT_APPEARANCEMODE_NORMAL, nullptr);
+
+            unsigned int r = 255;
+            unsigned int g = 255;
+            unsigned int b = 0;
+            unsigned int a = 125;
+            if (!FPDFAnnot_GetColor(annot, FPDFANNOT_COLORTYPE_Color, &r, &g, &b, &a)) {
+                FPDFAnnot_GetColor(annot, FPDFANNOT_COLORTYPE_InteriorColor, &r, &g, &b, &a);
+            }
+            FPDFAnnot_SetColor(annot, FPDFANNOT_COLORTYPE_Color, r, g, b, a);
+            if (geometry.subtype == FPDF_ANNOT_HIGHLIGHT) {
+                FPDFAnnot_SetColor(annot, FPDFANNOT_COLORTYPE_InteriorColor, r, g, b, a);
+                const unsigned short blendMode[] = {'M','u','l','t','i','p','l','y',0};
+                FPDFAnnot_SetStringValue(annot, "BM", (FPDF_WIDESTRING)blendMode);
+            } else {
+                const int typeInt = NativeTextMarkupSubtypeToTypeInt(geometry.subtype);
+                for (const FS_RECTF& quadBounds : transformedQuadBounds) {
+                    AppendFallbackTextMarkupAppearance(
+                            annot,
+                            typeInt,
+                            quadBounds,
+                            static_cast<int>(r),
+                            static_cast<int>(g),
+                            static_cast<int>(b),
+                            static_cast<int>(a)
+                    );
+                }
+            }
+        }
+
+        FPDFPage_CloseAnnot(annot);
+    }
+}
+
+static bool NativeApplyPageSizeScale(
+        FPDF_PAGE page,
+        float targetWidth,
+        float targetHeight,
+        int scaleMode,
+        float scaleFactor,
+        float* outScaleX = nullptr,
+        float* outScaleY = nullptr
+) {
+    float sourceLeft = 0.0f;
+    float sourceBottom = 0.0f;
+    float sourceWidth = 0.0f;
+    float sourceHeight = 0.0f;
+    if (!NativeResolvePageSize(page, &sourceLeft, &sourceBottom, &sourceWidth, &sourceHeight)) {
+        return false;
+    }
+
+    const float finalWidth = targetWidth > 0.0f ? targetWidth : sourceWidth;
+    const float finalHeight = targetHeight > 0.0f ? targetHeight : sourceHeight;
+    const float factor = std::isfinite(scaleFactor) && scaleFactor > 0.0f ? scaleFactor : 1.0f;
+    if (finalWidth <= 0.0f || finalHeight <= 0.0f) {
+        return false;
+    }
+
+    float scaleX = factor;
+    float scaleY = factor;
+    const float fitScale = std::min(finalWidth / sourceWidth, finalHeight / sourceHeight);
+    const float fillScale = std::max(finalWidth / sourceWidth, finalHeight / sourceHeight);
+    switch (scaleMode) {
+        case 1:
+            scaleX = fitScale * factor;
+            scaleY = fitScale * factor;
+            break;
+        case 2:
+            scaleX = fillScale * factor;
+            scaleY = fillScale * factor;
+            break;
+        case 3:
+            scaleX = (finalWidth / sourceWidth) * factor;
+            scaleY = (finalHeight / sourceHeight) * factor;
+            break;
+        case 0:
+        case 4:
+        default:
+            scaleX = factor;
+            scaleY = factor;
+            break;
+    }
+    if (outScaleX) *outScaleX = scaleX;
+    if (outScaleY) *outScaleY = scaleY;
+
+    const float offsetX = (finalWidth - (sourceWidth * scaleX)) * 0.5f;
+    const float offsetY = (finalHeight - (sourceHeight * scaleY)) * 0.5f;
+    FS_MATRIX matrix;
+    matrix.a = scaleX;
+    matrix.b = 0.0f;
+    matrix.c = 0.0f;
+    matrix.d = scaleY;
+    matrix.e = offsetX - (sourceLeft * scaleX);
+    matrix.f = offsetY - (sourceBottom * scaleY);
+
+    FS_RECTF clipRect;
+    clipRect.left = 0.0f;
+    clipRect.top = finalHeight;
+    clipRect.right = finalWidth;
+    clipRect.bottom = 0.0f;
+
+    const std::vector<NativeTextMarkupGeometry> textMarkupGeometry =
+            NativeCollectTextMarkupGeometry(page);
+    if (!FPDFPage_TransFormWithClip(page, &matrix, &clipRect)) {
+        return false;
+    }
+    FPDFPage_TransformAnnots(page, matrix.a, matrix.b, matrix.c, matrix.d, matrix.e, matrix.f);
+    NativeFixTextMarkupAfterPageSizeScale(page, matrix, textMarkupGeometry);
+    FPDFPage_SetMediaBox(page, 0.0f, 0.0f, finalWidth, finalHeight);
+    FPDFPage_SetCropBox(page, 0.0f, 0.0f, finalWidth, finalHeight);
+    return FPDFPage_GenerateContent(page) != 0;
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeSavePdfPageSizeScale(
+        JNIEnv* env,
+        jobject thiz,
+        jstring inputPath_,
+        jstring outputPath_,
+        jfloat targetWidth,
+        jfloat targetHeight,
+        jint scaleMode,
+        jfloat scaleFactor,
+        jintArray pageIndices_
+) {
+    const char* inputPath = env->GetStringUTFChars(inputPath_, 0);
+    const char* outputPath = env->GetStringUTFChars(outputPath_, 0);
+
+    std::set<int> requestedPages;
+    if (pageIndices_) {
+        const int indexCount = env->GetArrayLength(pageIndices_);
+        std::vector<jint> indices(indexCount);
+        if (indexCount > 0) {
+            env->GetIntArrayRegion(pageIndices_, 0, indexCount, indices.data());
+            for (int i = 0; i < indexCount; i++) {
+                if (indices[i] >= 0) {
+                    requestedPages.insert(indices[i]);
+                }
+            }
+        }
+    }
+
+    FPDF_DOCUMENT doc = FPDF_LoadDocument(inputPath, nullptr);
+    if (!doc) {
+        env->ReleaseStringUTFChars(inputPath_, inputPath);
+        env->ReleaseStringUTFChars(outputPath_, outputPath);
+        return JNI_FALSE;
+    }
+
+    const int pageCount = FPDF_GetPageCount(doc);
+    bool appliedAnyPage = false;
+    bool failed = false;
+    for (int pageIndex = 0; pageIndex < pageCount; pageIndex++) {
+        if (!NativePageIndexRequested(requestedPages, pageIndex)) continue;
+
+        FPDF_PAGE page = FPDF_LoadPage(doc, pageIndex);
+        if (!page) {
+            failed = true;
+            break;
+        }
+
+        const bool applied = NativeApplyPageSizeScale(
+                page,
+                targetWidth,
+                targetHeight,
+                scaleMode,
+                scaleFactor
+        );
+        FPDF_ClosePage(page);
+        if (!applied) {
+            failed = true;
+            break;
+        }
+        appliedAnyPage = true;
+    }
+
+    int success = JNI_FALSE;
+    if (!failed && appliedAnyPage) {
         FILE* file = fopen(outputPath, "wb");
         PdfFileWriter writer{ {1, WriteBlock}, file };
         success = (file) ? FPDF_SaveAsCopy(doc, (FPDF_FILEWRITE*)&writer, FPDF_NO_INCREMENTAL) : JNI_FALSE;
