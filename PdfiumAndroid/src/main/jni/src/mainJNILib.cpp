@@ -392,6 +392,27 @@ static jstring ReadAnnotStringValueJString(JNIEnv* env, FPDF_ANNOTATION annot, F
     return env->NewString(reinterpret_cast<const jchar*>(value.data()), static_cast<jsize>(value.size()));
 }
 
+static std::string BuildLocalDestLinkTarget(FPDF_DOCUMENT doc, FPDF_DEST dest) {
+    if (!doc || !dest) return std::string();
+    const int pageIndex = FPDFDest_GetDestPageIndex(doc, dest);
+    if (pageIndex < 0) return std::string();
+    char buffer[16] = {0};
+    buffer[0] = '@';
+    snprintf(buffer + 1, sizeof(buffer) - 1, "%d", pageIndex);
+    return std::string(buffer);
+}
+
+static std::string ReadLinkAnnotationTarget(FPDF_DOCUMENT doc, FPDF_ANNOTATION annot) {
+    if (!doc || !annot || FPDFAnnot_GetSubtype(annot) != FPDF_ANNOT_LINK) return std::string();
+    FPDF_LINK link = FPDFAnnot_GetLink(annot);
+    if (!link) return std::string();
+
+    const std::string directDestTarget = BuildLocalDestLinkTarget(doc, FPDFLink_GetDest(doc, link));
+    if (!directDestTarget.empty()) return directDestTarget;
+
+    return std::string();
+}
+
 static void SetAnnotAsciiStringValue(FPDF_ANNOTATION annot, FPDF_BYTESTRING key, const char* value) {
     if (!annot || !value) return;
     const size_t valueLen = strlen(value);
@@ -13392,7 +13413,10 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeGetAnnotati
             case FPDF_ANNOT_UNDERLINE: type = 1; break;
             case FPDF_ANNOT_STRIKEOUT: type = 2; break;
             case FPDF_ANNOT_SQUIGGLY:  type = 8; break;
-            case FPDF_ANNOT_LINK:      type = 3; break;
+            case FPDF_ANNOT_LINK:
+                type = 3;
+                usesRectOnly = true;
+                break;
             case FPDF_ANNOT_FREETEXT:
                 type = 11;
                 usesRectOnly = true;
@@ -13494,6 +13518,12 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeGetAnnotati
             }
         }
         jstring jLinkUrl = nullptr;
+        if (type == 3) {
+            const std::string linkTarget = ReadLinkAnnotationTarget(doc, annot);
+            if (!linkTarget.empty()) {
+                jLinkUrl = env->NewStringUTF(linkTarget.c_str());
+            }
+        }
         jstring jTextProps = nullptr;
         jstring jImageProps = nullptr;
         jstring jShapeProps = nullptr;
@@ -13918,6 +13948,7 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeGetAnnotati
             }
             if (jMarkupRects) env->DeleteLocalRef(jMarkupRects);
         }
+        if (jLinkUrl) env->DeleteLocalRef(jLinkUrl);
         FPDFPage_CloseAnnot(annot);
     }
 
