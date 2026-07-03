@@ -6370,23 +6370,20 @@ static bool CollectPageLevelTextWatermarkPatternSpec(
             ? fmax(measuredPdfTextHeight, 1.0f)
             : fmax(measuredPdfTextHeight > 0.0f ? measuredPdfTextHeight : spec.fontSize * 1.15f, spec.fontSize);
     const float glyphPadding = fmax(spec.fontSize * 0.18f, 1.0f);
-    const float repeatSpacing = fmax((float)optDoubleValue("lineSpacing", 1.0) * 20.0f * watermarkPdfScale, 0.0f);
     const float horizontalSpacing = fmax((float)optDoubleValue("horizontalSpacing", 0.0) * watermarkPdfScale, 0.0f);
     const float verticalSpacing = fmax((float)optDoubleValue("verticalSpacing", 0.0) * watermarkPdfScale, 0.0f);
     spec.contentWidth = approximateTextWidth;
     spec.contentHeight = textHeight;
-    const float textRepeatHorizontalSpacing = horizontalSpacing > 0.0f ? horizontalSpacing : repeatSpacing;
-    const float textRepeatVerticalSpacing = verticalSpacing > 0.0f ? verticalSpacing : repeatSpacing;
     spec.repeatStepWidth = isRasterImageWatermark
             ? fmax(approximateTextWidth + horizontalSpacing, approximateTextWidth)
             : fmax(
-                    approximateTextWidth + (isIconImageWatermark ? horizontalSpacing : textRepeatHorizontalSpacing),
+                    approximateTextWidth + horizontalSpacing,
                     spec.fontSize
             );
     spec.repeatStepHeight = isRasterImageWatermark
             ? fmax(textHeight + verticalSpacing, textHeight)
             : fmax(
-                    textHeight + (isIconImageWatermark ? verticalSpacing : textRepeatVerticalSpacing),
+                    textHeight + verticalSpacing,
                     spec.fontSize
             );
     spec.patternWidth = spec.repeatStepWidth + (glyphPadding * 3.0f);
@@ -6946,13 +6943,10 @@ static bool processPageLevelTextWatermark(
             : textHeight,
             scale
     );
-    const float repeatSpacing = fmax((float)optDoubleValue("lineSpacing", 1.0) * 20.0f * watermarkPdfScale, 0.0f);
     const float horizontalSpacing = fmax((float)optDoubleValue("horizontalSpacing", 0.0) * watermarkPdfScale, 0.0f);
     const float verticalSpacing = fmax((float)optDoubleValue("verticalSpacing", 0.0) * watermarkPdfScale, 0.0f);
-    const float textRepeatHorizontalSpacing = horizontalSpacing > 0.0f ? horizontalSpacing : repeatSpacing;
-    const float textRepeatVerticalSpacing = verticalSpacing > 0.0f ? verticalSpacing : repeatSpacing;
-    const float tileWidth = fmax(textWidth + textRepeatHorizontalSpacing, scale);
-    const float tileHeight = fmax(measuredTileHeight + textRepeatVerticalSpacing, scale);
+    const float tileWidth = fmax(textWidth + horizontalSpacing, scale);
+    const float tileHeight = fmax(measuredTileHeight + verticalSpacing, scale);
     const float centerX = pageWidth * 0.5f;
     const float centerY = pageHeight * 0.5f;
     const float diagonal = (float)hypot(pageWidth, pageHeight);
@@ -7025,23 +7019,11 @@ static bool processPageLevelTextWatermark(
 static void processFreeText(JNIEnv* env, jobject obj, FPDF_DOCUMENT doc, FPDF_PAGE page, FS_RECTF rect, jfieldID textPropsField, int r, int g, int b, int alpha, jclass jsonClass, jmethodID jsonInit) {
     jstring jJsonStr = GetBridgeDataPropertyJString(env, obj, textPropsField, jsonClass, jsonInit, "textProperties");
     if (!jJsonStr) {
-        LOGE("PDF_EDIT_NATIVE processFreeText skipped: missing textProperties page=%p", page);
         return;
     }
-    LOGE(
-            "PDF_EDIT_NATIVE processFreeText start page=%p rect=[%f,%f,%f,%f] pageObjectsBefore=%d jsonLen=%d",
-            page,
-            rect.left,
-            rect.top,
-            rect.right,
-            rect.bottom,
-            page ? FPDFPage_CountObjects(page) : -1,
-            env->GetStringLength(jJsonStr)
-    );
 
     jobject json = env->NewObject(jsonClass, jsonInit, jJsonStr);
     if (!json) {
-        LOGE("PDF_EDIT_NATIVE processFreeText failed: json parse returned null");
         env->DeleteLocalRef(jJsonStr);
         return;
     }
@@ -7102,7 +7084,6 @@ static void processFreeText(JNIEnv* env, jobject obj, FPDF_DOCUMENT doc, FPDF_PA
     const int textA = optIntValue("textColorA", defaultAlpha);
 
     if (!jText || env->GetStringLength(jText) == 0) {
-        LOGE("PDF_EDIT_NATIVE processFreeText skipped: empty text");
         if (jFont) env->DeleteLocalRef(jFont);
         if (jText) env->DeleteLocalRef(jText);
         if (jAlign) env->DeleteLocalRef(jAlign);
@@ -7121,21 +7102,6 @@ static void processFreeText(JNIEnv* env, jobject obj, FPDF_DOCUMENT doc, FPDF_PA
     const char* fontName = jFont ? env->GetStringUTFChars(jFont, nullptr) : nullptr;
     const char* alignStr = jAlign ? env->GetStringUTFChars(jAlign, nullptr) : "center";
     const char* fontPath = jFontPath ? env->GetStringUTFChars(jFontPath, nullptr) : nullptr;
-    LOGE(
-            "PDF_EDIT_NATIVE processFreeText props textLen=%d font=%s fontPath=%s size=%f box=%fx%f rotation=%f alpha=%d color=%d,%d,%d,%d",
-            textLength,
-            fontName ? fontName : "",
-            fontPath ? fontPath : "",
-            jsonSize,
-            jsonWidth,
-            jsonHeight,
-            rotation,
-            alpha,
-            textR,
-            textG,
-            textB,
-            textA
-    );
 
     float initialWidth = (jsonWidth > 0) ? (float)jsonWidth : fabs(rect.right - rect.left);
     float initialHeight = (jsonHeight > 0) ? (float)jsonHeight : fabs(rect.top - rect.bottom);
@@ -7166,9 +7132,6 @@ static void processFreeText(JNIEnv* env, jobject obj, FPDF_DOCUMENT doc, FPDF_PA
             fseek(f, 0, SEEK_END); long fSize = ftell(f); rewind(f);
             std::vector<uint8_t> buffer(fSize); fread(buffer.data(), 1, fSize, f); fclose(f);
             loadedFont = FPDFText_LoadFont(doc, buffer.data(), fSize, FPDF_FONT_TRUETYPE, true);
-            LOGE("PDF_EDIT_NATIVE processFreeText font load path success=%d bytes=%ld", loadedFont ? 1 : 0, fSize);
-        } else {
-            LOGE("PDF_EDIT_NATIVE processFreeText font path open failed path=%s", fontPath);
         }
     }
     if (!loadedFont) {
@@ -7181,7 +7144,6 @@ static void processFreeText(JNIEnv* env, jobject obj, FPDF_DOCUMENT doc, FPDF_PA
             }
         }
         loadedFont = FPDFText_LoadStandardFont(doc, fallbackFontName);
-        LOGE("PDF_EDIT_NATIVE processFreeText standard font fallback=%s success=%d", fallbackFontName, loadedFont ? 1 : 0);
     }
 
     FPDF_PAGEOBJECT textObj = FPDFPageObj_CreateTextObj(doc, loadedFont, 1.0f);
@@ -7218,17 +7180,6 @@ static void processFreeText(JNIEnv* env, jobject obj, FPDF_DOCUMENT doc, FPDF_PA
             FPDFTextObj_SetTextRenderMode(textObj, FPDF_TEXTRENDERMODE_FILL_STROKE);
         }
         FPDFPage_InsertObject(page, textObj);
-        LOGE(
-                "PDF_EDIT_NATIVE processFreeText inserted textObj pageObjectsNow=%d bounds=[%f,%f,%f,%f] scale=%f textWH=%fx%f",
-                page ? FPDFPage_CountObjects(page) : -1,
-                tL,
-                tB,
-                tR,
-                tT,
-                scale,
-                textW,
-                textH
-        );
 
         auto drawLine = [&](float baselineOffset) {
             float lineStartX = alignedLeft;
@@ -7245,11 +7196,8 @@ static void processFreeText(JNIEnv* env, jobject obj, FPDF_DOCUMENT doc, FPDF_PA
         };
         if (hasUnderline) drawLine(-0.15f);
         if (hasStrikeout) drawLine(0.30f);
-    } else {
-        LOGE("PDF_EDIT_NATIVE processFreeText failed: FPDFPageObj_CreateTextObj returned null loadedFont=%p", loadedFont);
     }
 
-    LOGE("PDF_EDIT_NATIVE processFreeText finish pageObjectsAfter=%d", page ? FPDFPage_CountObjects(page) : -1);
     if (rawTextContent) env->ReleaseStringChars(jText, rawTextContent);
     if (fontName) env->ReleaseStringUTFChars(jFont, fontName);
     if (jAlign && alignStr) env->ReleaseStringUTFChars(jAlign, alignStr);
@@ -12544,9 +12492,7 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeSavePdfEdit
                       FPDF_ANNOT_HIGHLIGHT;
 
         if (typeInt == 11) {
-            LOGE("PDF_EDIT_NATIVE nativeSavePdfEditObjects processFreeText index=%d page=%d beforeObjects=%d", i, pageIndex, FPDFPage_CountObjects(currentPage));
             processFreeText(env, obj, doc, currentPage, rect, dataPropsField, r, g, b, alpha, jsonClass, jsonInit);
-            LOGE("PDF_EDIT_NATIVE nativeSavePdfEditObjects processFreeText done index=%d page=%d afterObjects=%d", i, pageIndex, FPDFPage_CountObjects(currentPage));
             env->DeleteLocalRef(obj);
             continue;
         }
