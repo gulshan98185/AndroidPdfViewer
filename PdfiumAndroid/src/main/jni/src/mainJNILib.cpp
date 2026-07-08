@@ -1518,11 +1518,11 @@ static jstring BuildBridgeDataPropertiesJString(JNIEnv* env, jclass jsonClass, j
 static void processStickyNoteComment(JNIEnv* env, jobject obj, FPDF_ANNOTATION annot, jfieldID commentPropsField, int r, int g, int b, int alpha, jclass jsonClass, jmethodID jsonInit);
 static void processTextStamp(JNIEnv* env, jobject obj, FPDF_DOCUMENT doc, FPDF_PAGE page, FPDF_ANNOTATION annot, FS_RECTF rect, jfieldID textPropsField, int r, int g, int b, int alpha, jclass jsonClass, jmethodID jsonInit);
 static void processFreeText(JNIEnv* env, jobject obj, FPDF_DOCUMENT doc, FPDF_PAGE page, FS_RECTF rect, jfieldID textPropsField, int r, int g, int b, int alpha, jclass jsonClass, jmethodID jsonInit);
-static bool processStickerStamp(JNIEnv* env, FPDF_DOCUMENT doc, FPDF_ANNOTATION annot, FS_RECTF rect, jobject json, jstring jJsonStr, jmethodID optS, jmethodID optD, jmethodID optI, jmethodID optB, int r, int g, int b, int alpha);
-static bool processSvgPathStamp(JNIEnv* env, FPDF_ANNOTATION annot, FS_RECTF rect, jobject json, jstring jJsonStr, jmethodID optS, jmethodID optD, jmethodID optI, jmethodID optB, int r, int g, int b, int alpha);
-static bool processImageOrPresetStamp(JNIEnv* env, jobject obj, FPDF_DOCUMENT doc, FPDF_PAGE page, FPDF_ANNOTATION annot, FS_RECTF rect, jfieldID imagePropsField, jclass jsonClass, jmethodID jsonInit);
+static bool processStickerStamp(JNIEnv* env, FPDF_DOCUMENT doc, FPDF_PAGE page, FPDF_ANNOTATION annot, FS_RECTF rect, jobject json, jstring jJsonStr, jmethodID optS, jmethodID optD, jmethodID optI, jmethodID optB, int r, int g, int b, int alpha, bool saveAsPageContent = false);
+static bool processSvgPathStamp(JNIEnv* env, FPDF_PAGE page, FPDF_ANNOTATION annot, FS_RECTF rect, jobject json, jstring jJsonStr, jmethodID optS, jmethodID optD, jmethodID optI, jmethodID optB, int r, int g, int b, int alpha, bool saveAsPageContent = false);
+static bool processImageOrPresetStamp(JNIEnv* env, jobject obj, FPDF_DOCUMENT doc, FPDF_PAGE page, FPDF_ANNOTATION annot, FS_RECTF rect, jfieldID imagePropsField, jclass jsonClass, jmethodID jsonInit, bool saveAsPageContent = false);
 static bool isSimplePdfStampBridgeAnnotation(JNIEnv* env, jobject obj, jfieldID dataPropsField, jclass jsonClass, jmethodID jsonInit);
-static bool processSimplePdfStamp(JNIEnv* env, jobject obj, FPDF_DOCUMENT doc, FPDF_PAGE page, FPDF_ANNOTATION annot, FS_RECTF rect, int typeInt, jfieldID dataPropsField, int r, int g, int b, int alpha, jclass jsonClass, jmethodID jsonInit);
+static bool processSimplePdfStamp(JNIEnv* env, jobject obj, FPDF_DOCUMENT doc, FPDF_PAGE page, FPDF_ANNOTATION annot, FS_RECTF rect, int typeInt, jfieldID dataPropsField, int r, int g, int b, int alpha, jclass jsonClass, jmethodID jsonInit, bool saveAsPageContent = false);
 static bool processPageLevelTextWatermark(JNIEnv* env, jobject obj, FPDF_DOCUMENT doc, FPDF_PAGE page, jfieldID dataPropsField, jclass jsonClass, jmethodID jsonInit);
 struct RawPdfWatermarkSpec;
 static bool CollectPageLevelTextWatermarkPatternSpec(JNIEnv* env, jobject obj, jfieldID dataPropsField, jclass jsonClass, jmethodID jsonInit, RawPdfWatermarkSpec* outSpec);
@@ -1559,7 +1559,8 @@ static std::string ResolvePageLevelWatermarkFontPath(const char* requestedPath, 
 }
 
 static bool processPdfShape(JNIEnv* env, jobject obj, FPDF_ANNOTATION annot, FS_RECTF rect, int typeInt, jfieldID shapePropsField, int r, int g, int b, int alpha, jclass jsonClass, jmethodID jsonInit);
-static void processFreeHand(JNIEnv* env, jobject obj, FPDF_PAGE page, jfieldID fhDrawingProperties, int r, int g, int b, jclass jsonClass, jmethodID jsonInit);
+static bool processPdfShapeContent(JNIEnv* env, jobject obj, FPDF_PAGE page, FS_RECTF rect, int typeInt, jfieldID shapePropsField, int r, int g, int b, int alpha, jclass jsonClass, jmethodID jsonInit);
+static void processFreeHand(JNIEnv* env, jobject obj, FPDF_PAGE page, jfieldID fhDrawingProperties, int r, int g, int b, jclass jsonClass, jmethodID jsonInit, bool saveAsPageContent = false);
 
 // helper for sticky note (to tell the native the name of the icon we want to set on the icon on note instead of default)
 static void SetAnnotWideStringValueFromJString(
@@ -2106,6 +2107,220 @@ static bool AppendPdfShapeAppearanceObject(
     }
     FPDFAnnot_UpdateObject(annot, path);
     return true;
+}
+
+static bool InsertPdfShapeContentPath(
+        FPDF_PAGE page,
+        FPDF_PAGEOBJECT path,
+        bool allowFill,
+        int strokeR,
+        int strokeG,
+        int strokeB,
+        int strokeA,
+        int fillR,
+        int fillG,
+        int fillB,
+        int fillA,
+        float strokeWidth
+) {
+    if (!page || !path) {
+        if (path) FPDFPageObj_Destroy(path);
+        return false;
+    }
+
+    const float effectiveStrokeWidth = fmax(strokeWidth, 0.0f);
+    const bool shouldStroke = strokeA > 0 && effectiveStrokeWidth > 0.0f;
+    const bool shouldFill = allowFill && fillA > 0;
+    if (!shouldStroke && !shouldFill) {
+        FPDFPageObj_Destroy(path);
+        return false;
+    }
+
+    FPDFPageObj_SetStrokeWidth(path, effectiveStrokeWidth);
+    FPDFPageObj_SetLineJoin(path, FPDF_LINEJOIN_ROUND);
+    FPDFPageObj_SetLineCap(path, FPDF_LINECAP_ROUND);
+    FPDFPageObj_SetStrokeColor(path, strokeR, strokeG, strokeB, strokeA);
+    FPDFPageObj_SetFillColor(path, fillR, fillG, fillB, fillA);
+    FPDFPath_SetDrawMode(path, shouldFill ? 1 : 0, shouldStroke ? 1 : 0);
+    FPDFPage_InsertObject(page, path);
+    return true;
+}
+
+static FPDF_PAGEOBJECT CreatePdfShapeContentPath(
+        int typeInt,
+        const FS_RECTF& baseRect,
+        float rotationDegrees,
+        float cornerRadius,
+        const std::vector<PdfShapePoint>& customPoints,
+        std::vector<PdfShapePoint>* linePointsOut
+) {
+    const float left = fmin(baseRect.left, baseRect.right);
+    const float right = fmax(baseRect.left, baseRect.right);
+    const float bottom = fmin(baseRect.bottom, baseRect.top);
+    const float top = fmax(baseRect.bottom, baseRect.top);
+    const float width = right - left;
+    const float height = top - bottom;
+    if (width <= 0.1f || height <= 0.1f) return nullptr;
+
+    FPDF_PAGEOBJECT path = nullptr;
+    auto appendPoint = [&](PdfShapePoint point, bool first) {
+        if (first) {
+            path = FPDFPageObj_CreateNewPath(point.x, point.y);
+        } else if (path) {
+            FPDFPath_LineTo(path, point.x, point.y);
+        }
+    };
+
+    const bool hasCustomVertexPoints =
+            customPoints.size() >= 2 && (typeInt == 15 || typeInt == 16);
+    const bool hasCustomLinePoints =
+            customPoints.size() >= 2 && (typeInt == 17 || typeInt == 18);
+
+    if (hasCustomVertexPoints) {
+        for (size_t index = 0; index < customPoints.size(); index++) {
+            appendPoint(customPoints[index], index == 0);
+        }
+        if (typeInt == 15 && path) FPDFPath_Close(path);
+        if (linePointsOut) *linePointsOut = customPoints;
+        return path;
+    }
+
+    if (typeInt == 17 || typeInt == 18) {
+        const PdfShapePoint start = hasCustomLinePoints
+                ? customPoints[0]
+                : PdfShapePointFromFraction(baseRect, 0.08f, 0.50f, rotationDegrees);
+        const PdfShapePoint end = hasCustomLinePoints
+                ? customPoints[1]
+                : PdfShapePointFromFraction(baseRect, 0.92f, 0.50f, rotationDegrees);
+        appendPoint(start, true);
+        appendPoint(end, false);
+        if (linePointsOut) {
+            linePointsOut->clear();
+            linePointsOut->push_back(start);
+            linePointsOut->push_back(end);
+        }
+        return path;
+    }
+
+    if (typeInt == 16) {
+        std::vector<PdfShapePoint> points{
+                PdfShapePointFromFraction(baseRect, 0.05f, 0.80f, rotationDegrees),
+                PdfShapePointFromFraction(baseRect, 0.35f, 0.20f, rotationDegrees),
+                PdfShapePointFromFraction(baseRect, 0.65f, 0.65f, rotationDegrees),
+                PdfShapePointFromFraction(baseRect, 0.95f, 0.10f, rotationDegrees)
+        };
+        for (size_t index = 0; index < points.size(); index++) {
+            appendPoint(points[index], index == 0);
+        }
+        if (linePointsOut) *linePointsOut = points;
+        return path;
+    }
+
+    if (typeInt == 15) {
+        std::vector<PdfShapePoint> points{
+                PdfShapePointFromFraction(baseRect, 0.50f, 0.00f, rotationDegrees),
+                PdfShapePointFromFraction(baseRect, 1.00f, 0.38f, rotationDegrees),
+                PdfShapePointFromFraction(baseRect, 0.82f, 1.00f, rotationDegrees),
+                PdfShapePointFromFraction(baseRect, 0.18f, 1.00f, rotationDegrees),
+                PdfShapePointFromFraction(baseRect, 0.00f, 0.38f, rotationDegrees)
+        };
+        for (size_t index = 0; index < points.size(); index++) {
+            appendPoint(points[index], index == 0);
+        }
+        if (path) FPDFPath_Close(path);
+        return path;
+    }
+
+    if (typeInt == 14) {
+        const int segmentCount = 32;
+        for (int index = 0; index < segmentCount; index++) {
+            const double angle = (2.0 * M_PI * index) / segmentCount;
+            const float fx = 0.5f + static_cast<float>(cos(angle) * 0.5);
+            const float fy = 0.5f - static_cast<float>(sin(angle) * 0.5);
+            appendPoint(PdfShapePointFromFraction(baseRect, fx, fy, rotationDegrees), index == 0);
+        }
+        if (path) FPDFPath_Close(path);
+        return path;
+    }
+
+    if (typeInt == 12 && cornerRadius > 0.0f) {
+        const float radius = fmax(0.0f, fmin(cornerRadius, fmin(width * 0.5f, height * 0.5f)));
+        const float control = radius * 0.5522847498f;
+        const float centerX = (left + right) * 0.5f;
+        const float centerY = (bottom + top) * 0.5f;
+        auto rotatePoint = [&](float x, float y) -> PdfShapePoint {
+            return RotatePdfShapePoint(PdfShapePoint{x, y}, centerX, centerY, rotationDegrees);
+        };
+        const PdfShapePoint start = rotatePoint(left + radius, top);
+        path = FPDFPageObj_CreateNewPath(start.x, start.y);
+        if (!path) return nullptr;
+        auto lineTo = [&](float x, float y) {
+            const PdfShapePoint p = rotatePoint(x, y);
+            FPDFPath_LineTo(path, p.x, p.y);
+        };
+        auto bezierTo = [&](float c1x, float c1y, float c2x, float c2y, float ex, float ey) {
+            const PdfShapePoint c1 = rotatePoint(c1x, c1y);
+            const PdfShapePoint c2 = rotatePoint(c2x, c2y);
+            const PdfShapePoint end = rotatePoint(ex, ey);
+            FPDFPath_BezierTo(path, c1.x, c1.y, c2.x, c2.y, end.x, end.y);
+        };
+        lineTo(right - radius, top);
+        bezierTo(right - radius + control, top, right, top - radius + control, right, top - radius);
+        lineTo(right, bottom + radius);
+        bezierTo(right, bottom + radius - control, right - radius + control, bottom, right - radius, bottom);
+        lineTo(left + radius, bottom);
+        bezierTo(left + radius - control, bottom, left, bottom + radius - control, left, bottom + radius);
+        lineTo(left, top - radius);
+        bezierTo(left, top - radius + control, left + radius - control, top, left + radius, top);
+        FPDFPath_Close(path);
+        return path;
+    }
+
+    appendPoint(PdfShapePointFromFraction(baseRect, 0.00f, 0.00f, rotationDegrees), true);
+    appendPoint(PdfShapePointFromFraction(baseRect, 1.00f, 0.00f, rotationDegrees), false);
+    appendPoint(PdfShapePointFromFraction(baseRect, 1.00f, 1.00f, rotationDegrees), false);
+    appendPoint(PdfShapePointFromFraction(baseRect, 0.00f, 1.00f, rotationDegrees), false);
+    if (path) FPDFPath_Close(path);
+    return path;
+}
+
+static bool InsertPdfShapeArrowHeadContent(
+        FPDF_PAGE page,
+        PdfShapePoint from,
+        PdfShapePoint to,
+        int strokeR,
+        int strokeG,
+        int strokeB,
+        int strokeA,
+        float strokeWidth
+) {
+    const float effectiveStrokeWidth = fmax(strokeWidth, 0.0f);
+    if (!page || strokeA <= 0 || effectiveStrokeWidth <= 0.0f) return false;
+
+    const float lineLength = hypotf(to.x - from.x, to.y - from.y);
+    const float headLength = ResolvePdfArrowHeadLength(effectiveStrokeWidth, lineLength);
+    const float headHalfHeight = fmax(headLength * 0.36f, effectiveStrokeWidth * 1.2f);
+    const PdfShapePoint first = OffsetPdfShapePointFromLineEnd(from, to, headLength, headHalfHeight);
+    const PdfShapePoint second = OffsetPdfShapePointFromLineEnd(from, to, headLength, -headHalfHeight);
+    FPDF_PAGEOBJECT arrowPath = FPDFPageObj_CreateNewPath(to.x, to.y);
+    if (!arrowPath) return false;
+    FPDFPath_LineTo(arrowPath, first.x, first.y);
+    FPDFPath_LineTo(arrowPath, second.x, second.y);
+    FPDFPath_Close(arrowPath);
+    return InsertPdfShapeContentPath(
+            page,
+            arrowPath,
+            true,
+            strokeR,
+            strokeG,
+            strokeB,
+            strokeA,
+            strokeR,
+            strokeG,
+            strokeB,
+            strokeA,
+            effectiveStrokeWidth
+    );
 }
 
 static std::string BuildPdfShapeAppearanceStreamAscii(
@@ -2774,6 +2989,8 @@ struct RawPdfWatermarkSpec {
     std::string fontPath;
     float pageWidth = 0.0f;
     float pageHeight = 0.0f;
+    float pageLeft = 0.0f;
+    float pageBottom = 0.0f;
     float fontSize = 0.0f;
     float patternWidth = 0.0f;
     float patternHeight = 0.0f;
@@ -3461,6 +3678,8 @@ static bool ParsePdfObjectHeaderLine(const std::string& line, int* objectNumber,
     return true;
 }
 
+static size_t FindPdfObjectEndToken(const std::string& data, size_t searchPos);
+
 static std::vector<PdfObjectInfo> ScanPdfObjects(const std::string& data) {
     std::vector<PdfObjectInfo> objects;
     size_t searchPos = 0;
@@ -3478,7 +3697,7 @@ static std::vector<PdfObjectInfo> ScanPdfObjects(const std::string& data) {
             searchPos = objPos + 4;
             continue;
         }
-        const size_t endObj = data.find("endobj", lineEnd);
+        const size_t endObj = FindPdfObjectEndToken(data, lineEnd);
         if (endObj == std::string::npos) break;
         const size_t bodyStart = lineEnd + 1;
         PdfObjectInfo info;
@@ -3495,6 +3714,28 @@ static std::vector<PdfObjectInfo> ScanPdfObjects(const std::string& data) {
 
 static std::string PdfObjectRefKey(int objectNumber, int generation) {
     return std::to_string(objectNumber) + ":" + std::to_string(generation);
+}
+
+static bool IsPdfKeywordBoundary(const std::string& data, size_t pos, size_t length) {
+    const size_t after = pos + length;
+    const bool beforeOk = pos == 0 ||
+                          std::isspace(static_cast<unsigned char>(data[pos - 1])) ||
+                          IsPdfNameDelimiter(data[pos - 1]);
+    const bool afterOk = after >= data.size() ||
+                         std::isspace(static_cast<unsigned char>(data[after])) ||
+                         IsPdfNameDelimiter(data[after]);
+    return beforeOk && afterOk;
+}
+
+static size_t FindPdfObjectEndToken(const std::string& data, size_t searchPos) {
+    size_t endObj = data.find("endobj", searchPos);
+    while (endObj != std::string::npos) {
+        if (IsPdfKeywordBoundary(data, endObj, strlen("endobj"))) {
+            return endObj;
+        }
+        endObj = data.find("endobj", endObj + strlen("endobj"));
+    }
+    return std::string::npos;
 }
 
 static bool IsPdfPageObject(const PdfObjectInfo& object);
@@ -3852,6 +4093,14 @@ static bool PdfFileHasEditContentMarker(const char* inputPath) {
            data.find(kPdfEditContentMarker) != std::string::npos;
 }
 
+static bool PdfFileHasToolkitTextStampOrCommentMarker(const char* inputPath) {
+    if (!inputPath) return false;
+    std::string data;
+    return ReadFileToString(inputPath, &data) &&
+           (data.find("/LufickTextStampMeta") != std::string::npos ||
+            data.find("/LufickCommentMeta") != std::string::npos);
+}
+
 static bool AppendPdfEditContentMarker(const char* outputPath) {
     if (!outputPath) return false;
     std::string data;
@@ -4122,10 +4371,13 @@ static std::string BuildPdfWatermarkContentStream(
         const std::string& patternName
 ) {
     std::ostringstream stream;
+    const float pageLeft = spec.pageLeft;
+    const float pageBottom = spec.pageBottom;
     stream << "q\n"
            << "/Pattern cs\n"
            << "/" << patternName << " scn\n"
-           << "0 0 " << FormatPdfFloat(spec.pageWidth) << ' ' << FormatPdfFloat(spec.pageHeight)
+           << FormatPdfFloat(pageLeft) << ' ' << FormatPdfFloat(pageBottom) << ' '
+           << FormatPdfFloat(spec.pageWidth) << ' ' << FormatPdfFloat(spec.pageHeight)
            << " re f\n"
            << "Q";
     return stream.str();
@@ -6316,10 +6568,12 @@ static bool CollectPageLevelTextWatermarkPatternSpec(
     spec.pageIndex = optIntValue("pdfPageIndex", optIntValue("sourcePageIndex", -1));
     spec.pageWidth = fmax((float)optDoubleValue("pageWidth", 0.0), 0.0f);
     spec.pageHeight = fmax((float)optDoubleValue("pageHeight", 0.0), 0.0f);
+    spec.pageLeft = (float)optDoubleValue("pageLeft", 0.0);
+    spec.pageBottom = (float)optDoubleValue("pageBottom", 0.0);
     const float centerNormX = fmax(0.0f, fmin((float)optDoubleValue("centerNormX", 0.5), 1.0f));
     const float centerNormY = fmax(0.0f, fmin((float)optDoubleValue("centerNormY", 0.5), 1.0f));
-    spec.centerX = spec.pageWidth * centerNormX;
-    spec.centerY = spec.pageHeight * (1.0f - centerNormY);
+    spec.centerX = spec.pageLeft + (spec.pageWidth * centerNormX);
+    spec.centerY = spec.pageBottom + (spec.pageHeight * (1.0f - centerNormY));
     spec.isRepeated = isRepeatedMode;
     spec.isRasterImage = isRasterImageWatermark;
     spec.imagePixelWidth = std::max(0, optIntValue("imagePixelWidth", 0));
@@ -7013,6 +7267,80 @@ static bool processPageLevelTextWatermark(
     env->DeleteLocalRef(json);
     env->DeleteLocalRef(jJsonStr);
     return false;
+}
+
+static bool SaveToolkitTextWatermarksWithPdfium(
+        JNIEnv* env,
+        const char* inputPath,
+        const char* outputPath,
+        jobjectArray watermarksArray,
+        jfieldID dataPropsField,
+        jclass jsonClass,
+        jmethodID jsonInit
+) {
+    if (!inputPath || !outputPath || !watermarksArray) return false;
+
+    FPDF_DOCUMENT doc = FPDF_LoadDocument(inputPath, nullptr);
+    if (!doc) return false;
+
+    const int watermarkCount = env->GetArrayLength(watermarksArray);
+    bool appliedAny = false;
+    bool failed = false;
+
+    for (int i = 0; i < watermarkCount; i++) {
+        jobject obj = env->GetObjectArrayElement(watermarksArray, i);
+        if (!obj) continue;
+
+        RawPdfWatermarkSpec spec;
+        if (!CollectPageLevelTextWatermarkPatternSpec(env, obj, dataPropsField, jsonClass, jsonInit, &spec)) {
+            env->DeleteLocalRef(obj);
+            failed = true;
+            break;
+        }
+        if (spec.pageIndex < 0 || spec.pageIndex >= FPDF_GetPageCount(doc)) {
+            env->DeleteLocalRef(obj);
+            failed = true;
+            break;
+        }
+
+        FPDF_PAGE page = FPDF_LoadPage(doc, spec.pageIndex);
+        if (!page) {
+            env->DeleteLocalRef(obj);
+            failed = true;
+            break;
+        }
+
+        const bool applied = processPageLevelTextWatermark(
+                env,
+                obj,
+                doc,
+                page,
+                dataPropsField,
+                jsonClass,
+                jsonInit
+        );
+        if (applied) {
+            FPDFPage_GenerateContent(page);
+            appliedAny = true;
+        } else {
+            failed = true;
+        }
+        FPDF_ClosePage(page);
+        env->DeleteLocalRef(obj);
+
+        if (failed) break;
+    }
+
+    int success = JNI_FALSE;
+    if (appliedAny && !failed) {
+        FILE* file = fopen(outputPath, "wb");
+        PdfFileWriter writer{ {1, WriteBlock}, file };
+        success = (file) ? FPDF_SaveAsCopy(doc, (FPDF_FILEWRITE*)&writer, FPDF_NO_INCREMENTAL) : JNI_FALSE;
+        if (file) fclose(file);
+    }
+
+    FPDF_CloseDocument(doc);
+    return success == JNI_TRUE;
 }
 
 // --- HELPER 2B: EDIT PANEL ADD TEXT CONTENT LOGIC ---
@@ -8523,6 +8851,7 @@ static bool AppendPageLevelTextWatermarkGlyphPaths(
 
 static bool processSvgPathStamp(
         JNIEnv* env,
+        FPDF_PAGE page,
         FPDF_ANNOTATION annot,
         FS_RECTF rect,
         jobject json,
@@ -8534,9 +8863,13 @@ static bool processSvgPathStamp(
         int r,
         int g,
         int b,
-        int alpha
+        int alpha,
+        bool saveAsPageContent
 ) {
-    if (!env || !annot || !json || !jJsonStr || !optS || !optD || !optI || !optB) {
+    if (!env || !json || !jJsonStr || !optS || !optD || !optI || !optB) {
+        return false;
+    }
+    if (saveAsPageContent ? !page : !annot) {
         return false;
     }
 
@@ -8977,6 +9310,11 @@ static bool processSvgPathStamp(
     FPDFPageObj_SetFillColor(parser.path, iconR, iconG, iconB, iconA);
     FPDFPath_SetDrawMode(parser.path, FPDF_FILLMODE_ALTERNATE, JNI_FALSE);
     FPDFPageObj_Transform(parser.path, matrixA, matrixB, matrixC, matrixD, matrixE, matrixF);
+    if (saveAsPageContent) {
+        FPDFPage_InsertObject(page, parser.path);
+        return true;
+    }
+
     FPDFAnnot_SetRect(annot, &rect);
     FPDFAnnot_SetColor(annot, FPDFANNOT_COLORTYPE_Color, iconR, iconG, iconB, iconA);
     FPDFAnnot_SetBorder(annot, 0, 0, 0);
@@ -8997,6 +9335,7 @@ static bool processSvgPathStamp(
 static bool processStickerStamp(
         JNIEnv* env,
         FPDF_DOCUMENT doc,
+        FPDF_PAGE page,
         FPDF_ANNOTATION annot,
         FS_RECTF rect,
         jobject json,
@@ -9008,9 +9347,13 @@ static bool processStickerStamp(
         int r,
         int g,
         int b,
-        int alpha
+        int alpha,
+        bool saveAsPageContent
 ) {
-    if (!env || !doc || !annot || !json || !jJsonStr || !optS || !optD || !optI || !optB) {
+    if (!env || !doc || !json || !jJsonStr || !optS || !optD || !optI || !optB) {
+        return false;
+    }
+    if (saveAsPageContent ? !page : !annot) {
         return false;
     }
 
@@ -9174,6 +9517,11 @@ static bool processStickerStamp(
     const double matrixF = centerY - ((flippedGlyphCenterX * sinA) + (flippedGlyphCenterY * cosA));
 
     FPDFPageObj_Transform(pathObj, matrixA, matrixB, matrixC, matrixD, matrixE, matrixF);
+    if (saveAsPageContent) {
+        FPDFPage_InsertObject(page, pathObj);
+        return true;
+    }
+
     FPDFAnnot_SetRect(annot, &rect);
     FPDFAnnot_SetColor(annot, FPDFANNOT_COLORTYPE_Color, iconR, iconG, iconB, iconA);
     FPDFAnnot_SetBorder(annot, 0, 0, 0);
@@ -9200,7 +9548,8 @@ static bool processImageOrPresetStamp(
         FS_RECTF rect,
         jfieldID imagePropsField,
         jclass jsonClass,
-        jmethodID jsonInit
+        jmethodID jsonInit,
+        bool saveAsPageContent
 ) {
     jstring jJsonStr = GetBridgeDataPropertyJString(env, obj, imagePropsField, jsonClass, jsonInit, "imageProperties");
     if (!jJsonStr) return false;
@@ -9266,6 +9615,7 @@ static bool processImageOrPresetStamp(
         normalizedStampKind == "shape_element_svg") {
         const bool savedSvgPath = processSvgPathStamp(
                 env,
+                page,
                 annot,
                 rect,
                 json,
@@ -9277,7 +9627,8 @@ static bool processImageOrPresetStamp(
                 0,
                 0,
                 0,
-                255
+                255,
+                saveAsPageContent
         );
         releaseJsonStrings();
         if (jSignatureSubtype) env->DeleteLocalRef(jSignatureSubtype);
@@ -9291,6 +9642,7 @@ static bool processImageOrPresetStamp(
         const bool savedSticker = processStickerStamp(
                 env,
                 doc,
+                page,
                 annot,
                 rect,
                 json,
@@ -9302,7 +9654,8 @@ static bool processImageOrPresetStamp(
                 0,
                 0,
                 0,
-                255
+                255,
+                saveAsPageContent
         );
         releaseJsonStrings();
         if (jSignatureSubtype) env->DeleteLocalRef(jSignatureSubtype);
@@ -9394,6 +9747,22 @@ static bool processImageOrPresetStamp(
     const double f = centerY - ((b + d) / 2.0);
 
     FPDFImageObj_SetMatrix(imageObj, a, b, c, d, e, f);
+    if (saveAsPageContent) {
+        FPDFPage_InsertObject(page, imageObj);
+        if (jSignatureSubtype) env->DeleteLocalRef(jSignatureSubtype);
+        env->DeleteLocalRef(json);
+        env->DeleteLocalRef(jJsonStr);
+        return true;
+    }
+
+    if (!annot) {
+        FPDFPageObj_Destroy(imageObj);
+        if (jSignatureSubtype) env->DeleteLocalRef(jSignatureSubtype);
+        env->DeleteLocalRef(json);
+        env->DeleteLocalRef(jJsonStr);
+        return false;
+    }
+
     if (!FPDFAnnot_AppendObject(annot, imageObj)) {
         FPDFPageObj_Destroy(imageObj);
         if (jSignatureSubtype) env->DeleteLocalRef(jSignatureSubtype);
@@ -9616,6 +9985,138 @@ static bool processPdfShape(
     return true;
 }
 
+static bool processPdfShapeContent(
+        JNIEnv* env,
+        jobject obj,
+        FPDF_PAGE page,
+        FS_RECTF rect,
+        int typeInt,
+        jfieldID shapePropsField,
+        int r,
+        int g,
+        int b,
+        int alpha,
+        jclass jsonClass,
+        jmethodID jsonInit
+) {
+    if (!page || !IsPdfShapeNativeType(typeInt)) return false;
+
+    jstring jJsonStr = shapePropsField
+            ? GetBridgeDataPropertyJString(env, obj, shapePropsField, jsonClass, jsonInit, "shapeProperties")
+            : nullptr;
+    jobject json = jJsonStr ? env->NewObject(jsonClass, jsonInit, jJsonStr) : nullptr;
+
+    jmethodID optD = env->GetMethodID(jsonClass, "optDouble", "(Ljava/lang/String;D)D");
+    jmethodID optI = env->GetMethodID(jsonClass, "optInt", "(Ljava/lang/String;I)I");
+    jmethodID optB = env->GetMethodID(jsonClass, "optBoolean", "(Ljava/lang/String;Z)Z");
+
+    auto optDoubleValue = [&](const char* key, double fallback) -> double {
+        if (!json || !optD) return fallback;
+        jstring jKey = env->NewStringUTF(key);
+        const double value = env->CallDoubleMethod(json, optD, jKey, fallback);
+        env->DeleteLocalRef(jKey);
+        return value;
+    };
+
+    auto optIntValue = [&](const char* key, int fallback) -> int {
+        if (!json || !optI) return fallback;
+        jstring jKey = env->NewStringUTF(key);
+        const int value = env->CallIntMethod(json, optI, jKey, fallback);
+        env->DeleteLocalRef(jKey);
+        return value;
+    };
+
+    FS_RECTF baseRect;
+    baseRect.left = static_cast<float>(optDoubleValue("baseLeft", rect.left));
+    baseRect.top = static_cast<float>(optDoubleValue("baseTop", rect.top));
+    baseRect.right = static_cast<float>(optDoubleValue("baseRight", rect.right));
+    baseRect.bottom = static_cast<float>(optDoubleValue("baseBottom", rect.bottom));
+
+    const float rotation = static_cast<float>(optDoubleValue("rotation", 0.0));
+    const float strokeWidth = static_cast<float>(optDoubleValue("strokeWidth", 1.0));
+    const float cornerRadius = static_cast<float>(optDoubleValue("cornerRadius", 0.0));
+    const float dashWidth = static_cast<float>(optDoubleValue("dashWidth", 0.0));
+    const float dashGap = static_cast<float>(optDoubleValue("dashGap", 0.0));
+    (void)dashWidth;
+    (void)dashGap;
+    const int strokeR = optIntValue("strokeR", r);
+    const int strokeG = optIntValue("strokeG", g);
+    const int strokeB = optIntValue("strokeB", b);
+    const int strokeA = std::max(0, std::min(optIntValue("strokeA", alpha), 255));
+    const int fillR = optIntValue("fillR", 0);
+    const int fillG = optIntValue("fillG", 0);
+    const int fillB = optIntValue("fillB", 0);
+    const int requestedFillA = std::max(0, std::min(optIntValue("fillA", 0), 255));
+    const int fillA = requestedFillA > 0 ? strokeA : 0;
+    bool arrowStart = false;
+    bool arrowEnd = typeInt == 18;
+    if (json && optB) {
+        jstring arrowStartKey = env->NewStringUTF("arrowStart");
+        jstring arrowEndKey = env->NewStringUTF("arrowEnd");
+        arrowStart = env->CallBooleanMethod(json, optB, arrowStartKey, false);
+        arrowEnd = env->CallBooleanMethod(json, optB, arrowEndKey, typeInt == 18);
+        env->DeleteLocalRef(arrowStartKey);
+        env->DeleteLocalRef(arrowEndKey);
+    }
+    const std::vector<PdfShapePoint> customPoints = ReadPdfShapePointsFromJson(env, json, jsonClass);
+
+    std::vector<PdfShapePoint> linePoints;
+    FPDF_PAGEOBJECT shapePath = CreatePdfShapeContentPath(
+            typeInt,
+            baseRect,
+            rotation,
+            cornerRadius,
+            customPoints,
+            &linePoints
+    );
+    const bool allowFill = typeInt != 16 && typeInt != 17 && typeInt != 18;
+    bool inserted = InsertPdfShapeContentPath(
+            page,
+            shapePath,
+            allowFill,
+            strokeR,
+            strokeG,
+            strokeB,
+            strokeA,
+            fillR,
+            fillG,
+            fillB,
+            fillA,
+            strokeWidth
+    );
+
+    if (inserted && (typeInt == 16 || typeInt == 17 || typeInt == 18) && linePoints.size() >= 2) {
+        if (arrowStart) {
+            inserted = InsertPdfShapeArrowHeadContent(
+                    page,
+                    linePoints[1],
+                    linePoints[0],
+                    strokeR,
+                    strokeG,
+                    strokeB,
+                    strokeA,
+                    strokeWidth
+            ) || inserted;
+        }
+        if (arrowEnd) {
+            inserted = InsertPdfShapeArrowHeadContent(
+                    page,
+                    linePoints[linePoints.size() - 2],
+                    linePoints.back(),
+                    strokeR,
+                    strokeG,
+                    strokeB,
+                    strokeA,
+                    strokeWidth
+            ) || inserted;
+        }
+    }
+
+    if (json) env->DeleteLocalRef(json);
+    if (jJsonStr) env->DeleteLocalRef(jJsonStr);
+    return inserted;
+}
+
 static bool jsonStringContainsSimplePdfStamp(JNIEnv* env, jstring jsonString) {
     if (!jsonString) return false;
     const char* rawJson = env->GetStringUTFChars(jsonString, nullptr);
@@ -9650,11 +10151,14 @@ static bool isSimplePdfStampBridgeAnnotation(
 
 static bool appendSimplePdfStampShapeObject(
         JNIEnv* env,
+        FPDF_PAGE page,
         FPDF_ANNOTATION annot,
         jobject shapeJson,
-        jclass jsonClass
+        jclass jsonClass,
+        bool saveAsPageContent = false
 ) {
-    if (!annot || !shapeJson) return false;
+    if (!shapeJson) return false;
+    if (saveAsPageContent ? !page : !annot) return false;
 
     jmethodID optD = env->GetMethodID(jsonClass, "optDouble", "(Ljava/lang/String;D)D");
     jmethodID optI = env->GetMethodID(jsonClass, "optInt", "(Ljava/lang/String;I)I");
@@ -9693,19 +10197,55 @@ static bool appendSimplePdfStampShapeObject(
     const float dashWidth = static_cast<float>(optDoubleValue("dashWidth", 0.0));
     const float dashGap = static_cast<float>(optDoubleValue("dashGap", 0.0));
 
+    const int strokeR = optIntValue("strokeR", 0);
+    const int strokeG = optIntValue("strokeG", 0);
+    const int strokeB = optIntValue("strokeB", 0);
+    const int strokeA = std::max(0, std::min(optIntValue("strokeA", 255), 255));
+    const int fillR = optIntValue("fillR", 0);
+    const int fillG = optIntValue("fillG", 0);
+    const int fillB = optIntValue("fillB", 0);
+    const int fillA = std::max(0, std::min(optIntValue("fillA", 0), 255));
+
+    if (saveAsPageContent) {
+        std::vector<PdfShapePoint> linePoints;
+        FPDF_PAGEOBJECT path = CreatePdfShapeContentPath(
+                typeInt,
+                baseRect,
+                rotation,
+                cornerRadius,
+                std::vector<PdfShapePoint>(),
+                &linePoints
+        );
+        const bool allowFill = typeInt != 16 && typeInt != 17 && typeInt != 18;
+        return InsertPdfShapeContentPath(
+                page,
+                path,
+                allowFill,
+                strokeR,
+                strokeG,
+                strokeB,
+                strokeA,
+                fillR,
+                fillG,
+                fillB,
+                fillA,
+                strokeWidth
+        );
+    }
+
     return AppendPdfShapeAppearanceObject(
             annot,
             typeInt,
             baseRect,
             rotation,
-            optIntValue("strokeR", 0),
-            optIntValue("strokeG", 0),
-            optIntValue("strokeB", 0),
-            std::max(0, std::min(optIntValue("strokeA", 255), 255)),
-            optIntValue("fillR", 0),
-            optIntValue("fillG", 0),
-            optIntValue("fillB", 0),
-            std::max(0, std::min(optIntValue("fillA", 0), 255)),
+            strokeR,
+            strokeG,
+            strokeB,
+            strokeA,
+            fillR,
+            fillG,
+            fillB,
+            fillA,
             strokeWidth,
             cornerRadius,
             dashWidth,
@@ -9716,6 +10256,7 @@ static bool appendSimplePdfStampShapeObject(
 static bool appendSimplePdfStampTextObject(
         JNIEnv* env,
         FPDF_DOCUMENT doc,
+        FPDF_PAGE page,
         FPDF_ANNOTATION annot,
         FS_RECTF rect,
         jobject textJson,
@@ -9723,9 +10264,11 @@ static bool appendSimplePdfStampTextObject(
         int r,
         int g,
         int b,
-        int alpha
+        int alpha,
+        bool saveAsPageContent = false
 ) {
-    if (!doc || !annot || !textJson) return false;
+    if (!doc || !textJson) return false;
+    if (saveAsPageContent ? !page : !annot) return false;
 
     jmethodID optS = env->GetMethodID(jsonClass, "optString", "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;");
     jmethodID optD = env->GetMethodID(jsonClass, "optDouble", "(Ljava/lang/String;D)D");
@@ -9812,8 +10355,12 @@ static bool appendSimplePdfStampTextObject(
             );
             FPDFPath_SetDrawMode(bgObj, 1, JNI_FALSE);
             FPDFPageObj_Transform(bgObj, cosA, sinA, -sinA, cosA, origCenterX, centerY);
-            FPDFAnnot_AppendObject(annot, bgObj);
-            FPDFAnnot_UpdateObject(annot, bgObj);
+            if (saveAsPageContent) {
+                FPDFPage_InsertObject(page, bgObj);
+            } else {
+                FPDFAnnot_AppendObject(annot, bgObj);
+                FPDFAnnot_UpdateObject(annot, bgObj);
+            }
         }
     }
 
@@ -9902,9 +10449,15 @@ static bool appendSimplePdfStampTextObject(
                     FPDFPageObj_SetStrokeWidth(textObj, textH * 0.05f);
                     FPDFTextObj_SetTextRenderMode(textObj, FPDF_TEXTRENDERMODE_FILL_STROKE);
                 }
-                const bool lineAppended = FPDFAnnot_AppendObject(annot, textObj) != 0;
+                const bool lineAppended = saveAsPageContent
+                                          ? true
+                                          : FPDFAnnot_AppendObject(annot, textObj) != 0;
                 if (lineAppended) {
-                    FPDFAnnot_UpdateObject(annot, textObj);
+                    if (saveAsPageContent) {
+                        FPDFPage_InsertObject(page, textObj);
+                    } else {
+                        FPDFAnnot_UpdateObject(annot, textObj);
+                    }
                     appended = true;
                     decorationLeft = xPx * pxToPageX;
                     decorationWidth = textW;
@@ -9932,7 +10485,9 @@ static bool appendSimplePdfStampTextObject(
         FPDFPageObj_SetStrokeColor(line, textR, textG, textB, textA);
         FPDFPageObj_SetStrokeWidth(line, decorationHeight * 0.05f);
         FPDFPath_SetDrawMode(line, 0, JNI_TRUE);
-        if (FPDFAnnot_AppendObject(annot, line)) {
+        if (saveAsPageContent) {
+            FPDFPage_InsertObject(page, line);
+        } else if (FPDFAnnot_AppendObject(annot, line)) {
             FPDFAnnot_UpdateObject(annot, line);
         } else {
             FPDFPageObj_Destroy(line);
@@ -9967,10 +10522,11 @@ static bool processSimplePdfStamp(
         int b,
         int alpha,
         jclass jsonClass,
-        jmethodID jsonInit
+        jmethodID jsonInit,
+        bool saveAsPageContent
 ) {
-    (void)page;
     (void)typeInt;
+    if (saveAsPageContent ? !page : !annot) return false;
     jstring jJsonStr = GetBridgeDataPropertyJString(env, obj, dataPropsField, jsonClass, jsonInit, "simplePdfStampProperties");
     if (!jJsonStr) return false;
 
@@ -10010,9 +10566,11 @@ static bool processSimplePdfStamp(
     paddedRect.top += containerPadding;
     paddedRect.bottom -= containerPadding;
 
-    FPDFAnnot_SetRect(annot, &paddedRect);
-    FPDFAnnot_SetColor(annot, FPDFANNOT_COLORTYPE_Color, r, g, b, alpha);
-    FPDFAnnot_SetBorder(annot, 0, 0, 0);
+    if (!saveAsPageContent) {
+        FPDFAnnot_SetRect(annot, &paddedRect);
+        FPDFAnnot_SetColor(annot, FPDFANNOT_COLORTYPE_Color, r, g, b, alpha);
+        FPDFAnnot_SetBorder(annot, 0, 0, 0);
+    }
 
     int appendedCount = 0;
     const int childCount = env->CallIntMethod(children, arrayLength);
@@ -10041,11 +10599,11 @@ static bool processSimplePdfStamp(
         bool appended = false;
         if (strcmp(kind, "text") == 0) {
             jobject textProps = env->CallObjectMethod(child, childOptJSONObject, textPropsKey);
-            appended = appendSimplePdfStampTextObject(env, doc, annot, childRect, textProps, jsonClass, r, g, b, alpha);
+            appended = appendSimplePdfStampTextObject(env, doc, page, annot, childRect, textProps, jsonClass, r, g, b, alpha, saveAsPageContent);
             if (textProps) env->DeleteLocalRef(textProps);
         } else if (strcmp(kind, "shape") == 0) {
             jobject shapeProps = env->CallObjectMethod(child, childOptJSONObject, shapePropsKey);
-            appended = appendSimplePdfStampShapeObject(env, annot, shapeProps, jsonClass);
+            appended = appendSimplePdfStampShapeObject(env, page, annot, shapeProps, jsonClass, saveAsPageContent);
             if (shapeProps) env->DeleteLocalRef(shapeProps);
         }
         if (appended) appendedCount++;
@@ -10067,16 +10625,18 @@ static bool processSimplePdfStamp(
         return false;
     }
 
-    SetAnnotWideStringValueFromJString(env, annot, "LufickSimplePdfStampMeta", jJsonStr);
-    SetAnnotAsciiStringValue(annot, "LufickStampKind", "simple_pdf_stamp");
-    SetAnnotAsciiStringValue(annot, "LufickSimplePdfStamp", "1");
-    FPDFAnnot_SetFlags(annot, FPDF_ANNOT_FLAG_PRINT | FPDF_ANNOT_FLAG_READONLY);
+    if (!saveAsPageContent) {
+        SetAnnotWideStringValueFromJString(env, annot, "LufickSimplePdfStampMeta", jJsonStr);
+        SetAnnotAsciiStringValue(annot, "LufickStampKind", "simple_pdf_stamp");
+        SetAnnotAsciiStringValue(annot, "LufickSimplePdfStamp", "1");
+        FPDFAnnot_SetFlags(annot, FPDF_ANNOT_FLAG_PRINT | FPDF_ANNOT_FLAG_READONLY);
+    }
     env->DeleteLocalRef(jJsonStr);
     return true;
 }
 
 // --- HELPER 3: FREEHAND LOGIC ---
-static void processFreeHand(JNIEnv* env, jobject obj, FPDF_PAGE page, jfieldID fhField, int r, int g, int b, jclass jsonClass, jmethodID jsonInit) {
+static void processFreeHand(JNIEnv* env, jobject obj, FPDF_PAGE page, jfieldID fhField, int r, int g, int b, jclass jsonClass, jmethodID jsonInit, bool saveAsPageContent) {
     jstring jJsonStr = GetBridgeDataPropertyJString(env, obj, fhField, jsonClass, jsonInit, "fhDrawingProperties");
     if (!jJsonStr) return;
 
@@ -10167,6 +10727,11 @@ static void processFreeHand(JNIEnv* env, jobject obj, FPDF_PAGE page, jfieldID f
             FPDFPageObj_SetStrokeColor(path, r, g, b, alphaValue);
         }
         FPDFPath_SetDrawMode(path, 0, JNI_TRUE);
+
+        if (saveAsPageContent) {
+            FPDFPage_InsertObject(page, path);
+            return;
+        }
 
         const float rectMargin = fmax((effectiveStrokeWidth * 0.5f) + 0.5f, 1.0f);
         FS_RECTF rect = {
@@ -10265,35 +10830,58 @@ static void processFreeHand(JNIEnv* env, jobject obj, FPDF_PAGE page, jfieldID f
 
         if (!inkStrokes.empty() && hasBounds) {
             const float effectiveStrokeWidth = strokeWidth > 0.0f ? strokeWidth : 1.0f;
-            const float rectMargin = fmax((effectiveStrokeWidth * 0.5f) + 0.5f, 1.0f);
-            FS_RECTF rect = {
-                    minX - rectMargin,
-                    minY - rectMargin,
-                    maxX + rectMargin,
-                    maxY + rectMargin
-            };
-
-            FPDF_ANNOTATION annot = FPDFPage_CreateAnnot(page, FPDF_ANNOT_INK);
-            if (annot) {
-                FPDFAnnot_SetBorder(annot, 0, 0, effectiveStrokeWidth);
-                FPDFAnnot_SetRect(annot, &rect);
-                FPDFAnnot_SetColor(annot, FPDFANNOT_COLORTYPE_Color, r, g, b, alphaValue);
-                bool addedAllStrokes = true;
+            if (saveAsPageContent) {
+                int insertedPathCount = 0;
                 for (const auto& inkPoints : inkStrokes) {
-                    if (FPDFAnnot_AddInkStroke(annot, inkPoints.data(), inkPoints.size()) < 0) {
-                        addedAllStrokes = false;
-                        break;
+                    if (inkPoints.size() < 2) continue;
+
+                    FPDF_PAGEOBJECT path = FPDFPageObj_CreateNewPath(inkPoints[0].x, inkPoints[0].y);
+                    if (!path) continue;
+
+                    for (size_t pointIndex = 1; pointIndex < inkPoints.size(); pointIndex++) {
+                        FPDFPath_LineTo(path, inkPoints[pointIndex].x, inkPoints[pointIndex].y);
                     }
+
+                    FPDFPageObj_SetStrokeWidth(path, effectiveStrokeWidth);
+                    FPDFPageObj_SetLineJoin(path, lineJoin);
+                    FPDFPageObj_SetLineCap(path, lineCap);
+                    FPDFPageObj_SetStrokeColor(path, r, g, b, alphaValue);
+                    FPDFPath_SetDrawMode(path, 0, JNI_TRUE);
+                    FPDFPage_InsertObject(page, path);
+                    insertedPathCount++;
                 }
-                if (addedAllStrokes) {
-                    SetAnnotWideStringValueFromJString(env, annot, "LufickSignatureSubtype", jSignatureSubtype);
-                    FPDFAnnot_SetFlags(annot, FPDF_ANNOT_FLAG_PRINT);
-                    FPDFPage_CloseAnnot(annot);
-                } else {
-                    const int annotIndex = FPDFPage_GetAnnotIndex(page, annot);
-                    FPDFPage_CloseAnnot(annot);
-                    if (annotIndex >= 0) {
-                        FPDFPage_RemoveAnnot(page, annotIndex);
+                LOGE("PDF_EDIT_NATIVE processFreeHand signature draw pageContent insertedPaths=%d", insertedPathCount);
+            } else {
+                const float rectMargin = fmax((effectiveStrokeWidth * 0.5f) + 0.5f, 1.0f);
+                FS_RECTF rect = {
+                        minX - rectMargin,
+                        minY - rectMargin,
+                        maxX + rectMargin,
+                        maxY + rectMargin
+                };
+
+                FPDF_ANNOTATION annot = FPDFPage_CreateAnnot(page, FPDF_ANNOT_INK);
+                if (annot) {
+                    FPDFAnnot_SetBorder(annot, 0, 0, effectiveStrokeWidth);
+                    FPDFAnnot_SetRect(annot, &rect);
+                    FPDFAnnot_SetColor(annot, FPDFANNOT_COLORTYPE_Color, r, g, b, alphaValue);
+                    bool addedAllStrokes = true;
+                    for (const auto& inkPoints : inkStrokes) {
+                        if (FPDFAnnot_AddInkStroke(annot, inkPoints.data(), inkPoints.size()) < 0) {
+                            addedAllStrokes = false;
+                            break;
+                        }
+                    }
+                    if (addedAllStrokes) {
+                        SetAnnotWideStringValueFromJString(env, annot, "LufickSignatureSubtype", jSignatureSubtype);
+                        FPDFAnnot_SetFlags(annot, FPDF_ANNOT_FLAG_PRINT);
+                        FPDFPage_CloseAnnot(annot);
+                    } else {
+                        const int annotIndex = FPDFPage_GetAnnotIndex(page, annot);
+                        FPDFPage_CloseAnnot(annot);
+                        if (annotIndex >= 0) {
+                            FPDFPage_RemoveAnnot(page, annotIndex);
+                        }
                     }
                 }
             }
@@ -12474,130 +13062,47 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeSavePdfEdit
         rect.bottom = fmin(top, bottom);
         rect.top = fmax(top, bottom);
 
+        bool isEditTextSignature = false;
+        if (typeInt == 5) {
+            jstring jTextProps = GetBridgeDataPropertyJString(env, obj, dataPropsField, jsonClass, jsonInit, "textProperties");
+            if (jTextProps) {
+                const char* textProps = env->GetStringUTFChars(jTextProps, nullptr);
+                isEditTextSignature = textProps &&
+                                      strstr(textProps, "\"signatureSubType\"") != nullptr &&
+                                      strstr(textProps, "Sign_text") != nullptr;
+                if (textProps) {
+                    env->ReleaseStringUTFChars(jTextProps, textProps);
+                }
+                env->DeleteLocalRef(jTextProps);
+            }
+        }
+        const bool isSimplePdfStampEdit = isSimplePdfStampBridgeAnnotation(env, obj, dataPropsField, jsonClass, jsonInit);
+
         if (typeInt == 6) {
             LOGE("PDF_EDIT_NATIVE nativeSavePdfEditObjects processFreeHand index=%d page=%d beforeObjects=%d", i, pageIndex, FPDFPage_CountObjects(currentPage));
-            processFreeHand(env, obj, currentPage, dataPropsField, r, g, b, jsonClass, jsonInit);
+            processFreeHand(env, obj, currentPage, dataPropsField, r, g, b, jsonClass, jsonInit, true);
             LOGE("PDF_EDIT_NATIVE nativeSavePdfEditObjects processFreeHand done index=%d page=%d afterObjects=%d", i, pageIndex, FPDFPage_CountObjects(currentPage));
-            env->DeleteLocalRef(obj);
-            continue;
-        }
-
-        int pdfType = (typeInt == 1) ? FPDF_ANNOT_UNDERLINE :
-                      (typeInt == 2) ? FPDF_ANNOT_STRIKEOUT :
-                      (typeInt == 8) ? FPDF_ANNOT_SQUIGGLY :
-                      (typeInt == 3) ? FPDF_ANNOT_LINK :
-                      (typeInt == 10) ? FPDF_ANNOT_TEXT :
-                      (typeInt == 11) ? FPDF_ANNOT_FREETEXT :
-                      (typeInt == 4 || typeInt == 7) ? FPDF_ANNOT_SQUARE :
-                      FPDF_ANNOT_HIGHLIGHT;
-
-        if (typeInt == 11) {
+        } else if (isSimplePdfStampEdit) {
+            const bool savedSimplePdfStampContent = processSimplePdfStamp(env, obj, doc, currentPage, nullptr, rect, typeInt, dataPropsField, r, g, b, alpha, jsonClass, jsonInit, true);
+            LOGE("PDF_EDIT_NATIVE nativeSavePdfEditObjects processSimplePdfStamp pageContent index=%d page=%d success=%d afterObjects=%d",
+                 i, pageIndex, savedSimplePdfStampContent ? 1 : 0, FPDFPage_CountObjects(currentPage));
+        } else if (typeInt == 11 || isEditTextSignature) {
+            if (isEditTextSignature) {
+                LOGE("PDF_EDIT_NATIVE nativeSavePdfEditObjects route Sign_text type=%d through processFreeText index=%d page=%d", typeInt, i, pageIndex);
+            }
             processFreeText(env, obj, doc, currentPage, rect, dataPropsField, r, g, b, alpha, jsonClass, jsonInit);
-            env->DeleteLocalRef(obj);
-            continue;
-        }
-
-        FPDF_ANNOTATION annot = IsPdfShapeNativeType(typeInt)
-                                ? CreatePdfShapeAnnotation(currentPage, typeInt)
-                                : FPDFPage_CreateAnnot(currentPage, (typeInt == 5 || typeInt == 9) ? FPDF_ANNOT_STAMP : pdfType);
-        if (!annot) {
-            LOGE("PDF_EDIT_NATIVE nativeSavePdfEditObjects failed create annot index=%d type=%d page=%d", i, typeInt, pageIndex);
-            env->DeleteLocalRef(obj);
-            continue;
-        }
-        LOGE("PDF_EDIT_NATIVE nativeSavePdfEditObjects created annot index=%d type=%d page=%d annotCount=%d", i, typeInt, pageIndex, FPDFPage_GetAnnotCount(currentPage));
-
-        FPDFAnnot_SetRect(annot, &rect);
-        if (typeInt == 3) {
-            processLink(env, obj, currentPage, annot, rect, urlField);
-        } else if (typeInt == 4) {
-            FPDFAnnot_SetColor(annot, FPDFANNOT_COLORTYPE_Color, r, g, b, alpha);
-            FPDFAnnot_SetColor(annot, FPDFANNOT_COLORTYPE_InteriorColor, r, g, b, alpha);
-            SetAnnotAsciiStringValue(annot, "LufickPdfRedaction", "1");
-        } else if (typeInt == 10) {
-            processStickyNoteComment(env, obj, annot, dataPropsField, r, g, b, alpha, jsonClass, jsonInit);
-        } else if (isSimplePdfStampBridgeAnnotation(env, obj, dataPropsField, jsonClass, jsonInit)) {
-            processSimplePdfStamp(env, obj, doc, currentPage, annot, rect, typeInt, dataPropsField, r, g, b, alpha, jsonClass, jsonInit);
-        } else if (typeInt == 5) {
-            processTextStamp(env, obj, doc, currentPage, annot, rect, dataPropsField, r, g, b, alpha, jsonClass, jsonInit);
         } else if (typeInt == 9) {
-            processImageOrPresetStamp(env, obj, doc, currentPage, annot, rect, dataPropsField, jsonClass, jsonInit);
-        } else if (typeInt == 7) {
-            processRegionHighlight(env, obj, currentPage, annot, rect, r, g, b, alpha);
+            const bool savedImageContent = processImageOrPresetStamp(env, obj, doc, currentPage, nullptr, rect, dataPropsField, jsonClass, jsonInit, true);
+            LOGE("PDF_EDIT_NATIVE nativeSavePdfEditObjects processImageOrPresetStamp pageContent index=%d page=%d success=%d afterObjects=%d",
+                 i, pageIndex, savedImageContent ? 1 : 0, FPDFPage_CountObjects(currentPage));
         } else if (IsPdfShapeNativeType(typeInt)) {
-            processPdfShape(env, obj, annot, rect, typeInt, dataPropsField, r, g, b, alpha, jsonClass, jsonInit);
+            const bool savedShapeContent = processPdfShapeContent(env, obj, currentPage, rect, typeInt, dataPropsField, r, g, b, alpha, jsonClass, jsonInit);
+            LOGE("PDF_EDIT_NATIVE nativeSavePdfEditObjects processPdfShapeContent index=%d page=%d type=%d success=%d afterObjects=%d",
+                 i, pageIndex, typeInt, savedShapeContent ? 1 : 0, FPDFPage_CountObjects(currentPage));
         } else {
-            FPDFAnnot_SetColor(annot, FPDFANNOT_COLORTYPE_Color, r, g, b, alpha);
-            if (typeInt == 1 || typeInt == 2 || typeInt == 8) {
-                ClearAnnotationAppearanceObjects(annot);
-            }
-            if (typeInt == 0) {
-                FPDFAnnot_SetColor(annot, FPDFANNOT_COLORTYPE_InteriorColor, r, g, b, alpha);
-                const unsigned short blendMode[] = {'M','u','l','t','i','p','l','y',0};
-                FPDFAnnot_SetStringValue(annot, "BM", (FPDF_WIDESTRING)blendMode);
-            }
-            jstring jMarkupRects = (jstring)env->GetObjectField(obj, markupRectsField);
-            if (jMarkupRects) {
-                jobject rectsArray = env->NewObject(jsonArrayClass, jsonArrayInit, jMarkupRects);
-                if (rectsArray) {
-                    int rectCount = env->CallIntMethod(rectsArray, jsonArrayLength);
-                    for (int rectIndex = 0; rectIndex < rectCount; rectIndex++) {
-                        jobject rectObj = env->CallObjectMethod(rectsArray, jsonArrayGetObject, rectIndex);
-                        if (!rectObj) continue;
-
-                        float quadLeft = (float)env->CallDoubleMethod(rectObj, jsonGetDouble, env->NewStringUTF("left"));
-                        float quadTop = (float)env->CallDoubleMethod(rectObj, jsonGetDouble, env->NewStringUTF("top"));
-                        float quadRight = (float)env->CallDoubleMethod(rectObj, jsonGetDouble, env->NewStringUTF("right"));
-                        float quadBottom = (float)env->CallDoubleMethod(rectObj, jsonGetDouble, env->NewStringUTF("bottom"));
-                        float rectTop = fmax(quadTop, quadBottom);
-                        float rectBottom = fmin(quadTop, quadBottom);
-                        double strokeRatioValue = env->CallDoubleMethod(
-                                rectObj,
-                                jsonOptDouble,
-                                env->NewStringUTF("strokeWidthRatio"),
-                                GetDefaultTextMarkupStrokeRatio(typeInt)
-                        );
-                        float rectHeight = fmax(rectTop - rectBottom, 0.5f);
-                        float strokeRatio = GetClampedTextMarkupStrokeRatio(typeInt, strokeRatioValue);
-                        float thickness = (typeInt == 8)
-                                          ? GetSquigglyRenderThickness(rectHeight, strokeRatio)
-                                          : fmax(rectHeight * strokeRatio, 0.5f);
-                        if (typeInt == 1) {
-                            rectTop = rectBottom + thickness;
-                            AppendStraightTextMarkupAppearance(annot, quadLeft, quadRight, rectBottom + (thickness * 0.5f), r, g, b, alpha, thickness);
-                        } else if (typeInt == 2) {
-                            float centerY = (rectTop + rectBottom) * 0.5f;
-                            rectTop = centerY + (thickness * 0.5f);
-                            rectBottom = centerY - (thickness * 0.5f);
-                            AppendStraightTextMarkupAppearance(annot, quadLeft, quadRight, centerY, r, g, b, alpha, thickness);
-                        } else if (typeInt == 8) {
-                            rectTop = GetSquigglyAttachmentTop(rectBottom, rectTop, thickness);
-                            AppendSquigglyTextMarkupAppearance(annot, quadLeft, quadRight, rectBottom, rectTop, r, g, b, alpha, thickness);
-                        }
-                        FS_QUADPOINTSF qp = {
-                                fmin(quadLeft, quadRight), rectTop,
-                                fmax(quadLeft, quadRight), rectTop,
-                                fmin(quadLeft, quadRight), rectBottom,
-                                fmax(quadLeft, quadRight), rectBottom
-                        };
-                        FPDFAnnot_AppendAttachmentPoints(annot, &qp);
-                        env->DeleteLocalRef(rectObj);
-                    }
-                    env->DeleteLocalRef(rectsArray);
-                }
-
-                const jchar* rawMarkupMeta = env->GetStringChars(jMarkupRects, nullptr);
-                FPDFAnnot_SetStringValue(annot, "LufickMarkupMeta", (FPDF_WIDESTRING)rawMarkupMeta);
-                env->ReleaseStringChars(jMarkupRects, rawMarkupMeta);
-            } else {
-                AppendFallbackTextMarkupAppearance(annot, typeInt, rect, r, g, b, alpha);
-                FS_QUADPOINTSF qp = {rect.left, rect.top, rect.right, rect.top, rect.left, rect.bottom, rect.right, rect.bottom};
-                FPDFAnnot_AppendAttachmentPoints(annot, &qp);
-            }
+            LOGE("PDF_EDIT_NATIVE nativeSavePdfEditObjects skip unsupported edit content type index=%d type=%d page=%d", i, typeInt, pageIndex);
         }
 
-        FPDFAnnot_SetFlags(annot, FPDF_ANNOT_FLAG_PRINT);
-        FPDFPage_CloseAnnot(annot);
         env->DeleteLocalRef(obj);
     }
 
@@ -13156,6 +13661,23 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeSaveEdit(
             rawWatermarkSpecs.push_back(spec);
         }
         env->DeleteLocalRef(obj);
+    }
+
+    if (watermarkCount > 0 &&
+        !rawWatermarkSpecs.empty() &&
+        PdfFileHasToolkitTextStampOrCommentMarker(inputPath) &&
+        SaveToolkitTextWatermarksWithPdfium(
+                env,
+                inputPath,
+                outputPath,
+                watermarksArray,
+                dataPropsField,
+                jsonClass,
+                jsonInit
+        )) {
+        env->ReleaseStringUTFChars(inputPath_, inputPath);
+        env->ReleaseStringUTFChars(outputPath_, outputPath);
+        return JNI_TRUE;
     }
 
     const bool editContentInput = PdfFileHasEditContentMarker(inputPath);
