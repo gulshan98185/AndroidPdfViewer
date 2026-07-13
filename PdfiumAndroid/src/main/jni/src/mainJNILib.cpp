@@ -3054,6 +3054,65 @@ static size_t FindPdfKeyTokenInRange(
     return std::string::npos;
 }
 
+static size_t FindTopLevelPdfKeyTokenInDictionaryRange(
+        const std::string& data,
+        size_t start,
+        size_t end,
+        const std::string& key
+) {
+    if (start >= end || end > data.size()) return std::string::npos;
+    const std::string keyToken = "/" + key;
+    int dictionaryDepth = 0;
+    int arrayDepth = 0;
+    bool inLiteralString = false;
+    bool escaped = false;
+    for (size_t index = start; index < end; index++) {
+        const char ch = data[index];
+        if (inLiteralString) {
+            if (escaped) {
+                escaped = false;
+            } else if (ch == '\\') {
+                escaped = true;
+            } else if (ch == ')') {
+                inLiteralString = false;
+            }
+            continue;
+        }
+        if (ch == '(') {
+            inLiteralString = true;
+            escaped = false;
+            continue;
+        }
+        if (index + 1 < end && ch == '<' && data[index + 1] == '<') {
+            dictionaryDepth++;
+            index++;
+            continue;
+        }
+        if (index + 1 < end && ch == '>' && data[index + 1] == '>') {
+            dictionaryDepth = std::max(0, dictionaryDepth - 1);
+            index++;
+            continue;
+        }
+        if (ch == '[') {
+            arrayDepth++;
+            continue;
+        }
+        if (ch == ']') {
+            arrayDepth = std::max(0, arrayDepth - 1);
+            continue;
+        }
+        if (dictionaryDepth == 1 && arrayDepth == 0 &&
+            index + keyToken.size() <= end &&
+            data.compare(index, keyToken.size(), keyToken) == 0) {
+            const size_t afterKey = index + keyToken.size();
+            if (afterKey >= end || IsPdfNameDelimiter(data[afterKey])) {
+                return index;
+            }
+        }
+    }
+    return std::string::npos;
+}
+
 static bool ExtractPdfArrayValueFromObject(
         const std::string& objectText,
         const std::string& key,
@@ -3391,7 +3450,7 @@ static bool FindPdfDictionaryRawValueSegment(
         size_t* outEnd
 ) {
     if (!outStart || !outEnd || rangeStart >= rangeEnd || rangeEnd > data.size()) return false;
-    const size_t keyPos = FindPdfKeyTokenInRange(data, rangeStart, rangeEnd, key);
+    const size_t keyPos = FindTopLevelPdfKeyTokenInDictionaryRange(data, rangeStart, rangeEnd, key);
     if (keyPos == std::string::npos) return false;
 
     size_t valueStart = keyPos + key.size() + 1;
@@ -3967,7 +4026,7 @@ static bool FindDirectDictionaryValue(
         size_t* outStart,
         size_t* outEnd
 ) {
-    const size_t keyPos = FindPdfKeyTokenInRange(data, rangeStart, rangeEnd, key);
+    const size_t keyPos = FindTopLevelPdfKeyTokenInDictionaryRange(data, rangeStart, rangeEnd, key);
     if (keyPos == std::string::npos) return false;
     size_t valueStart = keyPos + key.size() + 1;
     while (valueStart < rangeEnd && std::isspace(static_cast<unsigned char>(data[valueStart]))) {
@@ -4016,7 +4075,7 @@ static bool FindIndirectReferenceValue(
         size_t* outValueStart,
         size_t* outValueEnd
 ) {
-    const size_t keyPos = FindPdfKeyTokenInRange(data, rangeStart, rangeEnd, key);
+    const size_t keyPos = FindTopLevelPdfKeyTokenInDictionaryRange(data, rangeStart, rangeEnd, key);
     if (keyPos == std::string::npos) return false;
     size_t valueStart = keyPos + key.size() + 1;
     while (valueStart < rangeEnd && std::isspace(static_cast<unsigned char>(data[valueStart]))) {
@@ -4030,7 +4089,7 @@ static bool ContainsPdfNameValue(const std::string& objectBody, const std::strin
     size_t dictStart = 0;
     size_t dictEnd = 0;
     if (!FindTopLevelPdfDictionary(objectBody, &dictStart, &dictEnd)) return false;
-    const size_t keyPos = FindPdfKeyTokenInRange(objectBody, dictStart, dictEnd, key);
+    const size_t keyPos = FindTopLevelPdfKeyTokenInDictionaryRange(objectBody, dictStart, dictEnd, key);
     if (keyPos == std::string::npos) return false;
     size_t valueStart = keyPos + key.size() + 1;
     while (valueStart < dictEnd && std::isspace(static_cast<unsigned char>(objectBody[valueStart]))) {
@@ -5339,50 +5398,57 @@ static bool RemoveToolkitWatermarkContentFromPageBody(
 
 static bool AddWatermarkContentToPageBody(
         const std::string& originalBody,
+        const std::vector<PdfObjectInfo>& objects,
+        std::vector<PdfObjectReplacement>* replacements,
         int prefixObjectNumber,
         int suffixObjectNumber,
         int contentObjectNumber,
         std::string* outBody,
         const std::set<int>& toolkitContentObjects
 ) {
-    if (!outBody) return false;
+    if (!outBody || !replacements) return false;
     std::string body = originalBody;
     size_t dictStart = 0;
     size_t dictEnd = 0;
     if (!FindTopLevelPdfDictionary(body, &dictStart, &dictEnd)) return false;
 
-    const size_t contentsKey = FindPdfKeyTokenInRange(body, dictStart, dictEnd, "Contents");
-    if (contentsKey == std::string::npos) {
+    size_t valueStart = 0;
+    size_t valueEnd = 0;
+    if (!FindPdfDictionaryRawValueSegment(body, dictStart, dictEnd, "Contents", &valueStart, &valueEnd)) {
         WM_LOGE("Native watermark content patch: no contents, inserting contentObj=%d", contentObjectNumber);
-        body.insert(dictEnd - 2, "/Contents " + std::to_string(contentObjectNumber) + " 0 R ");
+        body.insert(dictEnd - 2, "/Contents [ " + std::to_string(contentObjectNumber) + " 0 R ] ");
         *outBody = body;
         return true;
     }
 
-    size_t valueStart = contentsKey + strlen("/Contents");
-    while (valueStart < dictEnd && std::isspace(static_cast<unsigned char>(body[valueStart]))) {
-        valueStart++;
-    }
-    if (valueStart >= dictEnd) return false;
-
     if (body[valueStart] == '[') {
-        const size_t arrayEnd = body.find(']', valueStart + 1);
-        if (arrayEnd == std::string::npos || arrayEnd >= dictEnd) return false;
         WM_LOGE("Native watermark content patch: append to contents array contentObj=%d", contentObjectNumber);
         std::string rebuiltArray;
         if (RebuildContentsArrayWithoutToolkitWatermarks(
                     body,
                     valueStart,
-                    arrayEnd,
+                    valueEnd - 1,
                     toolkitContentObjects,
                     prefixObjectNumber,
                     suffixObjectNumber,
                     contentObjectNumber,
                     &rebuiltArray
         )) {
-            body.replace(valueStart, arrayEnd - valueStart + 1, rebuiltArray);
+            body.replace(valueStart, valueEnd - valueStart, rebuiltArray);
         } else {
-            body.insert(arrayEnd, " " + std::to_string(contentObjectNumber) + " 0 R");
+            std::string existingArray = body.substr(valueStart, valueEnd - valueStart);
+            const size_t closeBracket = existingArray.rfind(']');
+            if (closeBracket == std::string::npos) return false;
+            std::string appendRefs;
+            if (suffixObjectNumber > 0) {
+                appendRefs += " " + std::to_string(suffixObjectNumber) + " 0 R";
+            }
+            appendRefs += " " + std::to_string(contentObjectNumber) + " 0 R";
+            existingArray.insert(closeBracket, appendRefs);
+            if (prefixObjectNumber > 0) {
+                existingArray.insert(1, " " + std::to_string(prefixObjectNumber) + " 0 R");
+            }
+            body.replace(valueStart, valueEnd - valueStart, existingArray);
         }
         *outBody = body;
         return true;
@@ -5390,15 +5456,72 @@ static bool AddWatermarkContentToPageBody(
 
     int existingObjectNumber = 0;
     int existingGeneration = 0;
-    size_t valueEnd = 0;
+    size_t refEnd = 0;
     if (ParseIndirectReferenceAt(
             body,
             valueStart,
             dictEnd,
             &existingObjectNumber,
             &existingGeneration,
-            &valueEnd
+            &refEnd
     )) {
+        const PdfObjectInfo* existingContentsObject = FindPdfObjectInfoByRef(
+                objects,
+                existingObjectNumber,
+                existingGeneration
+        );
+        if (existingContentsObject) {
+            std::string contentsBody = GetCurrentPdfObjectBody(*existingContentsObject, replacements);
+            size_t contentsArrayStart = 0;
+            while (contentsArrayStart < contentsBody.size() &&
+                   std::isspace(static_cast<unsigned char>(contentsBody[contentsArrayStart]))) {
+                contentsArrayStart++;
+            }
+            if (contentsArrayStart < contentsBody.size() && contentsBody[contentsArrayStart] == '[') {
+                size_t contentsArrayEnd = contentsBody.find(']', contentsArrayStart + 1);
+                if (contentsArrayEnd != std::string::npos) {
+                    WM_LOGE(
+                            "Native watermark content patch: append to indirect contents array obj=%d gen=%d contentObj=%d",
+                            existingObjectNumber,
+                            existingGeneration,
+                            contentObjectNumber
+                    );
+                    std::string rebuiltArray;
+                    if (RebuildContentsArrayWithoutToolkitWatermarks(
+                            contentsBody,
+                            contentsArrayStart,
+                            contentsArrayEnd,
+                            toolkitContentObjects,
+                            prefixObjectNumber,
+                            suffixObjectNumber,
+                            contentObjectNumber,
+                            &rebuiltArray
+                    )) {
+                        contentsBody.replace(contentsArrayStart, contentsArrayEnd - contentsArrayStart + 1, rebuiltArray);
+                    } else {
+                        std::string appendRefs;
+                        if (suffixObjectNumber > 0) {
+                            appendRefs += " " + std::to_string(suffixObjectNumber) + " 0 R";
+                        }
+                        appendRefs += " " + std::to_string(contentObjectNumber) + " 0 R";
+                        contentsBody.insert(contentsArrayEnd, appendRefs);
+                        if (prefixObjectNumber > 0) {
+                            contentsBody.insert(contentsArrayStart + 1, " " + std::to_string(prefixObjectNumber) + " 0 R");
+                        }
+                    }
+                    if (!UpsertPdfObjectReplacement(
+                            replacements,
+                            existingObjectNumber,
+                            existingGeneration,
+                            contentsBody
+                    )) {
+                        return false;
+                    }
+                    *outBody = body;
+                    return true;
+                }
+            }
+        }
         WM_LOGE(
                 "Native watermark content patch: convert contents ref %d %d to array with contentObj=%d",
                 existingObjectNumber,
@@ -5414,17 +5537,21 @@ static bool AddWatermarkContentToPageBody(
                                           " R " +
                                           (suffixObjectNumber > 0 ? std::to_string(suffixObjectNumber) + " 0 R " : "") +
                                           std::to_string(contentObjectNumber) + " 0 R ]";
-        body.replace(valueStart, valueEnd - valueStart, replacement);
+        body.replace(valueStart, refEnd - valueStart, replacement);
         *outBody = body;
         return true;
     }
 
-    WM_LOGE(
-            "Native watermark content patch failed: unsupported contents value char=%d at=%zu",
-            static_cast<int>(static_cast<unsigned char>(body[valueStart])),
-            valueStart
-    );
-    return false;
+    std::string existingValue = body.substr(valueStart, valueEnd - valueStart);
+    if (existingValue.empty()) return false;
+    const std::string replacement = "[ " +
+                                    (prefixObjectNumber > 0 ? std::to_string(prefixObjectNumber) + " 0 R " : "") +
+                                    existingValue + " " +
+                                    (suffixObjectNumber > 0 ? std::to_string(suffixObjectNumber) + " 0 R " : "") +
+                                    std::to_string(contentObjectNumber) + " 0 R ]";
+    body.replace(valueStart, valueEnd - valueStart, replacement);
+    *outBody = body;
+    return true;
 }
 
 struct RawPdfWatermarkPatternBinding {
@@ -5662,6 +5789,8 @@ static bool PatchRawPdfWatermarkPatterns(JNIEnv* env, const char* outputPath, co
         }
         if (!AddWatermarkContentToPageBody(
                 pageBody,
+                latestObjects,
+                &replacements,
                 prefixContentObjectNumber,
                 suffixContentObjectNumber,
                 contentObjectNumber,
@@ -13262,6 +13391,370 @@ static bool NativePageIndexRequested(const std::set<int>& requestedPages, int pa
     return requestedPages.empty() || requestedPages.find(pageIndex) != requestedPages.end();
 }
 
+static bool NativeWrapPageContentsWithMatrix(
+        const std::string& originalBody,
+        const std::vector<PdfObjectInfo>& objects,
+        std::vector<PdfObjectReplacement>* replacements,
+        int prefixObjectNumber,
+        int suffixObjectNumber,
+        std::string* outBody
+) {
+    if (!replacements || !outBody) return false;
+    std::string body = originalBody;
+    size_t dictStart = 0;
+    size_t dictEnd = 0;
+    size_t valueStart = 0;
+    size_t valueEnd = 0;
+    if (!FindTopLevelPdfDictionary(body, &dictStart, &dictEnd) ||
+        !FindPdfDictionaryRawValueSegment(
+                body, dictStart, dictEnd, "Contents", &valueStart, &valueEnd)) {
+        return false;
+    }
+
+    const std::string prefixRef = std::to_string(prefixObjectNumber) + " 0 R";
+    const std::string suffixRef = std::to_string(suffixObjectNumber) + " 0 R";
+    if (body[valueStart] == '[') {
+        std::string contentsArray = body.substr(valueStart, valueEnd - valueStart);
+        const size_t closeBracket = contentsArray.rfind(']');
+        if (closeBracket == std::string::npos) return false;
+        contentsArray.insert(closeBracket, " " + suffixRef);
+        contentsArray.insert(1, " " + prefixRef);
+        body.replace(valueStart, valueEnd - valueStart, contentsArray);
+        *outBody = std::move(body);
+        return true;
+    }
+
+    int contentsObjectNumber = 0;
+    int contentsGeneration = 0;
+    size_t refEnd = valueStart;
+    if (!ParseIndirectReferenceAt(
+            body,
+            valueStart,
+            valueEnd,
+            &contentsObjectNumber,
+            &contentsGeneration,
+            &refEnd)) {
+        return false;
+    }
+
+    const PdfObjectInfo* contentsObject =
+            FindPdfObjectInfoByRef(objects, contentsObjectNumber, contentsGeneration);
+    if (contentsObject) {
+        std::string contentsBody = GetCurrentPdfObjectBody(*contentsObject, replacements);
+        size_t arrayStart = 0;
+        while (arrayStart < contentsBody.size() &&
+               std::isspace(static_cast<unsigned char>(contentsBody[arrayStart]))) {
+            arrayStart++;
+        }
+        if (arrayStart < contentsBody.size() && contentsBody[arrayStart] == '[') {
+            const size_t arrayEnd = contentsBody.find(']', arrayStart + 1);
+            if (arrayEnd == std::string::npos) return false;
+            contentsBody.insert(arrayEnd, " " + suffixRef);
+            contentsBody.insert(arrayStart + 1, " " + prefixRef);
+            if (!UpsertPdfObjectReplacement(
+                    replacements,
+                    contentsObjectNumber,
+                    contentsGeneration,
+                    contentsBody)) {
+                return false;
+            }
+            *outBody = std::move(body);
+            return true;
+        }
+    }
+
+    body.replace(
+            valueStart,
+            refEnd - valueStart,
+            "[ " + prefixRef + " " +
+            std::to_string(contentsObjectNumber) + " " +
+            std::to_string(contentsGeneration) + " R " + suffixRef + " ]"
+    );
+    *outBody = std::move(body);
+    return true;
+}
+
+static void NativeCollectIndirectRefsInRange(
+        const std::string& body,
+        size_t start,
+        size_t end,
+        std::set<std::pair<int, int>>* refs
+) {
+    if (!refs || start >= end || end > body.size()) return;
+    for (size_t cursor = start; cursor < end; cursor++) {
+        if (!std::isdigit(static_cast<unsigned char>(body[cursor]))) continue;
+        int objectNumber = 0;
+        int generation = 0;
+        size_t refEnd = cursor;
+        if (ParseIndirectReferenceAt(
+                body, cursor, end, &objectNumber, &generation, &refEnd)) {
+            refs->insert({objectNumber, generation});
+            cursor = refEnd - 1;
+        }
+    }
+}
+
+static bool NativeCollectPatternRefsFromResources(
+        const std::string& resourcesBody,
+        const std::vector<PdfObjectInfo>& objects,
+        std::set<std::pair<int, int>>* refs
+) {
+    size_t dictStart = 0;
+    size_t dictEnd = 0;
+    if (!refs || !FindTopLevelPdfDictionary(resourcesBody, &dictStart, &dictEnd)) return false;
+
+    size_t patternStart = 0;
+    size_t patternEnd = 0;
+    if (FindDirectDictionaryValue(
+            resourcesBody, dictStart, dictEnd, "Pattern", &patternStart, &patternEnd)) {
+        NativeCollectIndirectRefsInRange(resourcesBody, patternStart, patternEnd, refs);
+        return true;
+    }
+
+    int patternObjectNumber = 0;
+    int patternGeneration = 0;
+    size_t valueStart = 0;
+    size_t valueEnd = 0;
+    if (!FindIndirectReferenceValue(
+            resourcesBody,
+            dictStart,
+            dictEnd,
+            "Pattern",
+            &patternObjectNumber,
+            &patternGeneration,
+            &valueStart,
+            &valueEnd)) {
+        return true;
+    }
+    const PdfObjectInfo* patternDictionary =
+            FindPdfObjectInfoByRef(objects, patternObjectNumber, patternGeneration);
+    if (!patternDictionary) return false;
+    size_t patternDictStart = 0;
+    size_t patternDictEnd = 0;
+    if (!FindTopLevelPdfDictionary(
+            patternDictionary->body, &patternDictStart, &patternDictEnd)) {
+        return false;
+    }
+    NativeCollectIndirectRefsInRange(
+            patternDictionary->body, patternDictStart, patternDictEnd, refs);
+    return true;
+}
+
+static bool NativeCollectPagePatternRefs(
+        const std::string& pageBody,
+        const std::vector<PdfObjectInfo>& objects,
+        std::set<std::pair<int, int>>* refs,
+        int depth = 0
+) {
+    if (!refs || depth > 32) return false;
+    size_t dictStart = 0;
+    size_t dictEnd = 0;
+    if (!FindTopLevelPdfDictionary(pageBody, &dictStart, &dictEnd)) return false;
+
+    size_t resourcesStart = 0;
+    size_t resourcesEnd = 0;
+    if (FindDirectDictionaryValue(
+            pageBody, dictStart, dictEnd, "Resources", &resourcesStart, &resourcesEnd)) {
+        const std::string resourcesBody =
+                pageBody.substr(resourcesStart, resourcesEnd - resourcesStart);
+        return NativeCollectPatternRefsFromResources(resourcesBody, objects, refs);
+    }
+
+    int resourcesObjectNumber = 0;
+    int resourcesGeneration = 0;
+    size_t valueStart = 0;
+    size_t valueEnd = 0;
+    if (FindIndirectReferenceValue(
+            pageBody,
+            dictStart,
+            dictEnd,
+            "Resources",
+            &resourcesObjectNumber,
+            &resourcesGeneration,
+            &valueStart,
+            &valueEnd)) {
+        const PdfObjectInfo* resourcesObject =
+                FindPdfObjectInfoByRef(objects, resourcesObjectNumber, resourcesGeneration);
+        return resourcesObject &&
+               NativeCollectPatternRefsFromResources(resourcesObject->body, objects, refs);
+    }
+
+    int parentObjectNumber = 0;
+    int parentGeneration = 0;
+    if (!FindIndirectReferenceValue(
+            pageBody,
+            dictStart,
+            dictEnd,
+            "Parent",
+            &parentObjectNumber,
+            &parentGeneration,
+            &valueStart,
+            &valueEnd)) {
+        return true;
+    }
+    const PdfObjectInfo* parentObject =
+            FindPdfObjectInfoByRef(objects, parentObjectNumber, parentGeneration);
+    return parentObject &&
+           NativeCollectPagePatternRefs(parentObject->body, objects, refs, depth + 1);
+}
+
+static bool NativeTransformPatternMatrix(
+        const std::string& originalBody,
+        const FS_MATRIX& pageMatrix,
+        std::string* outBody
+) {
+    if (!outBody ||
+        !ContainsPdfNameValue(originalBody, "Type", "Pattern")) {
+        return false;
+    }
+    size_t dictStart = 0;
+    size_t dictEnd = 0;
+    if (!FindTopLevelPdfDictionary(originalBody, &dictStart, &dictEnd)) return false;
+
+    FS_MATRIX patternMatrix = {1.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f};
+    size_t matrixStart = 0;
+    size_t matrixEnd = 0;
+    const bool hasMatrix = FindPdfDictionaryRawValueSegment(
+            originalBody, dictStart, dictEnd, "Matrix", &matrixStart, &matrixEnd);
+    if (hasMatrix) {
+        std::string rawMatrix = originalBody.substr(matrixStart, matrixEnd - matrixStart);
+        std::replace(rawMatrix.begin(), rawMatrix.end(), '[', ' ');
+        std::replace(rawMatrix.begin(), rawMatrix.end(), ']', ' ');
+        std::istringstream values(rawMatrix);
+        if (!(values >> patternMatrix.a >> patternMatrix.b >>
+              patternMatrix.c >> patternMatrix.d >>
+              patternMatrix.e >> patternMatrix.f)) {
+            return false;
+        }
+    }
+
+    FS_MATRIX transformed;
+    transformed.a = pageMatrix.a * patternMatrix.a + pageMatrix.c * patternMatrix.b;
+    transformed.b = pageMatrix.b * patternMatrix.a + pageMatrix.d * patternMatrix.b;
+    transformed.c = pageMatrix.a * patternMatrix.c + pageMatrix.c * patternMatrix.d;
+    transformed.d = pageMatrix.b * patternMatrix.c + pageMatrix.d * patternMatrix.d;
+    transformed.e = pageMatrix.a * patternMatrix.e +
+                    pageMatrix.c * patternMatrix.f + pageMatrix.e;
+    transformed.f = pageMatrix.b * patternMatrix.e +
+                    pageMatrix.d * patternMatrix.f + pageMatrix.f;
+    const std::string matrixValue =
+            "[" + FormatPdfFloat(transformed.a) + " " +
+            FormatPdfFloat(transformed.b) + " " +
+            FormatPdfFloat(transformed.c) + " " +
+            FormatPdfFloat(transformed.d) + " " +
+            FormatPdfFloat(transformed.e) + " " +
+            FormatPdfFloat(transformed.f) + "]";
+
+    std::string body = originalBody;
+    if (hasMatrix) {
+        body.replace(matrixStart, matrixEnd - matrixStart, matrixValue);
+    } else {
+        body.insert(dictEnd - 2, "/Matrix " + matrixValue + " ");
+    }
+    *outBody = std::move(body);
+    return true;
+}
+
+static bool NativePatchPageSizeContentMatrices(
+        const char* outputPath,
+        const std::map<int, FS_MATRIX>& pageMatrices
+) {
+    if (!outputPath || pageMatrices.empty()) return false;
+    std::string data;
+    if (!ReadFileToString(outputPath, &data)) return false;
+
+    const std::vector<PdfObjectInfo> objects = ScanPdfObjects(data);
+    const std::vector<PdfObjectInfo> latestObjects = BuildLatestPdfObjectsByRef(objects);
+    std::vector<PdfObjectInfo> pages = BuildPdfPageObjectsFromCatalog(data, latestObjects);
+    if (pages.empty()) {
+        pages = BuildLatestPdfPageObjects(objects, latestObjects);
+    }
+    if (pages.empty()) return false;
+
+    int nextObjectNumber = GetMaxPdfObjectNumber(objects) + 1;
+    std::vector<PdfObjectReplacement> replacements;
+    std::map<std::pair<int, int>, FS_MATRIX> patternMatrices;
+    int patchedPages = 0;
+    for (const auto& pageMatrix : pageMatrices) {
+        const int pageIndex = pageMatrix.first;
+        if (pageIndex < 0 || static_cast<size_t>(pageIndex) >= pages.size()) return false;
+
+        const int prefixObjectNumber = nextObjectNumber++;
+        const int suffixObjectNumber = nextObjectNumber++;
+        std::string pageBody = GetCurrentPdfObjectBody(pages[pageIndex], &replacements);
+        if (!NativeWrapPageContentsWithMatrix(
+                pageBody,
+                latestObjects,
+                &replacements,
+                prefixObjectNumber,
+                suffixObjectNumber,
+                &pageBody)) {
+            return false;
+        }
+
+        const FS_MATRIX& matrix = pageMatrix.second;
+        const std::string matrixStream =
+                "q\n" +
+                FormatPdfFloat(matrix.a) + " " +
+                FormatPdfFloat(matrix.b) + " " +
+                FormatPdfFloat(matrix.c) + " " +
+                FormatPdfFloat(matrix.d) + " " +
+                FormatPdfFloat(matrix.e) + " " +
+                FormatPdfFloat(matrix.f) + " cm\n";
+        replacements.push_back({
+                prefixObjectNumber,
+                0,
+                "<< /Length " + std::to_string(matrixStream.size()) +
+                " >>\nstream\n" + matrixStream + "endstream"
+        });
+        replacements.push_back({
+                suffixObjectNumber,
+                0,
+                "<< /Length 2 >>\nstream\nQ\nendstream"
+        });
+        if (!UpsertPdfObjectReplacement(
+                &replacements,
+                pages[pageIndex].objectNumber,
+                pages[pageIndex].generation,
+                pageBody)) {
+            return false;
+        }
+        std::set<std::pair<int, int>> patternRefs;
+        if (!NativeCollectPagePatternRefs(
+                pages[pageIndex].body, latestObjects, &patternRefs)) {
+            return false;
+        }
+        for (const auto& patternRef : patternRefs) {
+            patternMatrices.emplace(patternRef, matrix);
+        }
+        patchedPages++;
+    }
+
+    for (const auto& patternMatrix : patternMatrices) {
+        const PdfObjectInfo* patternObject = FindPdfObjectInfoByRef(
+                latestObjects, patternMatrix.first.first, patternMatrix.first.second);
+        if (!patternObject) return false;
+        std::string transformedPatternBody;
+        if (!NativeTransformPatternMatrix(
+                patternObject->body, patternMatrix.second, &transformedPatternBody)) {
+            continue;
+        }
+        if (!UpsertPdfObjectReplacement(
+                &replacements,
+                patternObject->objectNumber,
+                patternObject->generation,
+                transformedPatternBody)) {
+            return false;
+        }
+    }
+
+    if (patchedPages != static_cast<int>(pageMatrices.size()) ||
+        !AppendIncrementalPdfObjectUpdates(&data, &replacements)) {
+        return false;
+    }
+    return WriteStringToFile(outputPath, data);
+}
+
 static bool NativeResolvePageSize(FPDF_PAGE page, float* left, float* bottom, float* width, float* height) {
     if (!page || !left || !bottom || !width || !height) return false;
 
@@ -13483,7 +13976,8 @@ static bool NativeApplyPageSizeScale(
         int scaleMode,
         float scaleFactor,
         float* outScaleX = nullptr,
-        float* outScaleY = nullptr
+        float* outScaleY = nullptr,
+        FS_MATRIX* outMatrix = nullptr
 ) {
     float sourceLeft = 0.0f;
     float sourceBottom = 0.0f;
@@ -13536,23 +14030,15 @@ static bool NativeApplyPageSizeScale(
     matrix.d = scaleY;
     matrix.e = offsetX - (sourceLeft * scaleX);
     matrix.f = offsetY - (sourceBottom * scaleY);
-
-    FS_RECTF clipRect;
-    clipRect.left = 0.0f;
-    clipRect.top = finalHeight;
-    clipRect.right = finalWidth;
-    clipRect.bottom = 0.0f;
+    if (outMatrix) *outMatrix = matrix;
 
     const std::vector<NativeTextMarkupGeometry> textMarkupGeometry =
             NativeCollectTextMarkupGeometry(page);
-    if (!FPDFPage_TransFormWithClip(page, &matrix, &clipRect)) {
-        return false;
-    }
     FPDFPage_TransformAnnots(page, matrix.a, matrix.b, matrix.c, matrix.d, matrix.e, matrix.f);
     NativeFixTextMarkupAfterPageSizeScale(page, matrix, textMarkupGeometry);
     FPDFPage_SetMediaBox(page, 0.0f, 0.0f, finalWidth, finalHeight);
     FPDFPage_SetCropBox(page, 0.0f, 0.0f, finalWidth, finalHeight);
-    return FPDFPage_GenerateContent(page) != 0;
+    return true;
 }
 
 JNIEXPORT jboolean JNICALL
@@ -13594,6 +14080,7 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeSavePdfPage
     const int pageCount = FPDF_GetPageCount(doc);
     bool appliedAnyPage = false;
     bool failed = false;
+    std::map<int, FS_MATRIX> pageMatrices;
     for (int pageIndex = 0; pageIndex < pageCount; pageIndex++) {
         if (!NativePageIndexRequested(requestedPages, pageIndex)) continue;
 
@@ -13603,18 +14090,23 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeSavePdfPage
             break;
         }
 
+        FS_MATRIX pageMatrix;
         const bool applied = NativeApplyPageSizeScale(
                 page,
                 targetWidth,
                 targetHeight,
                 scaleMode,
-                scaleFactor
+                scaleFactor,
+                nullptr,
+                nullptr,
+                &pageMatrix
         );
         FPDF_ClosePage(page);
         if (!applied) {
             failed = true;
             break;
         }
+        pageMatrices[pageIndex] = pageMatrix;
         appliedAnyPage = true;
     }
 
@@ -13624,6 +14116,9 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeSavePdfPage
         PdfFileWriter writer{ {1, WriteBlock}, file };
         success = (file) ? FPDF_SaveAsCopy(doc, (FPDF_FILEWRITE*)&writer, FPDF_NO_INCREMENTAL) : JNI_FALSE;
         if (file) fclose(file);
+        if (success && !NativePatchPageSizeContentMatrices(outputPath, pageMatrices)) {
+            success = JNI_FALSE;
+        }
     }
 
     FPDF_CloseDocument(doc);
@@ -13661,23 +14156,6 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeSaveEdit(
             rawWatermarkSpecs.push_back(spec);
         }
         env->DeleteLocalRef(obj);
-    }
-
-    if (watermarkCount > 0 &&
-        !rawWatermarkSpecs.empty() &&
-        PdfFileHasToolkitTextStampOrCommentMarker(inputPath) &&
-        SaveToolkitTextWatermarksWithPdfium(
-                env,
-                inputPath,
-                outputPath,
-                watermarksArray,
-                dataPropsField,
-                jsonClass,
-                jsonInit
-        )) {
-        env->ReleaseStringUTFChars(inputPath_, inputPath);
-        env->ReleaseStringUTFChars(outputPath_, outputPath);
-        return JNI_TRUE;
     }
 
     const bool editContentInput = PdfFileHasEditContentMarker(inputPath);
