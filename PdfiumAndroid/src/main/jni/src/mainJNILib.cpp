@@ -13059,6 +13059,45 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeSaveAnnotat
     return success ? JNI_TRUE : JNI_FALSE;
 }
 
+static bool processRedactionContent(
+        FPDF_PAGE page,
+        FS_RECTF rect,
+        int r,
+        int g,
+        int b,
+        int alpha
+) {
+    if (!page) return false;
+
+    const float redactionLeft = fmin(rect.left, rect.right);
+    const float redactionRight = fmax(rect.left, rect.right);
+    const float redactionBottom = fmin(rect.bottom, rect.top);
+    const float redactionTop = fmax(rect.bottom, rect.top);
+    const float width = redactionRight - redactionLeft;
+    const float height = redactionTop - redactionBottom;
+    if (width <= 0.0f || height <= 0.0f) return false;
+
+    FPDF_PAGEOBJECT redactionObject = FPDFPageObj_CreateNewRect(
+            redactionLeft,
+            redactionBottom,
+            width,
+            height
+    );
+    if (!redactionObject) return false;
+
+    FPDFPageObj_SetFillColor(redactionObject, r, g, b, alpha);
+    FPDFPath_SetDrawMode(redactionObject, FPDF_FILLMODE_WINDING, JNI_FALSE);
+    FPDFPage_InsertObject(page, redactionObject);
+    LOGE(
+            "PDF_EDIT_NATIVE processRedactionContent rect=[%f,%f,%f,%f]",
+            redactionLeft,
+            redactionBottom,
+            redactionRight,
+            redactionTop
+    );
+    return true;
+}
+
 JNIEXPORT jboolean JNICALL
 Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeSavePdfEditObjects(
         JNIEnv* env, jobject thiz, jstring inputPath_, jstring outputPath_, jobjectArray editObjectsArray) {
@@ -13207,7 +13246,23 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeSavePdfEdit
         }
         const bool isSimplePdfStampEdit = isSimplePdfStampBridgeAnnotation(env, obj, dataPropsField, jsonClass, jsonInit);
 
-        if (typeInt == 6) {
+        if (typeInt == 4) {
+            const bool savedRedactionContent = processRedactionContent(
+                    currentPage,
+                    rect,
+                    r,
+                    g,
+                    b,
+                    alpha
+            );
+            LOGE(
+                    "PDF_EDIT_NATIVE nativeSavePdfEditObjects processRedactionContent index=%d page=%d success=%d afterObjects=%d",
+                    i,
+                    pageIndex,
+                    savedRedactionContent ? 1 : 0,
+                    FPDFPage_CountObjects(currentPage)
+            );
+        } else if (typeInt == 6) {
             LOGE("PDF_EDIT_NATIVE nativeSavePdfEditObjects processFreeHand index=%d page=%d beforeObjects=%d", i, pageIndex, FPDFPage_CountObjects(currentPage));
             processFreeHand(env, obj, currentPage, dataPropsField, r, g, b, jsonClass, jsonInit, true);
             LOGE("PDF_EDIT_NATIVE nativeSavePdfEditObjects processFreeHand done index=%d page=%d afterObjects=%d", i, pageIndex, FPDFPage_CountObjects(currentPage));
@@ -13272,6 +13327,90 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeSavePdfEdit
     env->ReleaseStringUTFChars(outputPath_, outputPath);
     LOGE("PDF_EDIT_NATIVE nativeSavePdfEditObjects finish success=%d", success ? 1 : 0);
     return success ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeSaveScannedPdfObjects(
+        JNIEnv* env,
+        jobject thiz,
+        jstring inputPath_,
+        jstring outputPath_,
+        jobjectArray objectsArray) {
+    if (!objectsArray) return JNI_FALSE;
+
+    jclass objectClass = env->FindClass("com/cv/lufick/compose_editor/data_class/PdfAnnotationNative");
+    if (!objectClass) return JNI_FALSE;
+    jfieldID typeField = env->GetFieldID(objectClass, "type", "I");
+    if (!typeField) {
+        env->DeleteLocalRef(objectClass);
+        return JNI_FALSE;
+    }
+    const auto isScannedContentObject = [](int type) {
+        return type == 4 ||
+               type == 5 ||
+               type == 6 ||
+               type == 9 ||
+               type == 11 ||
+               IsPdfShapeNativeType(type);
+    };
+
+    const int objectCount = env->GetArrayLength(objectsArray);
+    int contentCount = 0;
+    int annotationCount = 0;
+    for (int i = 0; i < objectCount; ++i) {
+        jobject object = env->GetObjectArrayElement(objectsArray, i);
+        if (!object) continue;
+        const int type = env->GetIntField(object, typeField);
+        if (isScannedContentObject(type)) contentCount++; else annotationCount++;
+        env->DeleteLocalRef(object);
+    }
+
+    jobjectArray annotationObjects = env->NewObjectArray(annotationCount, objectClass, nullptr);
+    jobjectArray contentObjects = env->NewObjectArray(contentCount, objectClass, nullptr);
+    int annotationIndex = 0;
+    int contentIndex = 0;
+    for (int i = 0; i < objectCount; ++i) {
+        jobject object = env->GetObjectArrayElement(objectsArray, i);
+        if (!object) continue;
+        const int type = env->GetIntField(object, typeField);
+        if (isScannedContentObject(type)) {
+            env->SetObjectArrayElement(contentObjects, contentIndex++, object);
+        } else {
+            env->SetObjectArrayElement(annotationObjects, annotationIndex++, object);
+        }
+        env->DeleteLocalRef(object);
+    }
+
+    jboolean success = JNI_FALSE;
+    if (objectCount == 0) {
+        success = Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeSaveAnnotations(
+                env, thiz, inputPath_, outputPath_, annotationObjects);
+    } else if (annotationCount == 0) {
+        success = Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeSavePdfEditObjects(
+                env, thiz, inputPath_, outputPath_, contentObjects);
+    } else if (contentCount == 0) {
+        success = Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeSaveAnnotations(
+                env, thiz, inputPath_, outputPath_, annotationObjects);
+    } else {
+        const char* outputPath = env->GetStringUTFChars(outputPath_, nullptr);
+        const std::string contentStagePath = std::string(outputPath) + ".content_stage.pdf";
+        env->ReleaseStringUTFChars(outputPath_, outputPath);
+        jstring contentStagePath_ = env->NewStringUTF(contentStagePath.c_str());
+
+        success = Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeSavePdfEditObjects(
+                env, thiz, inputPath_, contentStagePath_, contentObjects);
+        if (success == JNI_TRUE) {
+            success = Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeSaveAnnotations(
+                    env, thiz, contentStagePath_, outputPath_, annotationObjects);
+        }
+        remove(contentStagePath.c_str());
+        env->DeleteLocalRef(contentStagePath_);
+    }
+
+    env->DeleteLocalRef(annotationObjects);
+    env->DeleteLocalRef(contentObjects);
+    env->DeleteLocalRef(objectClass);
+    return success;
 }
 
 static float ClampCropPercent(float value) {
