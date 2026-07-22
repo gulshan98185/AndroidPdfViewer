@@ -3066,6 +3066,7 @@ struct RawPdfWatermarkSpec {
     std::string objectId;
     std::string fontName;
     std::string fontPath;
+    std::string textPathData;
     float pageWidth = 0.0f;
     float pageHeight = 0.0f;
     float pageLeft = 0.0f;
@@ -3077,6 +3078,8 @@ struct RawPdfWatermarkSpec {
     float repeatStepHeight = 0.0f;
     float contentWidth = 0.0f;
     float contentHeight = 0.0f;
+    float textPathWidth = 0.0f;
+    float textPathHeight = 0.0f;
     float baselineX = 0.0f;
     float baselineY = 0.0f;
     float centerX = 0.0f;
@@ -3094,6 +3097,7 @@ struct RawPdfWatermarkSpec {
     bool isStrikeout = false;
     bool isIconImage = false;
     bool isRasterImage = false;
+    bool requiresTextShaping = false;
     std::string imagePath;
     int imagePixelWidth = 0;
     int imagePixelHeight = 0;
@@ -5649,6 +5653,7 @@ static std::string BuildRawPdfWatermarkPatternKey(const RawPdfWatermarkSpec& spe
         << spec.text << '|'
         << spec.fontName << '|'
         << spec.fontPath << '|'
+        << std::hash<std::string>{}(spec.textPathData) << '|'
         << spec.textR << ',' << spec.textG << ',' << spec.textB << '|'
         << FormatPdfFloat(spec.fontSize) << '|'
         << FormatPdfFloat(spec.patternWidth) << 'x' << FormatPdfFloat(spec.patternHeight) << '|'
@@ -6726,6 +6731,7 @@ static bool CollectPageLevelTextWatermarkPatternSpec(
     jstring jObjectId = optStringValue("objectId");
     jstring jFont = optStringValue("font");
     jstring jFontPath = optStringValue("fontPath");
+    jstring jTextPathData = optStringValue("textPathData");
     jstring jImagePath = optStringValue("imagePath");
 
     const char* typeStr = jType ? env->GetStringUTFChars(jType, nullptr) : nullptr;
@@ -6756,6 +6762,7 @@ static bool CollectPageLevelTextWatermarkPatternSpec(
         if (jObjectId) env->DeleteLocalRef(jObjectId);
         if (jFont) env->DeleteLocalRef(jFont);
         if (jFontPath) env->DeleteLocalRef(jFontPath);
+        if (jTextPathData) env->DeleteLocalRef(jTextPathData);
         if (jImagePath) env->DeleteLocalRef(jImagePath);
         env->DeleteLocalRef(json);
         env->DeleteLocalRef(jJsonStr);
@@ -6766,12 +6773,14 @@ static bool CollectPageLevelTextWatermarkPatternSpec(
     const char* objectIdChars = jObjectId ? env->GetStringUTFChars(jObjectId, nullptr) : nullptr;
     const char* fontChars = jFont ? env->GetStringUTFChars(jFont, nullptr) : nullptr;
     const char* fontPathChars = jFontPath ? env->GetStringUTFChars(jFontPath, nullptr) : nullptr;
+    const char* textPathDataChars = jTextPathData ? env->GetStringUTFChars(jTextPathData, nullptr) : nullptr;
     const char* imagePathChars = jImagePath ? env->GetStringUTFChars(jImagePath, nullptr) : nullptr;
     RawPdfWatermarkSpec spec;
     spec.text = textChars ? textChars : "";
     spec.objectId = objectIdChars ? objectIdChars : "";
     spec.fontName = fontChars ? fontChars : "";
     spec.fontPath = fontPathChars ? fontPathChars : "";
+    spec.textPathData = textPathDataChars ? textPathDataChars : "";
     spec.imagePath = imagePathChars ? imagePathChars : "";
     spec.pageIndex = optIntValue("pdfPageIndex", optIntValue("sourcePageIndex", -1));
     spec.pageWidth = fmax((float)optDoubleValue("pageWidth", 0.0), 0.0f);
@@ -6814,10 +6823,13 @@ static bool CollectPageLevelTextWatermarkPatternSpec(
     spec.isUnderline = !isIconImageWatermark && !isRasterImageWatermark && optBoolValue("underline", false);
     spec.isStrikeout = !isIconImageWatermark && !isRasterImageWatermark && optBoolValue("strikeout", false);
     spec.isIconImage = isIconImageWatermark;
+    spec.requiresTextShaping = !isIconImageWatermark && !isRasterImageWatermark && optBoolValue("requiresTextShaping", false);
     const int textLength = std::max(1, (int)spec.text.size());
     spec.characterSpacing = fmax((float)optDoubleValue("letterSpacing", 0.0) * spec.fontSize, 0.0f);
     const float measuredTextWidth = (float)optDoubleValue("measuredTextWidth", 0.0);
     const float measuredTextHeight = (float)optDoubleValue("measuredTextHeight", 0.0);
+    spec.textPathWidth = fmax((float)optDoubleValue("textPathWidth", 0.0), 0.0f);
+    spec.textPathHeight = fmax((float)optDoubleValue("textPathHeight", 0.0), 0.0f);
     const float measuredFontAscent = (float)optDoubleValue("measuredFontAscent", -modelTextSize * 0.8f);
     const float measuredFontDescent = (float)optDoubleValue("measuredFontDescent", modelTextSize * 0.2f);
     const float measuredSpacingOffset = (float)optDoubleValue("measuredSpacingOffset", 0.0);
@@ -6865,6 +6877,7 @@ static bool CollectPageLevelTextWatermarkPatternSpec(
     if (objectIdChars) env->ReleaseStringUTFChars(jObjectId, objectIdChars);
     if (fontChars) env->ReleaseStringUTFChars(jFont, fontChars);
     if (fontPathChars) env->ReleaseStringUTFChars(jFontPath, fontPathChars);
+    if (textPathDataChars) env->ReleaseStringUTFChars(jTextPathData, textPathDataChars);
     if (imagePathChars) env->ReleaseStringUTFChars(jImagePath, imagePathChars);
     if (jType) env->DeleteLocalRef(jType);
     if (jMode) env->DeleteLocalRef(jMode);
@@ -6872,6 +6885,7 @@ static bool CollectPageLevelTextWatermarkPatternSpec(
     if (jObjectId) env->DeleteLocalRef(jObjectId);
     if (jFont) env->DeleteLocalRef(jFont);
     if (jFontPath) env->DeleteLocalRef(jFontPath);
+    if (jTextPathData) env->DeleteLocalRef(jTextPathData);
     if (jImagePath) env->DeleteLocalRef(jImagePath);
     env->DeleteLocalRef(json);
     env->DeleteLocalRef(jJsonStr);
@@ -8738,10 +8752,133 @@ static bool AppendGlyphContourToPdfStream(
     return true;
 }
 
+static std::string BuildPdfWatermarkTextPathPatternStream(
+        const RawPdfWatermarkSpec& spec,
+        const std::string& graphicsStateName
+) {
+    if (spec.textPathData.empty() || spec.textPathWidth <= 0.0f || spec.textPathHeight <= 0.0f) {
+        return std::string();
+    }
+
+    struct TextPathParser {
+        const std::string& data;
+        size_t pos = 0;
+
+        void skipSeparators() {
+            while (pos < data.size()) {
+                const char c = data[pos];
+                if (std::isspace(static_cast<unsigned char>(c)) || c == ',') {
+                    pos++;
+                } else {
+                    break;
+                }
+            }
+        }
+
+        bool readNumber(double* out) {
+            skipSeparators();
+            if (pos >= data.size() || !out) return false;
+            char* endPtr = nullptr;
+            const char* start = data.c_str() + pos;
+            const double value = std::strtod(start, &endPtr);
+            if (endPtr == start) return false;
+            pos = static_cast<size_t>(endPtr - data.c_str());
+            *out = value;
+            return true;
+        }
+
+        bool parseToPdfStream(
+                std::ostringstream* stream,
+                double drawX,
+                double drawY,
+                double scaleX,
+                double scaleY,
+                double pathHeight
+        ) {
+            if (!stream) return false;
+            bool wrotePath = false;
+            while (pos < data.size()) {
+                skipSeparators();
+                if (pos >= data.size()) break;
+                const char command = data[pos++];
+                if (command == 'M' || command == 'm' || command == 'L' || command == 'l') {
+                    double x = 0.0;
+                    double y = 0.0;
+                    if (!readNumber(&x) || !readNumber(&y)) return false;
+                    const double pdfX = drawX + (x * scaleX);
+                    const double pdfY = drawY + ((pathHeight - y) * scaleY);
+                    *stream << FormatPdfFloat(static_cast<float>(pdfX)) << ' '
+                            << FormatPdfFloat(static_cast<float>(pdfY)) << ' '
+                            << ((command == 'M' || command == 'm') ? "m\n" : "l\n");
+                    wrotePath = true;
+                } else if (command == 'Z' || command == 'z') {
+                    *stream << "h\n";
+                } else {
+                    return false;
+                }
+            }
+            return wrotePath;
+        }
+    };
+
+    const double targetWidth = std::max(
+            static_cast<double>(spec.fontSize),
+            static_cast<double>(spec.contentWidth > 0.0f ? spec.contentWidth : spec.textPathWidth)
+    );
+    const double targetHeight = std::max(
+            1.0,
+            static_cast<double>(spec.contentHeight > 0.0f ? spec.contentHeight : spec.textPathHeight)
+    );
+    const double scaleX = targetWidth / std::max(1.0, static_cast<double>(spec.textPathWidth));
+    const double scaleY = targetHeight / std::max(1.0, static_cast<double>(spec.textPathHeight));
+    const double drawX = spec.baselineX;
+    const double drawY = std::max(
+            0.0,
+            (static_cast<double>(spec.patternHeight) - targetHeight) * 0.5
+    );
+
+    std::ostringstream stream;
+    stream << "q\n"
+           << "/" << graphicsStateName << " gs\n"
+           << FormatPdfFloat(spec.textR / 255.0f) << ' '
+           << FormatPdfFloat(spec.textG / 255.0f) << ' '
+           << FormatPdfFloat(spec.textB / 255.0f) << " rg\n";
+
+    TextPathParser parser{spec.textPathData};
+    if (!parser.parseToPdfStream(&stream, drawX, drawY, scaleX, scaleY, spec.textPathHeight)) {
+        return std::string();
+    }
+
+    if (spec.isUnderline || spec.isStrikeout) {
+        const double decorationThickness = std::max(0.5, static_cast<double>(spec.fontSize) * 0.06);
+        const double maxDecorationY = std::max(0.0, static_cast<double>(spec.patternHeight) - decorationThickness);
+        auto appendDecorationRect = [&](double y) {
+            const double clampedY = std::max(0.0, std::min(y, maxDecorationY));
+            stream << FormatPdfFloat(spec.baselineX) << ' '
+                   << FormatPdfFloat(static_cast<float>(clampedY)) << ' '
+                   << FormatPdfFloat(static_cast<float>(targetWidth)) << ' '
+                   << FormatPdfFloat(static_cast<float>(decorationThickness)) << " re\n";
+        };
+        if (spec.isUnderline) {
+            appendDecorationRect(drawY - (static_cast<double>(spec.fontSize) * 0.12));
+        }
+        if (spec.isStrikeout) {
+            appendDecorationRect(drawY + (targetHeight * 0.45));
+        }
+    }
+
+    stream << "f\nQ";
+    return stream.str();
+}
+
 static std::string BuildPdfWatermarkFontOutlinePatternStream(
         const RawPdfWatermarkSpec& spec,
         const std::string& graphicsStateName
 ) {
+    if (!spec.textPathData.empty()) {
+        std::string textPathStream = BuildPdfWatermarkTextPathPatternStream(spec, graphicsStateName);
+        if (!textPathStream.empty()) return textPathStream;
+    }
     if (spec.fontPath.empty() || spec.text.empty() || spec.fontSize <= 0.0f) return std::string();
     std::vector<uint8_t> fontBytes;
     if (!ReadFileBytes(spec.fontPath.c_str(), &fontBytes)) return std::string();
@@ -8893,10 +9030,136 @@ static std::string BuildPdfWatermarkFontOutlinePatternStream(
     return stream.str();
 }
 
+static std::string BuildPdfSingleWatermarkTextPathContentStream(
+        const RawPdfWatermarkSpec& spec,
+        const std::string& graphicsStateName
+) {
+    if (spec.textPathData.empty() || spec.textPathWidth <= 0.0f || spec.textPathHeight <= 0.0f) {
+        return std::string();
+    }
+
+    struct TextPathParser {
+        const std::string& data;
+        size_t pos = 0;
+
+        void skipSeparators() {
+            while (pos < data.size()) {
+                const char c = data[pos];
+                if (std::isspace(static_cast<unsigned char>(c)) || c == ',') {
+                    pos++;
+                } else {
+                    break;
+                }
+            }
+        }
+
+        bool readNumber(double* out) {
+            skipSeparators();
+            if (pos >= data.size() || !out) return false;
+            char* endPtr = nullptr;
+            const char* start = data.c_str() + pos;
+            const double value = std::strtod(start, &endPtr);
+            if (endPtr == start) return false;
+            pos = static_cast<size_t>(endPtr - data.c_str());
+            *out = value;
+            return true;
+        }
+
+        bool parseToPdfStream(
+                std::ostringstream* stream,
+                double drawX,
+                double drawY,
+                double scaleX,
+                double scaleY,
+                double pathHeight
+        ) {
+            if (!stream) return false;
+            bool wrotePath = false;
+            while (pos < data.size()) {
+                skipSeparators();
+                if (pos >= data.size()) break;
+                const char command = data[pos++];
+                if (command == 'M' || command == 'm' || command == 'L' || command == 'l') {
+                    double x = 0.0;
+                    double y = 0.0;
+                    if (!readNumber(&x) || !readNumber(&y)) return false;
+                    const double pdfX = drawX + (x * scaleX);
+                    const double pdfY = drawY + ((pathHeight - y) * scaleY);
+                    *stream << FormatPdfFloat(static_cast<float>(pdfX)) << ' '
+                            << FormatPdfFloat(static_cast<float>(pdfY)) << ' '
+                            << ((command == 'M' || command == 'm') ? "m\n" : "l\n");
+                    wrotePath = true;
+                } else if (command == 'Z' || command == 'z') {
+                    *stream << "h\n";
+                } else {
+                    return false;
+                }
+            }
+            return wrotePath;
+        }
+    };
+
+    const double targetWidth = std::max(
+            static_cast<double>(spec.fontSize),
+            static_cast<double>(spec.contentWidth > 0.0f ? spec.contentWidth : spec.textPathWidth)
+    );
+    const double targetHeight = std::max(
+            1.0,
+            static_cast<double>(spec.contentHeight > 0.0f ? spec.contentHeight : spec.textPathHeight)
+    );
+    const double scaleX = targetWidth / std::max(1.0, static_cast<double>(spec.textPathWidth));
+    const double scaleY = targetHeight / std::max(1.0, static_cast<double>(spec.textPathHeight));
+    const double drawX = -targetWidth * 0.5;
+    const double drawY = -targetHeight * 0.5;
+    const double angleRad = spec.rotation * M_PI / 180.0;
+    const float cosA = static_cast<float>(cos(angleRad));
+    const float sinA = static_cast<float>(sin(angleRad));
+    const float centerX = spec.centerX > 0.0f ? spec.centerX : (spec.pageWidth * 0.5f);
+    const float centerY = spec.centerY > 0.0f ? spec.centerY : (spec.pageHeight * 0.5f);
+
+    std::ostringstream stream;
+    stream << "q\n"
+           << "/" << graphicsStateName << " gs\n"
+           << FormatPdfFloat(spec.textR / 255.0f) << ' '
+           << FormatPdfFloat(spec.textG / 255.0f) << ' '
+           << FormatPdfFloat(spec.textB / 255.0f) << " rg\n"
+           << FormatPdfFloat(cosA) << ' ' << FormatPdfFloat(sinA) << ' '
+           << FormatPdfFloat(-sinA) << ' ' << FormatPdfFloat(cosA) << ' '
+           << FormatPdfFloat(centerX) << ' ' << FormatPdfFloat(centerY) << " cm\n";
+
+    TextPathParser parser{spec.textPathData};
+    if (!parser.parseToPdfStream(&stream, drawX, drawY, scaleX, scaleY, spec.textPathHeight)) {
+        return std::string();
+    }
+
+    if (spec.isUnderline || spec.isStrikeout) {
+        const double decorationThickness = std::max(0.5, static_cast<double>(spec.fontSize) * 0.06);
+        auto appendDecorationRect = [&](double y) {
+            stream << FormatPdfFloat(static_cast<float>(drawX)) << ' '
+                   << FormatPdfFloat(static_cast<float>(y)) << ' '
+                   << FormatPdfFloat(static_cast<float>(targetWidth)) << ' '
+                   << FormatPdfFloat(static_cast<float>(decorationThickness)) << " re\n";
+        };
+        if (spec.isUnderline) {
+            appendDecorationRect(drawY - (static_cast<double>(spec.fontSize) * 0.12));
+        }
+        if (spec.isStrikeout) {
+            appendDecorationRect(drawY + (targetHeight * 0.45));
+        }
+    }
+
+    stream << "f\nQ";
+    return stream.str();
+}
+
 static std::string BuildPdfSingleWatermarkFontOutlineContentStream(
         const RawPdfWatermarkSpec& spec,
         const std::string& graphicsStateName
 ) {
+    if (!spec.textPathData.empty()) {
+        std::string textPathStream = BuildPdfSingleWatermarkTextPathContentStream(spec, graphicsStateName);
+        if (!textPathStream.empty()) return textPathStream;
+    }
     if (spec.fontPath.empty() || spec.text.empty() || spec.fontSize <= 0.0f) return std::string();
     std::vector<uint8_t> fontBytes;
     if (!ReadFileBytes(spec.fontPath.c_str(), &fontBytes)) return std::string();
@@ -15551,7 +15814,7 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeGetAnnotati
         if (
                 pageObjectType == FPDF_PAGEOBJ_TEXT &&
                 (
-                    (contentMetadata.kind == "signature" && contentMetadata.subtype == "Sign_text") ||
+//                    (contentMetadata.kind == "signature" && contentMetadata.subtype == "Sign_text") ||
                     (contentMetadata.kind == "preset_stamp" && contentMetadata.subtype == "pdf")
                 )
         ) {
