@@ -978,8 +978,6 @@ JNI_FUNC(jstring, PdfiumCore, nativeGetText)(JNI_ARGS, jlong textPtr) {
     return ret;
 }
 
-
-
 JNI_FUNC(void, PdfiumCore, nativeRenderPageBitmap)(JNI_ARGS, jlong docPtr, jlong pagePtr, jobject bitmap,
                                                    jint dpi, jint startX, jint startY,
                                                    jint drawSizeHor, jint drawSizeVer,
@@ -1307,7 +1305,8 @@ JNI_FUNC(jboolean, PdfiumCore, nativeGetMixedLooseCharPos)(JNI_ARGS, jlong pageP
 
 JNI_FUNC(jint, PdfiumCore, nativeCountAndGetRects)(JNI_ARGS, jlong pagePtr, jint offsetY,
                                                    jint offsetX, jint width, jint height,
-                                                   jobject arr, jlong textPtr, jint st, jint ed) {
+                                                   jobject arr, jlong textPtr, jint st, jint ed,
+                                                   jboolean mergeAdjacent) {
     if (init_classes) initClasses(env);
     //jclass arrList = env->FindClass("java/util/ArrayList");
     //jmethodID arrList_add = env->GetMethodID(arrList,"add","(Ljava/lang/Object;)Z");
@@ -1320,9 +1319,15 @@ JNI_FUNC(jint, PdfiumCore, nativeCountAndGetRects)(JNI_ARGS, jlong pagePtr, jint
     //jmethodID rectF_set = env->GetMethodID(rectF, "set", "(FFFF)V");
 
     int rectCount = FPDFText_CountRects((FPDF_TEXTPAGE) textPtr, (int) st, (int) ed);
-    env->CallVoidMethod(arr, arrList_enssurecap, rectCount);
+    struct DeviceTextRect {
+        float left;
+        float top;
+        float right;
+        float bottom;
+    };
+    std::vector<DeviceTextRect> deviceRects;
+    deviceRects.reserve(rectCount);
     double left, top, right, bottom;//width=1080,height=1527,left=365,top=621,right=686,bottom=440,deviceX=663,deviceY=400,ptr=543663849984
-    int arraySize = env->CallIntMethod(arr, arrList_size);
     int deviceX, deviceY;
     int deviceRight, deviceBottom;
     for (int i = 0; i < rectCount; i++) {//"RectF(373.0, 405.0, 556.0, 434.0)"
@@ -1334,26 +1339,98 @@ JNI_FUNC(jint, PdfiumCore, nativeCountAndGetRects)(JNI_ARGS, jlong pagePtr, jint
                               &deviceBottom);
             /*int new_width = right - left;
             int new_height = top - bottom;*/
-            left = deviceX + offsetX;
-            top = deviceY + offsetY;
-
-          int  new_width =deviceRight - left;
-          int   new_height =deviceBottom - top;
-
-            right = left + new_width;
-            bottom = top + new_height;
-            if (i >= arraySize) {
-                env->CallBooleanMethod(arr, arrList_add,
-                                       env->NewObject(rectF, rectF_, (float) left, (float) top,
-                                                      (float) right, (float) bottom));
-            } else {
-                jobject rI = env->CallObjectMethod(arr, arrList_get, i);
-                env->CallVoidMethod(rI, rectF_set, (float) left, (float) top, (float) right,
-                                    (float) bottom);
-            }
+            deviceRects.push_back({
+                (float) (deviceX + offsetX),
+                (float) (deviceY + offsetY),
+                (float) (deviceRight + offsetX),
+                (float) (deviceBottom + offsetY)
+            });
         }
     }
-    return rectCount;
+
+    if (mergeAdjacent && deviceRects.size() > 1) {
+        std::vector<DeviceTextRect> mergedRects;
+        mergedRects.reserve(deviceRects.size());
+
+        const auto canMergeOnSameLine = [](const DeviceTextRect &current,
+                                           const DeviceTextRect &next) {
+            const float currentHeight = current.bottom - current.top;
+            const float nextHeight = next.bottom - next.top;
+            const float minHeight = std::min(currentHeight, nextHeight);
+            const float maxHeight = std::max(currentHeight, nextHeight);
+            const float verticalOverlap =
+                    std::min(current.bottom, next.bottom) - std::max(current.top, next.top);
+            const float centerDistance =
+                    std::fabs((current.top + current.bottom) * 0.5f -
+                              (next.top + next.bottom) * 0.5f);
+            const float bottomDistance = std::fabs(current.bottom - next.bottom);
+            // Complex-script runs (for example Devanagari base glyphs and matras)
+            // can have very different bounds while still sharing the same line.
+            const bool sameLine =
+                    verticalOverlap >= minHeight * 0.2f ||
+                    bottomDistance <= std::max(2.0f, maxHeight * 0.5f) ||
+                    centerDistance <= maxHeight * 0.75f;
+            const float horizontalGap = std::max(
+                    0.0f,
+                    std::max(next.left - current.right, current.left - next.right)
+            );
+            const float maxGap = std::max(3.0f, maxHeight * 2.0f);
+            return sameLine && horizontalGap <= maxGap;
+        };
+
+        const auto mergeRect = [](DeviceTextRect &current, const DeviceTextRect &next) {
+            current.left = std::min(current.left, next.left);
+            current.top = std::min(current.top, next.top);
+            current.right = std::max(current.right, next.right);
+            current.bottom = std::max(current.bottom, next.bottom);
+        };
+
+        for (DeviceTextRect next : deviceRects) {
+            if (next.left > next.right) std::swap(next.left, next.right);
+            if (next.top > next.bottom) std::swap(next.top, next.bottom);
+
+            int matchingLine = -1;
+            for (int i = (int)mergedRects.size() - 1; i >= 0; --i) {
+                if (canMergeOnSameLine(mergedRects[i], next)) {
+                    matchingLine = i;
+                    break;
+                }
+            }
+
+            if (matchingLine < 0) {
+                mergedRects.push_back(next);
+            } else {
+                mergeRect(mergedRects[matchingLine], next);
+            }
+        }
+
+        deviceRects.swap(mergedRects);
+        for (DeviceTextRect &rect : deviceRects) {
+            const float verticalPadding =
+                    std::max(1.0f, (rect.bottom - rect.top) * 0.15f);
+            rect.top -= verticalPadding;
+            rect.bottom += verticalPadding;
+        }
+    }
+
+    const int resultCount = (int) deviceRects.size();
+    env->CallVoidMethod(arr, arrList_enssurecap, resultCount);
+    const int arraySize = env->CallIntMethod(arr, arrList_size);
+    for (int i = 0; i < resultCount; i++) {
+        const DeviceTextRect &rect = deviceRects[i];
+        if (i >= arraySize) {
+            jobject newRect = env->NewObject(
+                    rectF, rectF_, rect.left, rect.top, rect.right, rect.bottom);
+            env->CallBooleanMethod(arr, arrList_add, newRect);
+            env->DeleteLocalRef(newRect);
+        } else {
+            jobject existingRect = env->CallObjectMethod(arr, arrList_get, i);
+            env->CallVoidMethod(
+                    existingRect, rectF_set, rect.left, rect.top, rect.right, rect.bottom);
+            env->DeleteLocalRef(existingRect);
+        }
+    }
+    return resultCount;
 }
 
 
@@ -1601,6 +1678,7 @@ static bool processStickerStamp(JNIEnv* env, FPDF_DOCUMENT doc, FPDF_PAGE page, 
 static bool processSvgPathStamp(JNIEnv* env, FPDF_PAGE page, FPDF_ANNOTATION annot, FS_RECTF rect, jobject json, jstring jJsonStr, jmethodID optS, jmethodID optD, jmethodID optI, jmethodID optB, int r, int g, int b, int alpha, bool saveAsPageContent = false);
 static bool processImageOrPresetStamp(JNIEnv* env, jobject obj, FPDF_DOCUMENT doc, FPDF_PAGE page, FPDF_ANNOTATION annot, FS_RECTF rect, jfieldID imagePropsField, jclass jsonClass, jmethodID jsonInit, bool saveAsPageContent = false);
 static bool isSimplePdfStampBridgeAnnotation(JNIEnv* env, jobject obj, jfieldID dataPropsField, jclass jsonClass, jmethodID jsonInit);
+static bool appendSimplePdfStampTextObject(JNIEnv* env, FPDF_DOCUMENT doc, FPDF_PAGE page, FPDF_ANNOTATION annot, FS_RECTF rect, jobject textJson, jclass jsonClass, int r, int g, int b, int alpha, bool saveAsPageContent);
 static bool processSimplePdfStamp(JNIEnv* env, jobject obj, FPDF_DOCUMENT doc, FPDF_PAGE page, FPDF_ANNOTATION annot, FS_RECTF rect, int typeInt, jfieldID dataPropsField, int r, int g, int b, int alpha, jclass jsonClass, jmethodID jsonInit, bool saveAsPageContent = false);
 static bool processPageLevelTextWatermark(JNIEnv* env, jobject obj, FPDF_DOCUMENT doc, FPDF_PAGE page, jfieldID dataPropsField, jclass jsonClass, jmethodID jsonInit);
 struct RawPdfWatermarkSpec;
@@ -7172,28 +7250,13 @@ static void processTextStamp(JNIEnv* env, jobject obj, FPDF_DOCUMENT doc, FPDF_P
     if (!jJsonStr) return;
 
     jobject json = env->NewObject(jsonClass, jsonInit, jJsonStr);
-    jmethodID getS = env->GetMethodID(jsonClass, "getString", "(Ljava/lang/String;)Ljava/lang/String;");
     jmethodID getD = env->GetMethodID(jsonClass, "getDouble", "(Ljava/lang/String;)D");
-    jmethodID getB = env->GetMethodID(jsonClass, "getBoolean", "(Ljava/lang/String;)Z");
-    jmethodID getI = env->GetMethodID(jsonClass, "getInt", "(Ljava/lang/String;)I");
     jmethodID optI = env->GetMethodID(jsonClass, "optInt", "(Ljava/lang/String;I)I");
     jmethodID optS = env->GetMethodID(jsonClass, "optString", "(Ljava/lang/String;)Ljava/lang/String;");
 
-    jstring jText = (jstring)env->CallObjectMethod(json, getS, env->NewStringUTF("text"));
-    jstring jFont = (jstring)env->CallObjectMethod(json, getS, env->NewStringUTF("font"));
-    jstring jAlign = (jstring)env->CallObjectMethod(json, getS, env->NewStringUTF("alignment"));
-    jstring jFontPath = (jstring)env->CallObjectMethod(json, getS, env->NewStringUTF("fontPath"));
-
-    jboolean hasUnderline = env->CallBooleanMethod(json, getB, env->NewStringUTF("underline"));
-    jboolean hasStrikeout = env->CallBooleanMethod(json, getB, env->NewStringUTF("strikeout"));
-    jboolean isBold = env->CallBooleanMethod(json, getB, env->NewStringUTF("bold"));
-    jboolean isItalic = env->CallBooleanMethod(json, getB, env->NewStringUTF("italic"));
-    jboolean hasBg = env->CallBooleanMethod(json, getB, env->NewStringUTF("hasBackground"));
-
-    double rotation = 0, jsonSize = 0, jsonWidth = 0, jsonHeight = 0;
+    double rotation = 0, jsonWidth = 0, jsonHeight = 0;
     try {
         rotation = env->CallDoubleMethod(json, getD, env->NewStringUTF("rotation"));
-        jsonSize = env->CallDoubleMethod(json, getD, env->NewStringUTF("size"));
         jsonWidth = env->CallDoubleMethod(json, getD, env->NewStringUTF("width"));
         jsonHeight = env->CallDoubleMethod(json, getD, env->NewStringUTF("height"));
     } catch (...) {}
@@ -7209,16 +7272,6 @@ static void processTextStamp(JNIEnv* env, jobject obj, FPDF_DOCUMENT doc, FPDF_P
     const int textG = optIntValue("textColorG", g);
     const int textB = optIntValue("textColorB", b);
     const int textA = optIntValue("textColorA", defaultAlpha);
-
-    const jsize textLength = env->GetStringLength(jText);
-    const jchar* rawTextContent = env->GetStringChars(jText, nullptr);
-    std::vector<unsigned short> textContent(textLength + 1, 0);
-    if (rawTextContent) {
-        memcpy(textContent.data(), rawTextContent, textLength * sizeof(jchar));
-    }
-    const char* fontName = jFont ? env->GetStringUTFChars(jFont, nullptr) : nullptr;
-    const char* alignStr = env->GetStringUTFChars(jAlign, nullptr);
-    const char* fontPath = jFontPath ? env->GetStringUTFChars(jFontPath, nullptr) : nullptr;
 
     // Recreated text stamps carry their base box in JSON while the annotation rect
     // may already be the expanded rotated bounds. Prefer JSON dimensions when present.
@@ -7237,95 +7290,20 @@ static void processTextStamp(JNIEnv* env, jobject obj, FPDF_DOCUMENT doc, FPDF_P
     FPDFAnnot_SetRect(annot, &drawRect);
     FPDFAnnot_SetColor(annot, FPDFANNOT_COLORTYPE_Color, textR, textG, textB, textA);
 
-    // Keep PDF text anchored to the exported object center. The extra vertical
-    // offset made saved text appear slightly shifted compared to the canvas.
-    float centerY = origCenterY;
-    double cosA = cos(angleRad), sinA = sin(angleRad);
-
-    if (hasBg) {
-        FPDF_PAGEOBJECT bg = FPDFPageObj_CreateNewRect(-initialWidth/2.0f, -initialHeight/2.0f, initialWidth, initialHeight);
-        FPDFPageObj_SetFillColor(bg, env->CallIntMethod(json, getI, env->NewStringUTF("bgColorR")),
-                                 env->CallIntMethod(json, getI, env->NewStringUTF("bgColorG")),
-                                 env->CallIntMethod(json, getI, env->NewStringUTF("bgColorB")),
-                                 (int)(env->CallDoubleMethod(json, getD, env->NewStringUTF("bgOpacity")) * 255));
-        FPDFPath_SetDrawMode(bg, 1, JNI_FALSE);
-        FPDFPageObj_Transform(bg, cosA, sinA, -sinA, cosA, origCenterX, centerY);
-        FPDFAnnot_AppendObject(annot, bg);
-    }
-
-    FPDF_FONT loadedFont = nullptr;
-    if (fontPath) {
-        FILE* f = fopen(fontPath, "rb");
-        if (f) {
-            fseek(f, 0, SEEK_END); long fSize = ftell(f); rewind(f);
-            std::vector<uint8_t> buffer(fSize); fread(buffer.data(), 1, fSize, f); fclose(f);
-            loadedFont = FPDFText_LoadFont(doc, buffer.data(), fSize, FPDF_FONT_TRUETYPE, true);
-        }
-    }
-    if (!loadedFont) {
-        const char* fallbackFont = "Helvetica";
-        if (fontName) {
-            if (strcmp(fontName, "serif") == 0 || strstr(fontName, "Serif") != nullptr || strstr(fontName, "serif") != nullptr) {
-                fallbackFont = "Times-Roman";
-            } else if (strstr(fontName, "Mono") != nullptr || strstr(fontName, "mono") != nullptr || strstr(fontName, "Courier") != nullptr) {
-                fallbackFont = "Courier";
-            }
-        }
-        loadedFont = FPDFText_LoadStandardFont(doc, fallbackFont);
-    }
-
-    // Build the text object at unit font size, then apply the editor text size
-    // through the object transform. This matches the old canvas/export behavior
-    // more closely than treating the editor size as a PDF point size directly.
-    FPDF_PAGEOBJECT textObj = FPDFPageObj_CreateTextObj(doc, loadedFont, 1.0f);
-    if (textObj) {
-        FPDFText_SetText(textObj, (FPDF_WIDESTRING)textContent.data());
-        FPDFPageObj_SetFillColor(textObj, textR, textG, textB, textA);
-        float tL, tB, tR, tT; FPDFPageObj_GetBounds(textObj, &tL, &tB, &tR, &tT);
-        float bW = tR - tL, bH = tT - tB;
-        float scale = (jsonSize > 0.0) ? (float)jsonSize : 12.0f;
-        if (bW > initialWidth || bH > initialHeight) {
-            scale = fmin(initialWidth / fmax(bW, 0.0001f), initialHeight / fmax(bH, 0.0001f)) * 0.95f;
-        } else if ((bW * scale) > initialWidth || (bH * scale) > initialHeight) {
-            scale = fmin(initialWidth / fmax(bW, 0.0001f), initialHeight / fmax(bH, 0.0001f)) * 0.95f;
-        }
-
-        float scaledLeft = tL * scale, scaledBottom = tB * scale;
-        float scaledRight = tR * scale, scaledTop = tT * scale;
-        float textW = scaledRight - scaledLeft, textH = scaledTop - scaledBottom;
-
-        float alignedLeft = -textW / 2.0f;
-        if (strcmp(alignStr, "left") == 0) alignedLeft = -initialWidth / 2.0f;
-        else if (strcmp(alignStr, "right") == 0) alignedLeft = (initialWidth / 2.0f) - textW;
-
-        float alignedBottom = -textH / 2.0f;
-        float lX = alignedLeft - scaledLeft;
-        float lY = alignedBottom - scaledBottom;
-        float skewX = isItalic ? 0.25f : 0.0f;
-        FPDFPageObj_Transform(textObj, cosA * scale, sinA * scale, (-sinA + skewX) * scale, cosA * scale,
-                              origCenterX + (lX * cosA - lY * sinA), centerY + (lX * sinA + lY * cosA));
-
-        if (isBold) {
-            FPDFPageObj_SetStrokeColor(textObj, textR, textG, textB, textA);
-            FPDFPageObj_SetStrokeWidth(textObj, textH * 0.05f);
-            FPDFTextObj_SetTextRenderMode(textObj, FPDF_TEXTRENDERMODE_FILL_STROKE);
-        }
-        FPDFAnnot_AppendObject(annot, textObj);
-
-        auto drawLine = [&](float baselineOffset) {
-            float lineStartX = alignedLeft;
-            float lineY = lY + (baselineOffset * scale);
-            FPDF_PAGEOBJECT line = FPDFPageObj_CreateNewPath(0, 0);
-            FPDFPath_LineTo(line, textW, 0);
-            FPDFPageObj_Transform(line, cosA, sinA, -sinA, cosA,
-                                  origCenterX + (lineStartX * cosA - lineY * sinA),
-                                  centerY + (lineStartX * sinA + lineY * cosA));
-            FPDFPageObj_SetStrokeColor(line, textR, textG, textB, textA); FPDFPageObj_SetStrokeWidth(line, textH * 0.05f);
-            FPDFPath_SetDrawMode(line, 0, JNI_TRUE); FPDFAnnot_AppendObject(annot, line);
-        };
-        if (hasUnderline) drawLine(-0.15f);
-        if (hasStrikeout) drawLine(0.30f);
-    }
+    appendSimplePdfStampTextObject(
+            env,
+            doc,
+            page,
+            annot,
+            rect,
+            json,
+            jsonClass,
+            r,
+            g,
+            b,
+            alpha,
+            false
+    );
     const jchar* rawJsonContent = env->GetStringChars(jJsonStr, nullptr);
     FPDFAnnot_SetStringValue(annot, "Contents", (FPDF_WIDESTRING)rawJsonContent);
     SetAnnotWideStringValueFromJString(env, annot, "LufickTextStampMeta", jJsonStr);
@@ -7339,11 +7317,8 @@ static void processTextStamp(JNIEnv* env, jobject obj, FPDF_DOCUMENT doc, FPDF_P
     env->DeleteLocalRef(jSignatureSubtypeKey);
     env->ReleaseStringChars(jJsonStr, rawJsonContent);
     FPDFAnnot_SetFlags(annot, FPDF_ANNOT_FLAG_PRINT | FPDF_ANNOT_FLAG_READONLY);
-    if (rawTextContent) env->ReleaseStringChars(jText, rawTextContent);
-    if (fontName) env->ReleaseStringUTFChars(jFont, fontName);
-    env->ReleaseStringUTFChars(jAlign, alignStr);
-    if (fontPath) env->ReleaseStringUTFChars(jFontPath, fontPath);
     env->DeleteLocalRef(json);
+    env->DeleteLocalRef(jJsonStr);
 }
 
 static bool processPageLevelTextWatermark(
@@ -7716,6 +7691,7 @@ static void processFreeText(JNIEnv* env, jobject obj, FPDF_DOCUMENT doc, FPDF_PA
     };
 
     jstring jText = optStringValue("text", "");
+    jstring jLayoutText = optStringValue("layoutText", "");
     jstring jFont = optStringValue("font", "Helvetica");
     jstring jAlign = optStringValue("alignment", "center");
     jstring jFontPath = optStringValue("fontPath", "");
@@ -7727,10 +7703,15 @@ static void processFreeText(JNIEnv* env, jobject obj, FPDF_DOCUMENT doc, FPDF_PA
     jboolean hasBg = optBoolValue("hasBackground", JNI_FALSE);
 
     double rotation = 0, jsonSize = 0, jsonWidth = 0, jsonHeight = 0;
+    double jsonFontSpacing = 0, jsonLineHeight = 0, jsonFontAscent = 0, jsonTextPadding = 0;
     rotation = optDoubleValue("rotation", 0.0);
     jsonSize = optDoubleValue("size", 12.0);
     jsonWidth = optDoubleValue("width", 0.0);
     jsonHeight = optDoubleValue("height", 0.0);
+    jsonFontSpacing = optDoubleValue("fontSpacing", 0.0);
+    jsonLineHeight = optDoubleValue("lineHeight", 0.0);
+    jsonFontAscent = optDoubleValue("fontAscent", 0.0);
+    jsonTextPadding = optDoubleValue("textPadding", 0.0);
 
     auto optIntValue = [&](const char* key, int fallback) -> int {
         jstring jKey = env->NewStringUTF(key);
@@ -7747,6 +7728,7 @@ static void processFreeText(JNIEnv* env, jobject obj, FPDF_DOCUMENT doc, FPDF_PA
     if (!jText || env->GetStringLength(jText) == 0) {
         if (jFont) env->DeleteLocalRef(jFont);
         if (jText) env->DeleteLocalRef(jText);
+        if (jLayoutText) env->DeleteLocalRef(jLayoutText);
         if (jAlign) env->DeleteLocalRef(jAlign);
         if (jFontPath) env->DeleteLocalRef(jFontPath);
         env->DeleteLocalRef(json);
@@ -7754,12 +7736,32 @@ static void processFreeText(JNIEnv* env, jobject obj, FPDF_DOCUMENT doc, FPDF_PA
         return;
     }
 
-    const jsize textLength = env->GetStringLength(jText);
-    const jchar* rawTextContent = env->GetStringChars(jText, nullptr);
-    std::vector<unsigned short> textContent(textLength + 1, 0);
-    if (rawTextContent) {
-        memcpy(textContent.data(), rawTextContent, textLength * sizeof(jchar));
+    jstring jRenderedText = (jLayoutText && env->GetStringLength(jLayoutText) > 0)
+                            ? jLayoutText
+                            : jText;
+    const jsize renderedTextLength = env->GetStringLength(jRenderedText);
+    const jchar* rawRenderedText = env->GetStringChars(jRenderedText, nullptr);
+    std::vector<std::vector<unsigned short>> textLines;
+    std::vector<unsigned short> currentLine;
+    if (rawRenderedText) {
+        for (jsize index = 0; index < renderedTextLength; index++) {
+            const unsigned short character = rawRenderedText[index];
+            if (character == '\r' || character == '\n') {
+                if (character == '\r' &&
+                    index + 1 < renderedTextLength &&
+                    rawRenderedText[index + 1] == '\n') {
+                    index++;
+                }
+                currentLine.push_back(0);
+                textLines.push_back(currentLine);
+                currentLine.clear();
+            } else {
+                currentLine.push_back(character);
+            }
+        }
     }
+    currentLine.push_back(0);
+    textLines.push_back(currentLine);
     const char* fontName = jFont ? env->GetStringUTFChars(jFont, nullptr) : nullptr;
     const char* alignStr = jAlign ? env->GetStringUTFChars(jAlign, nullptr) : "center";
     const char* fontPath = jFontPath ? env->GetStringUTFChars(jFontPath, nullptr) : nullptr;
@@ -7807,64 +7809,142 @@ static void processFreeText(JNIEnv* env, jobject obj, FPDF_DOCUMENT doc, FPDF_PA
         loadedFont = FPDFText_LoadStandardFont(doc, fallbackFontName);
     }
 
-    FPDF_PAGEOBJECT textObj = FPDFPageObj_CreateTextObj(doc, loadedFont, 1.0f);
-    if (textObj) {
-        FPDFText_SetText(textObj, (FPDF_WIDESTRING)textContent.data());
-        FPDFPageObj_SetFillColor(textObj, textR, textG, textB, textA);
-        float tL, tB, tR, tT; FPDFPageObj_GetBounds(textObj, &tL, &tB, &tR, &tT);
-        float bW = tR - tL, bH = tT - tB;
-        float scale = (jsonSize > 0.0) ? (float)jsonSize : 12.0f;
-        if (bW > initialWidth || bH > initialHeight) {
-            scale = fmin(initialWidth / fmax(bW, 0.0001f), initialHeight / fmax(bH, 0.0001f)) * 0.95f;
-        } else if ((bW * scale) > initialWidth || (bH * scale) > initialHeight) {
-            scale = fmin(initialWidth / fmax(bW, 0.0001f), initialHeight / fmax(bH, 0.0001f)) * 0.95f;
+    struct FreeTextLineBounds {
+        float left = 0.0f;
+        float width = 0.0f;
+        FPDF_PAGEOBJECT textObject = nullptr;
+    };
+    std::vector<FreeTextLineBounds> lineBounds(textLines.size());
+    float maxUnitLineWidth = 0.0f;
+    for (size_t lineIndex = 0; lineIndex < textLines.size(); lineIndex++) {
+        if (textLines[lineIndex].size() <= 1) continue;
+        FPDF_PAGEOBJECT textObject = FPDFPageObj_CreateTextObj(doc, loadedFont, 1.0f);
+        if (!textObject) continue;
+        if (FPDFText_SetText(textObject, (FPDF_WIDESTRING)textLines[lineIndex].data())) {
+            float lineLeft = 0.0f, lineBottom = 0.0f, lineRight = 0.0f, lineTop = 0.0f;
+            if (FPDFPageObj_GetBounds(textObject, &lineLeft, &lineBottom, &lineRight, &lineTop)) {
+                lineBounds[lineIndex].textObject = textObject;
+                lineBounds[lineIndex].left = lineLeft;
+                lineBounds[lineIndex].width = fmax(0.0f, lineRight - lineLeft);
+                maxUnitLineWidth = fmax(maxUnitLineWidth, lineBounds[lineIndex].width);
+            } else {
+                FPDFPageObj_Destroy(textObject);
+            }
+        } else {
+            FPDFPageObj_Destroy(textObject);
+        }
+    }
+
+    const float requestedFontSize = (jsonSize > 0.0) ? (float)jsonSize : 12.0f;
+    const float requestedFontSpacing = (jsonFontSpacing > 0.0)
+                                       ? (float)jsonFontSpacing
+                                       : requestedFontSize * 1.20f;
+    const float requestedLineHeight = (jsonLineHeight > 0.0)
+                                      ? (float)jsonLineHeight
+                                      : requestedFontSpacing;
+    const float requestedFontAscent = (jsonFontAscent < 0.0)
+                                      ? (float)jsonFontAscent
+                                      : -requestedFontSize * 0.80f;
+    const float horizontalPadding = fmax(0.0f, (float)jsonTextPadding);
+    const float availableWidth = fmax(0.1f, initialWidth - horizontalPadding);
+    const float requestedBlockHeight = requestedFontSpacing +
+                                       fmax(0.0f, (float)textLines.size() - 1.0f) *
+                                       requestedLineHeight;
+
+    float fitScale = 1.0f;
+    const float requestedMaxLineWidth = maxUnitLineWidth * requestedFontSize;
+    if (requestedMaxLineWidth > availableWidth) {
+        fitScale = fmin(fitScale, availableWidth / requestedMaxLineWidth);
+    }
+    if (requestedBlockHeight > initialHeight) {
+        fitScale = fmin(fitScale, initialHeight / requestedBlockHeight);
+    }
+    fitScale = fmax(0.01f, fmin(1.0f, fitScale));
+
+    const float fontSize = requestedFontSize * fitScale;
+    const float fontSpacing = requestedFontSpacing * fitScale;
+    const float lineHeight = requestedLineHeight * fitScale;
+    const float fontAscent = requestedFontAscent * fitScale;
+    const float textBlockHeight = fontSpacing +
+                                  fmax(0.0f, (float)textLines.size() - 1.0f) *
+                                  lineHeight;
+    const float firstBaselineY = (textBlockHeight / 2.0f) + fontAscent;
+    const float skewX = isItalic ? 0.25f : 0.0f;
+    const float transformA = (float)(cosA * fontSize);
+    const float transformB = (float)(sinA * fontSize);
+    const float transformC = (float)((cosA * skewX - sinA) * fontSize);
+    const float transformD = (float)((sinA * skewX + cosA) * fontSize);
+
+    for (size_t lineIndex = 0; lineIndex < textLines.size(); lineIndex++) {
+        const float baselineY = firstBaselineY - ((float)lineIndex * lineHeight);
+        const float textWidth = lineBounds[lineIndex].width * fontSize;
+        float alignedLeft = -textWidth / 2.0f;
+        if (strcmp(alignStr, "left") == 0) {
+            alignedLeft = (-initialWidth / 2.0f) + (horizontalPadding / 2.0f);
+        } else if (strcmp(alignStr, "right") == 0) {
+            alignedLeft = (initialWidth / 2.0f) - (horizontalPadding / 2.0f) - textWidth;
         }
 
-        float scaledLeft = tL * scale, scaledBottom = tB * scale;
-        float scaledRight = tR * scale, scaledTop = tT * scale;
-        float textW = scaledRight - scaledLeft, textH = scaledTop - scaledBottom;
+        FPDF_PAGEOBJECT textObj = lineBounds[lineIndex].textObject;
+        if (textObj) {
+                FPDFPageObj_SetFillColor(textObj, textR, textG, textB, textA);
+                const float originX = alignedLeft - (lineBounds[lineIndex].left * fontSize);
+                const float translatedX = origCenterX +
+                                          (float)(originX * cosA - baselineY * sinA);
+                const float translatedY = centerY +
+                                          (float)(originX * sinA + baselineY * cosA);
+                FPDFPageObj_Transform(
+                        textObj,
+                        transformA,
+                        transformB,
+                        transformC,
+                        transformD,
+                        translatedX,
+                        translatedY
+                );
 
-        float alignedLeft = -textW / 2.0f;
-        if (strcmp(alignStr, "left") == 0) alignedLeft = -initialWidth / 2.0f;
-        else if (strcmp(alignStr, "right") == 0) alignedLeft = (initialWidth / 2.0f) - textW;
-
-        float alignedBottom = -textH / 2.0f;
-        float lX = alignedLeft - scaledLeft;
-        float lY = alignedBottom - scaledBottom;
-        float skewX = isItalic ? 0.25f : 0.0f;
-        FPDFPageObj_Transform(textObj, cosA * scale, sinA * scale, (-sinA + skewX) * scale, cosA * scale,
-                              origCenterX + (lX * cosA - lY * sinA), centerY + (lX * sinA + lY * cosA));
-
-        if (isBold) {
-            FPDFPageObj_SetStrokeColor(textObj, textR, textG, textB, textA);
-            FPDFPageObj_SetStrokeWidth(textObj, textH * 0.05f);
-            FPDFTextObj_SetTextRenderMode(textObj, FPDF_TEXTRENDERMODE_FILL_STROKE);
+                if (isBold) {
+                    FPDFPageObj_SetStrokeColor(textObj, textR, textG, textB, textA);
+                    FPDFPageObj_SetStrokeWidth(textObj, fmax(0.35f, fontSize * 0.04f));
+                    FPDFTextObj_SetTextRenderMode(textObj, FPDF_TEXTRENDERMODE_FILL_STROKE);
+                }
+                FPDFPage_InsertObject(page, textObj);
         }
-        FPDFPage_InsertObject(page, textObj);
 
-        auto drawLine = [&](float baselineOffset) {
-            float lineStartX = alignedLeft;
-            float lineY = lY + (baselineOffset * scale);
-            FPDF_PAGEOBJECT line = FPDFPageObj_CreateNewPath(0, 0);
-            FPDFPath_LineTo(line, textW, 0);
-            FPDFPageObj_Transform(line, cosA, sinA, -sinA, cosA,
-                                  origCenterX + (lineStartX * cosA - lineY * sinA),
-                                  centerY + (lineStartX * sinA + lineY * cosA));
+        auto drawDecoration = [&](float localY) {
+            if (textWidth <= 0.0f) return;
+            FPDF_PAGEOBJECT line = FPDFPageObj_CreateNewPath(0.0f, 0.0f);
+            if (!line) return;
+            FPDFPath_LineTo(line, textWidth, 0.0f);
+            const float translatedX = origCenterX +
+                                      (float)(alignedLeft * cosA - localY * sinA);
+            const float translatedY = centerY +
+                                      (float)(alignedLeft * sinA + localY * cosA);
+            FPDFPageObj_Transform(
+                    line,
+                    (float)cosA,
+                    (float)sinA,
+                    (float)-sinA,
+                    (float)cosA,
+                    translatedX,
+                    translatedY
+            );
             FPDFPageObj_SetStrokeColor(line, textR, textG, textB, textA);
-            FPDFPageObj_SetStrokeWidth(line, textH * 0.05f);
+            FPDFPageObj_SetStrokeWidth(line, fmax(0.35f, fontSize * 0.04f));
             FPDFPath_SetDrawMode(line, 0, JNI_TRUE);
             FPDFPage_InsertObject(page, line);
         };
-        if (hasUnderline) drawLine(-0.15f);
-        if (hasStrikeout) drawLine(0.30f);
+        if (hasUnderline) drawDecoration(baselineY - (fontSize * 0.12f));
+        if (hasStrikeout) drawDecoration(baselineY + (fontSize * 0.30f));
     }
 
-    if (rawTextContent) env->ReleaseStringChars(jText, rawTextContent);
+    if (rawRenderedText) env->ReleaseStringChars(jRenderedText, rawRenderedText);
     if (fontName) env->ReleaseStringUTFChars(jFont, fontName);
     if (jAlign && alignStr) env->ReleaseStringUTFChars(jAlign, alignStr);
     if (fontPath) env->ReleaseStringUTFChars(jFontPath, fontPath);
     if (jFont) env->DeleteLocalRef(jFont);
     if (jText) env->DeleteLocalRef(jText);
+    if (jLayoutText) env->DeleteLocalRef(jLayoutText);
     if (jAlign) env->DeleteLocalRef(jAlign);
     if (jFontPath) env->DeleteLocalRef(jFontPath);
     env->DeleteLocalRef(json);
@@ -10993,7 +11073,12 @@ static bool appendSimplePdfStampTextObject(
     const float fontSpacingPx = fmax(static_cast<float>(optDoubleValue("fontSpacingPx", canvasHeight)), 0.0001f);
     const float fontAscentPx = static_cast<float>(optDoubleValue("fontAscentPx", -fontSpacingPx * 0.8f));
     const float lineSpacing = fmax(static_cast<float>(optDoubleValue("lineSpacing", 1.0)), 0.1f);
-    const float textPaddingPx = fmax(static_cast<float>(optDoubleValue("textPadding", 0.0)), 0.0f);
+    const float textPaddingPx = fmax(
+            static_cast<float>(
+                    optDoubleValue("textPaddingPx", optDoubleValue("textPadding", 0.0))
+            ),
+            0.0f
+    );
     const float pxToPageX = initialWidth / canvasWidth;
     const float pxToPageY = initialHeight / canvasHeight;
     const float totalTextHeightPx = (layoutLines.size() * fontSpacingPx) +
@@ -11715,88 +11800,6 @@ static float GetSquigglyRenderThickness(float rectHeight, float strokeRatio) {
     return fmax(fmax(rectHeight, 1.0f) * previewRatio, 0.5f);
 }
 
-static bool IsSameHighlightVisualLine(float firstTop, float firstBottom, float secondTop, float secondBottom) {
-    const float overlapHeight = fmin(firstTop, secondTop) - fmax(firstBottom, secondBottom);
-    const float firstHeight = fmax(firstTop - firstBottom, 0.0f);
-    const float secondHeight = fmax(secondTop - secondBottom, 0.0f);
-    const float minHeight = fmin(firstHeight, secondHeight);
-    if (minHeight > 0.0f && overlapHeight >= minHeight * 0.35f) {
-        return true;
-    }
-
-    const float firstCenterY = (firstTop + firstBottom) * 0.5f;
-    const float secondCenterY = (secondTop + secondBottom) * 0.5f;
-    return fabsf(firstCenterY - secondCenterY) <= fmax(firstHeight, secondHeight) * 0.4f;
-}
-
-struct HighlightLineBand {
-    float left;
-    float right;
-    float top;
-    float bottom;
-    float height;
-    int anchorIndex;
-    bool valid;
-};
-
-static HighlightLineBand ResolveHighlightLineBand(
-        JNIEnv* env,
-        jobject rectsArray,
-        int rectCount,
-        int targetIndex,
-        float targetTop,
-        float targetBottom,
-        jmethodID jsonArrayGetObject,
-        jmethodID jsonGetDouble
-) {
-    HighlightLineBand band = {0.0f, 0.0f, targetTop, targetBottom, fmax(targetTop - targetBottom, 0.5f), targetIndex, false};
-    jstring jLeftKey = env->NewStringUTF("left");
-    jstring jTopKey = env->NewStringUTF("top");
-    jstring jRightKey = env->NewStringUTF("right");
-    jstring jBottomKey = env->NewStringUTF("bottom");
-
-    for (int index = 0; index < rectCount; index++) {
-        jobject candidateRect = env->CallObjectMethod(rectsArray, jsonArrayGetObject, index);
-        if (!candidateRect) continue;
-
-        const float candidateLeftRaw = (float)env->CallDoubleMethod(candidateRect, jsonGetDouble, jLeftKey);
-        const float candidateTopRaw = (float)env->CallDoubleMethod(candidateRect, jsonGetDouble, jTopKey);
-        const float candidateRightRaw = (float)env->CallDoubleMethod(candidateRect, jsonGetDouble, jRightKey);
-        const float candidateBottomRaw = (float)env->CallDoubleMethod(candidateRect, jsonGetDouble, jBottomKey);
-        const float candidateLeft = fmin(candidateLeftRaw, candidateRightRaw);
-        const float candidateRight = fmax(candidateLeftRaw, candidateRightRaw);
-        const float candidateTop = fmax(candidateTopRaw, candidateBottomRaw);
-        const float candidateBottom = fmin(candidateTopRaw, candidateBottomRaw);
-
-        if (IsSameHighlightVisualLine(targetTop, targetBottom, candidateTop, candidateBottom)) {
-            if (!band.valid) {
-                band.left = candidateLeft;
-                band.right = candidateRight;
-                band.top = candidateTop;
-                band.bottom = candidateBottom;
-                band.height = fmax(candidateTop - candidateBottom, 0.5f);
-                band.anchorIndex = index;
-                band.valid = true;
-            } else {
-                band.left = fmin(band.left, candidateLeft);
-                band.right = fmax(band.right, candidateRight);
-                band.top = fmax(band.top, candidateTop);
-                band.bottom = fmin(band.bottom, candidateBottom);
-                band.height = fmax(band.height, fmax(candidateTop - candidateBottom, 0.5f));
-                band.anchorIndex = fmin(band.anchorIndex, index);
-            }
-        }
-
-        env->DeleteLocalRef(candidateRect);
-    }
-
-    env->DeleteLocalRef(jLeftKey);
-    env->DeleteLocalRef(jTopKey);
-    env->DeleteLocalRef(jRightKey);
-    env->DeleteLocalRef(jBottomKey);
-    return band;
-}
-
 static void AppendStraightTextMarkupAppearance(
         FPDF_ANNOTATION annot,
         float left,
@@ -12475,31 +12478,9 @@ static void ApplyExistingTextMarkupStyle(
         const float quadTop = (float)env->CallDoubleMethod(rectObj, jsonGetDouble, jTopKey);
         float quadRight = (float)env->CallDoubleMethod(rectObj, jsonGetDouble, jRightKey);
         const float quadBottom = (float)env->CallDoubleMethod(rectObj, jsonGetDouble, jBottomKey);
-        float rectTop = fmax(quadTop, quadBottom);
-        float rectBottom = fmin(quadTop, quadBottom);
-        const HighlightLineBand lineBand = ResolveHighlightLineBand(
-                env,
-                rectsArray,
-                rectCount,
-                rectIndex,
-                rectTop,
-                rectBottom,
-                jsonArrayGetObject,
-                jsonGetDouble
-        );
-        if (lineBand.valid && rectIndex != lineBand.anchorIndex) {
-            env->DeleteLocalRef(rectObj);
-            continue;
-        }
-        if (lineBand.valid) {
-            quadLeft = lineBand.left;
-            quadRight = lineBand.right;
-            rectTop = lineBand.top;
-            rectBottom = lineBand.bottom;
-        }
-        const float rectHeight = lineBand.valid
-                ? lineBand.height
-                : fmax(rectTop - rectBottom, 0.5f);
+        const float rectTop = fmax(quadTop, quadBottom);
+        const float rectBottom = fmin(quadTop, quadBottom);
+        const float rectHeight = fmax(rectTop - rectBottom, 0.5f);
         const float strokeRatio = GetClampedTextMarkupStrokeRatio(
                 typeInt,
                 env->CallDoubleMethod(
@@ -12513,10 +12494,7 @@ static void ApplyExistingTextMarkupStyle(
                 ? GetSquigglyRenderThickness(rectHeight, strokeRatio)
                 : fmax(rectHeight * strokeRatio, 0.5f);
 
-        float attachmentTop = rectTop;
-        float attachmentBottom = rectBottom;
         if (typeInt == 1) {
-            attachmentTop = rectBottom + thickness;
             const float lineY = rectBottom + (thickness * 0.5f);
             AppendStraightTextMarkupAppearance(
                     annot,
@@ -12531,14 +12509,11 @@ static void ApplyExistingTextMarkupStyle(
             );
         } else if (typeInt == 2) {
             const float centerY = (rectTop + rectBottom) * 0.5f;
-            attachmentTop = centerY + (thickness * 0.5f);
-            attachmentBottom = centerY - (thickness * 0.5f);
-            const float lineY = (attachmentTop + attachmentBottom) * 0.5f;
             AppendStraightTextMarkupAppearance(
                     annot,
                     quadLeft,
                     quadRight,
-                    lineY,
+                    centerY,
                     r,
                     g,
                     b,
@@ -12546,13 +12521,13 @@ static void ApplyExistingTextMarkupStyle(
                     thickness
             );
         } else {
-            attachmentTop = GetSquigglyAttachmentTop(rectBottom, rectTop, thickness);
+            const float appearanceTop = GetSquigglyAttachmentTop(rectBottom, rectTop, thickness);
             AppendSquigglyTextMarkupAppearance(
                     annot,
                     quadLeft,
                     quadRight,
                     rectBottom,
-                    attachmentTop,
+                    appearanceTop,
                     r,
                     g,
                     b,
@@ -12562,10 +12537,10 @@ static void ApplyExistingTextMarkupStyle(
         }
 
         FS_QUADPOINTSF qp = {
-                fmin(quadLeft, quadRight), attachmentTop,
-                fmax(quadLeft, quadRight), attachmentTop,
-                fmin(quadLeft, quadRight), attachmentBottom,
-                fmax(quadLeft, quadRight), attachmentBottom
+                fmin(quadLeft, quadRight), rectTop,
+                fmax(quadLeft, quadRight), rectTop,
+                fmin(quadLeft, quadRight), rectBottom,
+                fmax(quadLeft, quadRight), rectBottom
         };
         if (static_cast<size_t>(quadWriteIndex) < existingQuadCount) {
             FPDFAnnot_SetAttachmentPoints(annot, quadWriteIndex, &qp);
@@ -12576,9 +12551,9 @@ static void ApplyExistingTextMarkupStyle(
 
         const FS_RECTF pieceBounds = {
                 fmin(quadLeft, quadRight),
-                typeInt == 8 ? attachmentBottom : rectBottom,
+                rectBottom,
                 fmax(quadLeft, quadRight),
-                typeInt == 8 ? attachmentTop : rectTop
+                rectTop
         };
         if (!hasBounds) {
             bounds = pieceBounds;
@@ -13315,7 +13290,6 @@ static bool ApplyNativeAnnotationEditActions(
                                                     ? GetSquigglyRenderThickness(rectHeight, strokeRatio)
                                                     : fmax(rectHeight * strokeRatio, 0.5f);
                                             if (typeInt == 1) {
-                                                rectTop = rectBottom + thickness;
                                                 float lineY = rectBottom + (thickness * 0.5f);
                                                 AppendStraightTextMarkupAppearance(
                                                         annot,
@@ -13331,14 +13305,11 @@ static bool ApplyNativeAnnotationEditActions(
                                             } else {
                                                 if (typeInt == 2) {
                                                     float centerY = (rectTop + rectBottom) * 0.5f;
-                                                    rectTop = centerY + (thickness * 0.5f);
-                                                    rectBottom = centerY - (thickness * 0.5f);
-                                                    float lineY = (rectTop + rectBottom) * 0.5f;
                                                     AppendStraightTextMarkupAppearance(
                                                             annot,
                                                             quadLeft,
                                                             quadRight,
-                                                            lineY,
+                                                            centerY,
                                                             r,
                                                             g,
                                                             b,
@@ -13346,13 +13317,14 @@ static bool ApplyNativeAnnotationEditActions(
                                                             thickness
                                                     );
                                                 } else {
-                                                    rectTop = GetSquigglyAttachmentTop(rectBottom, rectTop, thickness);
+                                                    const float appearanceTop =
+                                                            GetSquigglyAttachmentTop(rectBottom, rectTop, thickness);
                                                     AppendSquigglyTextMarkupAppearance(
                                                             annot,
                                                             quadLeft,
                                                             quadRight,
                                                             rectBottom,
-                                                            rectTop,
+                                                            appearanceTop,
                                                             r,
                                                             g,
                                                             b,
@@ -13566,72 +13538,20 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeSaveAnnotat
                                     float quadBottom = (float)env->CallDoubleMethod(rectObj, jsonGetDouble, env->NewStringUTF("bottom"));
                                     float rectTop = fmax(quadTop, quadBottom);
                                     float rectBottom = fmin(quadTop, quadBottom);
-                                    if (typeInt == 0) {
-                                        const HighlightLineBand lineBand = ResolveHighlightLineBand(
-                                                env,
-                                                rectsArray,
-                                                rectCount,
-                                                rectIndex,
-                                                rectTop,
-                                                rectBottom,
-                                                jsonArrayGetObject,
-                                                jsonGetDouble
-                                        );
-                                        if (lineBand.valid && rectIndex != lineBand.anchorIndex) {
-                                            env->DeleteLocalRef(rectObj);
-                                            continue;
-                                        }
-                                        if (lineBand.valid) {
-                                            quadLeft = lineBand.left;
-                                            quadRight = lineBand.right;
-                                            rectTop = lineBand.top;
-                                            rectBottom = lineBand.bottom;
-                                        }
-                                        const float rectHeight = lineBand.valid
-                                                ? lineBand.height
-                                                : fmax(rectTop - rectBottom, 0.5f);
-                                        const float topPadding = fmax(0.5f, rectHeight * 0.18f);
-                                        const float bottomPadding = fmax(0.5f, rectHeight * 0.08f);
-                                        rectTop += topPadding;
-                                        rectBottom -= bottomPadding;
-                                    }
                                     if (typeInt == 1 || typeInt == 2 || typeInt == 8) {
-                                        const HighlightLineBand lineBand = ResolveHighlightLineBand(
-                                                env,
-                                                rectsArray,
-                                                rectCount,
-                                                rectIndex,
-                                                rectTop,
-                                                rectBottom,
-                                                jsonArrayGetObject,
-                                                jsonGetDouble
-                                        );
-                                        if (lineBand.valid && rectIndex != lineBand.anchorIndex) {
-                                            env->DeleteLocalRef(rectObj);
-                                            continue;
-                                        }
-                                        if (lineBand.valid) {
-                                            quadLeft = lineBand.left;
-                                            quadRight = lineBand.right;
-                                        }
                                         double strokeRatioValue = env->CallDoubleMethod(
                                                 rectObj,
                                                 jsonOptDouble,
                                                 env->NewStringUTF("strokeWidthRatio"),
                                                 GetDefaultTextMarkupStrokeRatio(typeInt)
                                         );
-                                        float rectHeight = lineBand.valid
-                                                ? lineBand.height
-                                                : fmax(rectTop - rectBottom, 0.5f);
+                                        float rectHeight = fmax(rectTop - rectBottom, 0.5f);
                                         float strokeRatio = GetClampedTextMarkupStrokeRatio(typeInt, strokeRatioValue);
                                         float thickness = (typeInt == 8)
                                                 ? GetSquigglyRenderThickness(rectHeight, strokeRatio)
                                                 : fmax(rectHeight * strokeRatio, 0.5f);
                                         if (typeInt == 1) {
-                                            const float lineBottom = lineBand.valid ? lineBand.bottom : rectBottom;
-                                            rectBottom = lineBottom;
-                                            rectTop = lineBottom + thickness;
-                                            float lineY = lineBottom + (thickness * 0.5f);
+                                            float lineY = rectBottom + (thickness * 0.5f);
                                             AppendStraightTextMarkupAppearance(
                                                     annot,
                                                     quadLeft,
@@ -13645,17 +13565,12 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeSaveAnnotat
                                             );
                                         } else {
                                             if (typeInt == 2) {
-                                                const float lineTop = lineBand.valid ? lineBand.top : rectTop;
-                                                const float lineBottom = lineBand.valid ? lineBand.bottom : rectBottom;
-                                                float centerY = (lineTop + lineBottom) * 0.5f;
-                                                rectTop = centerY + (thickness * 0.5f);
-                                                rectBottom = centerY - (thickness * 0.5f);
-                                                float lineY = (rectTop + rectBottom) * 0.5f;
+                                                float centerY = (rectTop + rectBottom) * 0.5f;
                                                 AppendStraightTextMarkupAppearance(
                                                         annot,
                                                         quadLeft,
                                                         quadRight,
-                                                        lineY,
+                                                        centerY,
                                                         r,
                                                         g,
                                                         b,
@@ -13663,16 +13578,14 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeSaveAnnotat
                                                         thickness
                                                 );
                                         } else {
-                                            const float lineTop = lineBand.valid ? lineBand.top : rectTop;
-                                            const float lineBottom = lineBand.valid ? lineBand.bottom : rectBottom;
-                                            rectBottom = lineBottom;
-                                            rectTop = GetSquigglyAttachmentTop(lineBottom, lineTop, thickness);
+                                            const float appearanceTop =
+                                                    GetSquigglyAttachmentTop(rectBottom, rectTop, thickness);
                                             AppendSquigglyTextMarkupAppearance(
                                                     annot,
                                                     quadLeft,
                                                     quadRight,
                                                     rectBottom,
-                                                    rectTop,
+                                                    appearanceTop,
                                                     r,
                                                     g,
                                                     b,
@@ -13692,9 +13605,9 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeSaveAnnotat
                                     FPDFAnnot_AppendAttachmentPoints(annot, &qp);
                                     const FS_RECTF pieceBounds = {
                                             fmin(quadLeft, quadRight),
-                                            typeInt == 8 ? rectBottom : fmin(rectTop, rectBottom),
+                                            fmin(rectTop, rectBottom),
                                             fmax(quadLeft, quadRight),
-                                            typeInt == 8 ? rectTop : fmax(rectTop, rectBottom)
+                                            fmax(rectTop, rectBottom)
                                     };
                                     if (!hasBounds) {
                                         bounds = pieceBounds;
@@ -14248,12 +14161,50 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeSavePdfCrop
             break;
         }
 
-        const float pageWidth = static_cast<float>(FPDF_GetPageWidth(page));
-        const float pageHeight = static_cast<float>(FPDF_GetPageHeight(page));
-        const float cropLeft = pageWidth * (leftPercent / 100.0f);
-        const float cropRight = pageWidth - (pageWidth * (rightPercent / 100.0f));
-        const float cropBottom = pageHeight * (bottomPercent / 100.0f);
-        const float cropTop = pageHeight - (pageHeight * (topPercent / 100.0f));
+        float baseLeft = 0.0f;
+        float baseBottom = 0.0f;
+        float baseRight = 0.0f;
+        float baseTop = 0.0f;
+        if (!FPDFPage_GetCropBox(page, &baseLeft, &baseBottom, &baseRight, &baseTop)) {
+            if (!FPDFPage_GetMediaBox(page, &baseLeft, &baseBottom, &baseRight, &baseTop)) {
+                baseRight = static_cast<float>(FPDF_GetPageWidth(page));
+                baseTop = static_cast<float>(FPDF_GetPageHeight(page));
+            }
+        }
+
+        float originalLeftPercent = leftPercent;
+        float originalTopPercent = topPercent;
+        float originalRightPercent = rightPercent;
+        float originalBottomPercent = bottomPercent;
+        switch (FPDFPage_GetRotation(page)) {
+            case 1: // 90 degrees clockwise.
+                originalLeftPercent = topPercent;
+                originalTopPercent = rightPercent;
+                originalRightPercent = bottomPercent;
+                originalBottomPercent = leftPercent;
+                break;
+            case 2: // 180 degrees clockwise.
+                originalLeftPercent = rightPercent;
+                originalTopPercent = bottomPercent;
+                originalRightPercent = leftPercent;
+                originalBottomPercent = topPercent;
+                break;
+            case 3: // 270 degrees clockwise.
+                originalLeftPercent = bottomPercent;
+                originalTopPercent = leftPercent;
+                originalRightPercent = topPercent;
+                originalBottomPercent = rightPercent;
+                break;
+            default:
+                break;
+        }
+
+        const float pageWidth = baseRight - baseLeft;
+        const float pageHeight = baseTop - baseBottom;
+        const float cropLeft = baseLeft + pageWidth * (originalLeftPercent / 100.0f);
+        const float cropRight = baseRight - pageWidth * (originalRightPercent / 100.0f);
+        const float cropBottom = baseBottom + pageHeight * (originalBottomPercent / 100.0f);
+        const float cropTop = baseTop - pageHeight * (originalTopPercent / 100.0f);
 
         if (cropLeft >= cropRight || cropBottom >= cropTop) {
             FPDF_ClosePage(page);
