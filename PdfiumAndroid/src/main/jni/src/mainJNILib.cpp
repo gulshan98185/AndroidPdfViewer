@@ -7120,6 +7120,154 @@ static LufickContentObjectMetadata ReadLufickContentObjectMetadata(FPDF_PAGEOBJE
     return metadata;
 }
 
+static bool IsEditableShadingProxy(FPDF_PAGEOBJECT pageObject) {
+    return pageObject &&
+           FPDFPageObj_GetType(pageObject) == FPDF_PAGEOBJ_IMAGE &&
+           ReadLufickContentObjectMetadata(pageObject).kind == "shading_proxy";
+}
+
+static bool IsEditableShadingObject(FPDF_PAGEOBJECT pageObject) {
+    return pageObject &&
+           (FPDFPageObj_GetType(pageObject) == FPDF_PAGEOBJ_SHADING ||
+            IsEditableShadingProxy(pageObject));
+}
+
+static FPDF_PAGEOBJECT CreateEditableShadingProxy(
+        FPDF_DOCUMENT doc,
+        FPDF_PAGE page,
+        FPDF_PAGEOBJECT shadingObject
+) {
+    float rawLeft = 0.0f;
+    float rawBottom = 0.0f;
+    float rawRight = 0.0f;
+    float rawTop = 0.0f;
+    if (!doc || !page || !shadingObject ||
+        !FPDFPageObj_GetBounds(
+                shadingObject,
+                &rawLeft,
+                &rawBottom,
+                &rawRight,
+                &rawTop
+        )) {
+        return nullptr;
+    }
+
+    const float left = std::min(rawLeft, rawRight);
+    const float right = std::max(rawLeft, rawRight);
+    const float bottom = std::min(rawBottom, rawTop);
+    const float top = std::max(rawBottom, rawTop);
+    const float width = right - left;
+    const float height = top - bottom;
+    if (width < 0.0001f || height < 0.0001f) return nullptr;
+
+    constexpr float kPreferredPixelsPerPoint = 2.0f;
+    constexpr float kMaximumBitmapSide = 2048.0f;
+    const float renderScale = std::max(
+            0.1f,
+            std::min(
+                    kPreferredPixelsPerPoint,
+                    std::min(kMaximumBitmapSide / width, kMaximumBitmapSide / height)
+            )
+    );
+    const int bitmapWidth = std::max(1, static_cast<int>(ceilf(width * renderScale)));
+    const int bitmapHeight = std::max(1, static_cast<int>(ceilf(height * renderScale)));
+    FPDF_BITMAP bitmap = FPDFBitmap_CreateEx(
+            bitmapWidth,
+            bitmapHeight,
+            FPDFBitmap_BGRA,
+            nullptr,
+            0
+    );
+    if (!bitmap) return nullptr;
+
+    FPDFBitmap_FillRect(bitmap, 0, 0, bitmapWidth, bitmapHeight, 0x00000000);
+    const float pageWidth = FPDF_GetPageWidthF(page);
+    const float pageHeight = FPDF_GetPageHeightF(page);
+    const int renderedPageWidth =
+            std::max(1, static_cast<int>(ceilf(pageWidth * renderScale)));
+    const int renderedPageHeight =
+            std::max(1, static_cast<int>(ceilf(pageHeight * renderScale)));
+    const int startX = static_cast<int>(roundf(-left * renderScale));
+    const int startY = static_cast<int>(roundf(-(pageHeight - top) * renderScale));
+    FPDF_RenderPageBitmap(
+            bitmap,
+            page,
+            startX,
+            startY,
+            renderedPageWidth,
+            renderedPageHeight,
+            0,
+            0
+    );
+
+    FPDF_PAGEOBJECT proxy = FPDFPageObj_NewImageObj(doc);
+    if (!proxy || !FPDFImageObj_SetBitmap(nullptr, 0, proxy, bitmap)) {
+        if (proxy) FPDFPageObj_Destroy(proxy);
+        FPDFBitmap_Destroy(bitmap);
+        return nullptr;
+    }
+    FPDFBitmap_Destroy(bitmap);
+
+    FPDFImageObj_SetMatrix(proxy, width, 0.0, 0.0, height, left, bottom);
+    AddLufickContentObjectMetadata(doc, proxy, "shading_proxy", "", "");
+    return proxy;
+}
+
+static bool ConvertNativeShadingsToEditableProxies(
+        FPDF_DOCUMENT doc,
+        FPDF_PAGE page
+) {
+    const int objectCount = page ? FPDFPage_CountObjects(page) : 0;
+    if (!doc || objectCount <= 0) return true;
+
+    std::vector<FPDF_PAGEOBJECT> originalObjects;
+    originalObjects.reserve(objectCount);
+    bool hasNativeShading = false;
+    for (int index = 0; index < objectCount; ++index) {
+        FPDF_PAGEOBJECT pageObject = FPDFPage_GetObject(page, index);
+        if (!pageObject) return false;
+        originalObjects.push_back(pageObject);
+        hasNativeShading =
+                hasNativeShading ||
+                FPDFPageObj_GetType(pageObject) == FPDF_PAGEOBJ_SHADING;
+    }
+    if (!hasNativeShading) return true;
+
+    std::vector<FPDF_PAGEOBJECT> replacements(objectCount, nullptr);
+    for (int index = 0; index < objectCount; ++index) {
+        FPDF_PAGEOBJECT original = originalObjects[index];
+        if (FPDFPageObj_GetType(original) != FPDF_PAGEOBJ_SHADING) continue;
+        replacements[index] = CreateEditableShadingProxy(doc, page, original);
+        if (replacements[index]) continue;
+
+        for (FPDF_PAGEOBJECT replacement : replacements) {
+            if (replacement) FPDFPageObj_Destroy(replacement);
+        }
+        return false;
+    }
+
+    for (int index = objectCount - 1; index >= 0; --index) {
+        if (FPDFPageObj_GetType(originalObjects[index]) != FPDF_PAGEOBJ_SHADING) continue;
+        if (!FPDFPage_RemoveObject(page, originalObjects[index])) {
+            for (FPDF_PAGEOBJECT replacement : replacements) {
+                if (replacement) FPDFPageObj_Destroy(replacement);
+            }
+            return false;
+        }
+    }
+
+    for (int index = 0; index < objectCount; ++index) {
+        FPDF_PAGEOBJECT replacement = replacements[index];
+        if (!replacement) continue;
+        if (!FPDFPage_InsertObjectAtIndex(page, replacement, static_cast<size_t>(index))) {
+            FPDFPageObj_Destroy(replacement);
+            return false;
+        }
+        FPDFPageObj_Destroy(originalObjects[index]);
+    }
+    return true;
+}
+
 static std::string GetBridgeDataPropertyUtf8(
         JNIEnv* env,
         jobject object,
@@ -12689,10 +12837,16 @@ static bool ApplyNativeAnnotationEditActions(
     };
     struct ContentPathTransformUpdate {
         int objectIndex;
+        int objectType;
         float left;
         float top;
         float right;
         float bottom;
+        bool hasSourceBounds;
+        float sourceLeft;
+        float sourceTop;
+        float sourceRight;
+        float sourceBottom;
     };
     std::map<int, std::vector<ContentPathStyleUpdate>> contentPathStyleUpdateMap;
     std::map<int, std::vector<ContentPathTransformUpdate>> contentPathTransformUpdateMap;
@@ -12710,7 +12864,7 @@ static bool ApplyNativeAnnotationEditActions(
             removeAllAnnotations = true;
         } else if (nativeSourceId >= 0 && nativeEditAction == 1) {
             const int objectType = env->GetIntField(obj, typeField);
-            if (objectType == 6) {
+            if (objectType == 6 || objectType == 19 || objectType == 20) {
                 objectRemovalMap[pageIndex].push_back({
                     nativeSourceId,
                     objectType,
@@ -12831,12 +12985,75 @@ static bool ApplyNativeAnnotationEditActions(
                 env->GetIntField(obj, alphaField)
             });
         } else if (nativeSourceId >= 0 && nativeEditAction == 10) {
+            const int objectType = env->GetIntField(obj, typeField);
+            bool hasSourceBounds = false;
+            float sourceLeft = 0.0f;
+            float sourceTop = 0.0f;
+            float sourceRight = 0.0f;
+            float sourceBottom = 0.0f;
+            if (objectType == 20) {
+                jstring formProperties = static_cast<jstring>(
+                        env->GetObjectField(obj, dataPropsField)
+                );
+                if (formProperties) {
+                    jobject formJson = env->NewObject(jsonClass, jsonInit, formProperties);
+                    if (formJson) {
+                        jstring sourceLeftKey = env->NewStringUTF("sourceLeft");
+                        jstring sourceTopKey = env->NewStringUTF("sourceTop");
+                        jstring sourceRightKey = env->NewStringUTF("sourceRight");
+                        jstring sourceBottomKey = env->NewStringUTF("sourceBottom");
+                        sourceLeft = static_cast<float>(env->CallDoubleMethod(
+                                formJson,
+                                jsonOptDouble,
+                                sourceLeftKey,
+                                static_cast<jdouble>(NAN)
+                        ));
+                        sourceTop = static_cast<float>(env->CallDoubleMethod(
+                                formJson,
+                                jsonOptDouble,
+                                sourceTopKey,
+                                static_cast<jdouble>(NAN)
+                        ));
+                        sourceRight = static_cast<float>(env->CallDoubleMethod(
+                                formJson,
+                                jsonOptDouble,
+                                sourceRightKey,
+                                static_cast<jdouble>(NAN)
+                        ));
+                        sourceBottom = static_cast<float>(env->CallDoubleMethod(
+                                formJson,
+                                jsonOptDouble,
+                                sourceBottomKey,
+                                static_cast<jdouble>(NAN)
+                        ));
+                        hasSourceBounds =
+                                std::isfinite(sourceLeft) &&
+                                std::isfinite(sourceTop) &&
+                                std::isfinite(sourceRight) &&
+                                std::isfinite(sourceBottom) &&
+                                fabsf(sourceRight - sourceLeft) >= 0.0001f &&
+                                fabsf(sourceTop - sourceBottom) >= 0.0001f;
+                        env->DeleteLocalRef(sourceBottomKey);
+                        env->DeleteLocalRef(sourceRightKey);
+                        env->DeleteLocalRef(sourceTopKey);
+                        env->DeleteLocalRef(sourceLeftKey);
+                        env->DeleteLocalRef(formJson);
+                    }
+                    env->DeleteLocalRef(formProperties);
+                }
+            }
             contentPathTransformUpdateMap[pageIndex].push_back({
                 nativeSourceId,
+                objectType,
                 env->GetFloatField(obj, leftField),
                 env->GetFloatField(obj, topField),
                 env->GetFloatField(obj, rightField),
-                env->GetFloatField(obj, bottomField)
+                env->GetFloatField(obj, bottomField),
+                hasSourceBounds,
+                sourceLeft,
+                sourceTop,
+                sourceRight,
+                sourceBottom
             });
         }
         env->DeleteLocalRef(obj);
@@ -12876,6 +13093,7 @@ static bool ApplyNativeAnnotationEditActions(
     for (const auto& entry : contentPathStyleUpdateMap) touchedPages[entry.first] = true;
     for (const auto& entry : contentPathTransformUpdateMap) touchedPages[entry.first] = true;
 
+    bool allPagesSucceeded = true;
     for (const auto& pageEntry : touchedPages) {
         int pageIndex = pageEntry.first;
         bool shouldClosePage = false;
@@ -12902,6 +13120,19 @@ static bool ApplyNativeAnnotationEditActions(
                 rectUpdateMap[pageIndex].size(),
                 processNewObjects ? 1 : 0
         );
+
+        if (!ConvertNativeShadingsToEditableProxies(doc, page)) {
+            LOGE(
+                    "PDF_EDIT_NATIVE failed to preserve shading objects on page=%d",
+                    pageIndex
+            );
+            for (const auto& update : contentImageUpdateMap[pageIndex]) {
+                if (update.replacementBitmap) FPDFBitmap_Destroy(update.replacementBitmap);
+            }
+            if (shouldClosePage) FPDF_ClosePage(page);
+            allPagesSucceeded = false;
+            continue;
+        }
 
         auto updatesIt = colorUpdateMap.find(pageIndex);
         if (updatesIt != colorUpdateMap.end()) {
@@ -12951,6 +13182,9 @@ static bool ApplyNativeAnnotationEditActions(
                 if (update.objectIndex >= 0 && update.objectIndex < FPDFPage_CountObjects(page)) {
                     FPDF_PAGEOBJECT pageObject = FPDFPage_GetObject(page, update.objectIndex);
                     if (pageObject && FPDFPageObj_GetType(pageObject) == FPDF_PAGEOBJ_IMAGE) {
+                        FS_MATRIX originalMatrix{};
+                        const bool hasOriginalMatrix =
+                                FPDFPageObj_GetMatrix(pageObject, &originalMatrix) == JNI_TRUE;
                         if (update.replacementBitmap) {
                             FPDFImageObj_SetBitmap(&page, 1, pageObject, update.replacementBitmap);
                         }
@@ -12982,15 +13216,41 @@ static bool ApplyNativeAnnotationEditActions(
                         const double d = cosAngle * drawHeight;
                         const double centerX = (left + right) * 0.5;
                         const double centerY = (bottom + top) * 0.5;
+                        const double e = centerX - (a + c) * 0.5;
+                        const double f = centerY - (b + d) * 0.5;
                         FPDFImageObj_SetMatrix(
                                 pageObject,
                                 a,
                                 b,
                                 c,
                                 d,
-                                centerX - (a + c) * 0.5,
-                                centerY - (b + d) * 0.5
+                                e,
+                                f
                         );
+                        const double determinant =
+                                (originalMatrix.a * originalMatrix.d) -
+                                (originalMatrix.b * originalMatrix.c);
+                        if (hasOriginalMatrix && fabs(determinant) > 0.000001) {
+                            const double inverseA = originalMatrix.d / determinant;
+                            const double inverseB = -originalMatrix.b / determinant;
+                            const double inverseC = -originalMatrix.c / determinant;
+                            const double inverseD = originalMatrix.a / determinant;
+                            const double inverseE =
+                                    ((originalMatrix.c * originalMatrix.f) -
+                                     (originalMatrix.d * originalMatrix.e)) / determinant;
+                            const double inverseF =
+                                    ((originalMatrix.b * originalMatrix.e) -
+                                     (originalMatrix.a * originalMatrix.f)) / determinant;
+                            FPDFPageObj_TransformClipPath(
+                                    pageObject,
+                                    (a * inverseA) + (c * inverseB),
+                                    (b * inverseA) + (d * inverseB),
+                                    (a * inverseC) + (c * inverseD),
+                                    (b * inverseC) + (d * inverseD),
+                                    (a * inverseE) + (c * inverseF) + e,
+                                    (b * inverseE) + (d * inverseF) + f
+                            );
+                        }
                     }
                 }
                 if (update.replacementBitmap) FPDFBitmap_Destroy(update.replacementBitmap);
@@ -13021,10 +13281,32 @@ static bool ApplyNativeAnnotationEditActions(
             for (const auto& update : contentPathTransformIt->second) {
                 if (update.objectIndex < 0 || update.objectIndex >= FPDFPage_CountObjects(page)) continue;
                 FPDF_PAGEOBJECT pageObject = FPDFPage_GetObject(page, update.objectIndex);
-                if (!pageObject || FPDFPageObj_GetType(pageObject) != FPDF_PAGEOBJ_PATH) continue;
+                const int expectedObjectType = update.objectType == 19
+                                               ? FPDF_PAGEOBJ_SHADING
+                                               : (update.objectType == 20
+                                                  ? FPDF_PAGEOBJ_FORM
+                                                  : FPDF_PAGEOBJ_PATH);
+                const bool objectTypeMatches = update.objectType == 19
+                                               ? IsEditableShadingObject(pageObject)
+                                               : pageObject &&
+                                                 FPDFPageObj_GetType(pageObject) == expectedObjectType;
+                if (!objectTypeMatches) continue;
 
                 float sourceLeft = 0.0f, sourceBottom = 0.0f, sourceRight = 0.0f, sourceTop = 0.0f;
-                if (!FPDFPageObj_GetBounds(pageObject, &sourceLeft, &sourceBottom, &sourceRight, &sourceTop)) continue;
+                if (update.objectType == 20 && update.hasSourceBounds) {
+                    sourceLeft = fmin(update.sourceLeft, update.sourceRight);
+                    sourceRight = fmax(update.sourceLeft, update.sourceRight);
+                    sourceBottom = fmin(update.sourceTop, update.sourceBottom);
+                    sourceTop = fmax(update.sourceTop, update.sourceBottom);
+                } else if (!FPDFPageObj_GetBounds(
+                        pageObject,
+                        &sourceLeft,
+                        &sourceBottom,
+                        &sourceRight,
+                        &sourceTop
+                )) {
+                    continue;
+                }
                 const float sourceWidth = sourceRight - sourceLeft;
                 const float sourceHeight = sourceTop - sourceBottom;
                 if (fabs(sourceWidth) < 0.0001f || fabs(sourceHeight) < 0.0001f) continue;
@@ -13044,6 +13326,17 @@ static bool ApplyNativeAnnotationEditActions(
                         targetLeft - (sourceLeft * scaleX),
                         targetBottom - (sourceBottom * scaleY)
                 );
+                if (expectedObjectType == FPDF_PAGEOBJ_PATH) {
+                    FPDFPageObj_TransformClipPath(
+                            pageObject,
+                            scaleX,
+                            0.0f,
+                            0.0f,
+                            scaleY,
+                            targetLeft - (sourceLeft * scaleX),
+                            targetBottom - (sourceBottom * scaleY)
+                    );
+                }
             }
         }
 
@@ -13121,12 +13414,23 @@ static bool ApplyNativeAnnotationEditActions(
                     FPDF_PAGEOBJECT pageObject = FPDFPage_GetObject(page, target.objectIndex);
                     const int expectedObjectType = target.objectType == 9
                                                    ? FPDF_PAGEOBJ_IMAGE
-                                                   : FPDF_PAGEOBJ_PATH;
-                    if (pageObject && FPDFPageObj_GetType(pageObject) == expectedObjectType &&
+                                                   : (target.objectType == 19
+                                                      ? FPDF_PAGEOBJ_SHADING
+                                                      : (target.objectType == 20
+                                                         ? FPDF_PAGEOBJ_FORM
+                                                         : FPDF_PAGEOBJ_PATH));
+                    const bool objectTypeMatches = target.objectType == 19
+                                                   ? IsEditableShadingObject(pageObject)
+                                                   : pageObject &&
+                                                     FPDFPageObj_GetType(pageObject) == expectedObjectType;
+                    if (objectTypeMatches &&
                         FPDFPage_RemoveObject(page, pageObject)) {
                         FPDFPageObj_Destroy(pageObject);
                         removed = true;
                     }
+                }
+                if (!removed && (target.objectType == 19 || target.objectType == 20)) {
+                    continue;
                 }
                 if (!removed) {
                     float bestScore = 0.0f;
@@ -13137,8 +13441,16 @@ static bool ApplyNativeAnnotationEditActions(
                         FPDF_PAGEOBJECT pageObject = FPDFPage_GetObject(page, objectIndex);
                         const int expectedObjectType = target.objectType == 9
                                                        ? FPDF_PAGEOBJ_IMAGE
-                                                       : FPDF_PAGEOBJ_PATH;
-                        if (!pageObject || FPDFPageObj_GetType(pageObject) != expectedObjectType) continue;
+                                                       : (target.objectType == 19
+                                                          ? FPDF_PAGEOBJ_SHADING
+                                                          : (target.objectType == 20
+                                                             ? FPDF_PAGEOBJ_FORM
+                                                             : FPDF_PAGEOBJ_PATH));
+                        const bool objectTypeMatches = target.objectType == 19
+                                                       ? IsEditableShadingObject(pageObject)
+                                                       : pageObject &&
+                                                         FPDFPageObj_GetType(pageObject) == expectedObjectType;
+                        if (!objectTypeMatches) continue;
 
                         float left = 0.0f, bottom = 0.0f, right = 0.0f, top = 0.0f;
                         if (!FPDFPageObj_GetBounds(pageObject, &left, &bottom, &right, &top)) continue;
@@ -13387,7 +13699,7 @@ static bool ApplyNativeAnnotationEditActions(
     }
 
     LOGE("PDF_EDIT_NATIVE ApplyNativeAnnotationEditActions finish touchedPages=%zu", touchedPages.size());
-    return true;
+    return allPagesSucceeded;
 }
 
 JNIEXPORT jboolean JNICALL //TODO Main Method of saving.
@@ -15147,6 +15459,147 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeDummySave(
 #include <map>
 #include <functional>
 
+static bool GetNativeFormPaintedBounds(
+        FPDF_PAGE page,
+        FPDF_PAGEOBJECT targetForm,
+        int requestedWidth,
+        int requestedHeight,
+        float* outLeft,
+        float* outBottom,
+        float* outRight,
+        float* outTop) {
+    if (!page || !targetForm || !outLeft || !outBottom || !outRight || !outTop) {
+        return false;
+    }
+
+    const int pageObjectCount = FPDFPage_CountObjects(page);
+    if (pageObjectCount <= 0) return false;
+
+    const int sourceWidth = std::max(1, requestedWidth);
+    const int sourceHeight = std::max(1, requestedHeight);
+    constexpr float kMaximumRenderSide = 1536.0f;
+    const float renderScale = std::min(
+            1.0f,
+            kMaximumRenderSide / static_cast<float>(std::max(sourceWidth, sourceHeight))
+    );
+    const int renderWidth =
+            std::max(1, static_cast<int>(ceilf(sourceWidth * renderScale)));
+    const int renderHeight =
+            std::max(1, static_cast<int>(ceilf(sourceHeight * renderScale)));
+    FPDF_BITMAP bitmap = FPDFBitmap_CreateEx(
+            renderWidth,
+            renderHeight,
+            FPDFBitmap_BGRA,
+            nullptr,
+            0
+    );
+    if (!bitmap) return false;
+
+    struct NativePageObjectActiveState {
+        FPDF_PAGEOBJECT object;
+        FPDF_BOOL active;
+    };
+    std::vector<NativePageObjectActiveState> activeStates;
+    activeStates.reserve(pageObjectCount);
+    for (int objectIndex = 0; objectIndex < pageObjectCount; ++objectIndex) {
+        FPDF_PAGEOBJECT object = FPDFPage_GetObject(page, objectIndex);
+        if (!object) continue;
+        FPDF_BOOL active = true;
+        FPDFPageObj_GetIsActive(object, &active);
+        activeStates.push_back({object, active});
+        FPDFPageObj_SetIsActive(object, object == targetForm ? true : false);
+    }
+
+    FPDFBitmap_FillRect(bitmap, 0, 0, renderWidth, renderHeight, 0x00000000);
+    FPDF_RenderPageBitmap(
+            bitmap,
+            page,
+            0,
+            0,
+            renderWidth,
+            renderHeight,
+            0,
+            0
+    );
+    for (const auto& state : activeStates) {
+        FPDFPageObj_SetIsActive(state.object, state.active);
+    }
+
+    auto* pixels = static_cast<uint8_t*>(FPDFBitmap_GetBuffer(bitmap));
+    const int stride = FPDFBitmap_GetStride(bitmap);
+    if (!pixels || stride <= 0) {
+        FPDFBitmap_Destroy(bitmap);
+        return false;
+    }
+
+    int paintedLeft = renderWidth;
+    int paintedTop = renderHeight;
+    int paintedRight = -1;
+    int paintedBottom = -1;
+    constexpr uint8_t kPaintedAlphaThreshold = 8;
+    for (int y = 0; y < renderHeight; ++y) {
+        const uint8_t* row = pixels + (y * stride);
+        for (int x = 0; x < renderWidth; ++x) {
+            if (row[(x * 4) + 3] <= kPaintedAlphaThreshold) continue;
+            paintedLeft = std::min(paintedLeft, x);
+            paintedTop = std::min(paintedTop, y);
+            paintedRight = std::max(paintedRight, x);
+            paintedBottom = std::max(paintedBottom, y);
+        }
+    }
+    if (paintedRight < paintedLeft || paintedBottom < paintedTop) {
+        FPDFBitmap_Destroy(bitmap);
+        return false;
+    }
+
+    paintedLeft = std::max(0, paintedLeft - 1);
+    paintedTop = std::max(0, paintedTop - 1);
+    paintedRight = std::min(renderWidth, paintedRight + 2);
+    paintedBottom = std::min(renderHeight, paintedBottom + 2);
+
+    double firstX = 0.0;
+    double firstY = 0.0;
+    double secondX = 0.0;
+    double secondY = 0.0;
+    const bool convertedFirstPoint = FPDF_DeviceToPage(
+            page,
+            0,
+            0,
+            renderWidth,
+            renderHeight,
+            0,
+            paintedLeft,
+            paintedTop,
+            &firstX,
+            &firstY
+    );
+    const bool convertedSecondPoint = FPDF_DeviceToPage(
+            page,
+            0,
+            0,
+            renderWidth,
+            renderHeight,
+            0,
+            paintedRight,
+            paintedBottom,
+            &secondX,
+            &secondY
+    );
+    FPDFBitmap_Destroy(bitmap);
+    if (!convertedFirstPoint || !convertedSecondPoint) return false;
+
+    *outLeft = static_cast<float>(std::min(firstX, secondX));
+    *outRight = static_cast<float>(std::max(firstX, secondX));
+    *outBottom = static_cast<float>(std::min(firstY, secondY));
+    *outTop = static_cast<float>(std::max(firstY, secondY));
+    return std::isfinite(*outLeft) &&
+           std::isfinite(*outBottom) &&
+           std::isfinite(*outRight) &&
+           std::isfinite(*outTop) &&
+           *outRight - *outLeft >= 0.0001f &&
+           *outTop - *outBottom >= 0.0001f;
+}
+
 JNIEXPORT jobjectArray JNICALL //todo main get annotation method
 Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeGetAnnotationsForPage(
         JNIEnv* env,
@@ -15746,6 +16199,7 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeGetAnnotati
     const float pageWidth = FPDF_GetPageWidthF(page);
     const float pageHeight = FPDF_GetPageHeightF(page);
     int objectCount = FPDFPage_CountObjects(page);
+    int formOrdinal = 0;
     for (int i = 0; includeEditContent && i < objectCount; i++) {
         FPDF_PAGEOBJECT pageObj = FPDFPage_GetObject(page, i);
         if (!pageObj) continue;
@@ -15851,6 +16305,31 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeGetAnnotati
             const float deviceTop = static_cast<float>(std::min(dTop, dBottom));
             const float deviceBottom = static_cast<float>(std::max(dTop, dBottom));
             if (deviceRight - deviceLeft < 1.0f || deviceBottom - deviceTop < 1.0f) continue;
+
+            if (contentMetadata.kind == "shading_proxy") {
+                jobject shadingObject = env->NewObject(
+                        annotClass,
+                        constructor,
+                        19,
+                        pageIndex,
+                        deviceLeft,
+                        deviceTop,
+                        deviceRight,
+                        deviceBottom,
+                        0,
+                        0,
+                        0,
+                        0,
+                        nullptr,
+                        nullptr,
+                        nullptr,
+                        nullptr,
+                        i,
+                        4
+                );
+                if (shadingObject) tempCollector.push_back(shadingObject);
+                continue;
+            }
 
             FPDF_IMAGEOBJ_METADATA imageMetadata{};
             const bool hasImageMetadata = FPDFImageObj_GetImageMetadata(pageObj, page, &imageMetadata);
@@ -15965,6 +16444,118 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeGetAnnotati
             continue;
         }
 
+        if (pageObjectType == FPDF_PAGEOBJ_SHADING) {
+            float left = 0.0f, bottom = 0.0f, right = 0.0f, top = 0.0f;
+            if (!FPDFPageObj_GetBounds(pageObj, &left, &bottom, &right, &top)) continue;
+            if (fabs(right - left) < 0.0001f || fabs(top - bottom) < 0.0001f) continue;
+
+            int dLeft, dTop, dRight, dBottom;
+            FPDF_PageToDevice(page, 0, 0, viewWidth, viewHeight, 0, left, top, &dLeft, &dTop);
+            FPDF_PageToDevice(page, 0, 0, viewWidth, viewHeight, 0, right, bottom, &dRight, &dBottom);
+
+            jobject shadingObject = env->NewObject(
+                    annotClass,
+                    constructor,
+                    19,
+                    pageIndex,
+                    static_cast<float>(std::min(dLeft, dRight)),
+                    static_cast<float>(std::min(dTop, dBottom)),
+                    static_cast<float>(std::max(dLeft, dRight)),
+                    static_cast<float>(std::max(dTop, dBottom)),
+                    0,
+                    0,
+                    0,
+                    0,
+                    nullptr,
+                    nullptr,
+                    nullptr,
+                    nullptr,
+                    i,
+                    4
+            );
+            if (shadingObject) tempCollector.push_back(shadingObject);
+            continue;
+        }
+
+        if (pageObjectType == FPDF_PAGEOBJ_FORM) {
+            const int currentFormOrdinal = formOrdinal++;
+            float left = 0.0f, bottom = 0.0f, right = 0.0f, top = 0.0f;
+            const bool hasOuterBounds =
+                    FPDFPageObj_GetBounds(pageObj, &left, &bottom, &right, &top);
+            FS_MATRIX formMatrix{1.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f};
+            FPDFPageObj_GetMatrix(pageObj, &formMatrix);
+            const bool hasPaintedBounds = GetNativeFormPaintedBounds(
+                    page,
+                    pageObj,
+                    viewWidth,
+                    viewHeight,
+                    &left,
+                    &bottom,
+                    &right,
+                    &top
+            );
+            if ((!hasOuterBounds && !hasPaintedBounds) ||
+                fabs(right - left) < 0.0001f ||
+                fabs(top - bottom) < 0.0001f) {
+                continue;
+            }
+
+            int dLeft, dTop, dRight, dBottom;
+            FPDF_PageToDevice(page, 0, 0, viewWidth, viewHeight, 0, left, top, &dLeft, &dTop);
+            FPDF_PageToDevice(page, 0, 0, viewWidth, viewHeight, 0, right, bottom, &dRight, &dBottom);
+            std::ostringstream formProps;
+            formProps << "{\"formOrdinal\":" << currentFormOrdinal
+                      << ",\"sourceLeft\":" << std::min(left, right)
+                      << ",\"sourceTop\":" << std::max(top, bottom)
+                      << ",\"sourceRight\":" << std::max(left, right)
+                      << ",\"sourceBottom\":" << std::min(top, bottom)
+                      << ",\"matrixA\":" << formMatrix.a
+                      << ",\"matrixB\":" << formMatrix.b
+                      << ",\"matrixC\":" << formMatrix.c
+                      << ",\"matrixD\":" << formMatrix.d
+                      << ",\"matrixE\":" << formMatrix.e
+                      << ",\"matrixF\":" << formMatrix.f
+                      << "}";
+            jstring jFormProps = env->NewStringUTF(formProps.str().c_str());
+            jstring jDataProps = BuildBridgeDataPropertiesJString(
+                    env,
+                    jsonClass,
+                    jsonInit,
+                    jsonPut,
+                    jsonToString,
+                    nullptr,
+                    nullptr,
+                    nullptr,
+                    jFormProps
+            );
+
+            jobject formObject = env->NewObject(
+                    annotClass,
+                    constructor,
+                    20,
+                    pageIndex,
+                    static_cast<float>(std::min(dLeft, dRight)),
+                    static_cast<float>(std::min(dTop, dBottom)),
+                    static_cast<float>(std::max(dLeft, dRight)),
+                    static_cast<float>(std::max(dTop, dBottom)),
+                    0,
+                    0,
+                    0,
+                    0,
+                    nullptr,
+                    nullptr,
+                    jDataProps,
+                    nullptr,
+                    i,
+                    4
+            );
+            if (formObject) tempCollector.push_back(formObject);
+            if (jDataProps) env->DeleteLocalRef(jDataProps);
+            env->DeleteLocalRef(jFormProps);
+            continue;
+        }
+
+        // Unknown page objects are intentionally unsupported.
         if (pageObjectType != FPDF_PAGEOBJ_PATH) continue;
 
         float left = 0.0f, bottom = 0.0f, right = 0.0f, top = 0.0f;
