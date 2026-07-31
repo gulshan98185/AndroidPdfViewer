@@ -6891,10 +6891,7 @@ static bool CollectPageLevelTextWatermarkPatternSpec(
     spec.textG = std::max(0, std::min(optIntValue("textColorG", 0), 255));
     spec.textB = std::max(0, std::min(optIntValue("textColorB", 0), 255));
     const float rawOpacity = fmax(0.0f, fmin((float)optDoubleValue("opacity", 1.0), 1.0f));
-    const float repeatedWatermarkOpacityScale = 0.65f;
-    spec.opacity = (isIconImageWatermark || isRasterImageWatermark)
-                   ? fmax(0.0f, fmin(rawOpacity * repeatedWatermarkOpacityScale, 1.0f))
-                   : (spec.isRepeated ? fmax(0.0f, fmin(rawOpacity * repeatedWatermarkOpacityScale, 1.0f)) : rawOpacity);
+    spec.opacity = rawOpacity;
 
     spec.isBold = !isIconImageWatermark && !isRasterImageWatermark && optBoolValue("bold", false);
     spec.isItalic = !isIconImageWatermark && !isRasterImageWatermark && optBoolValue("italic", false);
@@ -12325,16 +12322,40 @@ static bool BuildFreehandPropsFromPathObject(
 
     float strokeWidth = 1.0f;
     FPDFPageObj_GetStrokeWidth(pathObj, &strokeWidth);
-    unsigned int r = outR ? *outR : 0;
-    unsigned int g = outG ? *outG : 0;
-    unsigned int b = outB ? *outB : 0;
-    unsigned int a = outA ? *outA : 255;
-    FPDFPageObj_GetStrokeColor(pathObj, &r, &g, &b, &a);
+    int fillMode = FPDF_FILLMODE_NONE;
+    FPDF_BOOL isStroked = false;
+    FPDFPath_GetDrawMode(pathObj, &fillMode, &isStroked);
+    const bool hasStroke = isStroked == JNI_TRUE;
+    const bool hasFill = fillMode != FPDF_FILLMODE_NONE;
+    if (!hasStroke && !hasFill) return false;
+
+    unsigned int strokeR = 0, strokeG = 0, strokeB = 0, strokeA = 0;
+    unsigned int fillR = 0, fillG = 0, fillB = 0, fillA = 0;
+    const bool hasStrokeColor = hasStroke &&
+            FPDFPageObj_GetStrokeColor(pathObj, &strokeR, &strokeG, &strokeB, &strokeA);
+    const bool hasFillColor = hasFill &&
+            FPDFPageObj_GetFillColor(pathObj, &fillR, &fillG, &fillB, &fillA);
+    if (!hasStrokeColor && !hasFillColor) return false;
+
+    const unsigned int r = hasStrokeColor ? strokeR : fillR;
+    const unsigned int g = hasStrokeColor ? strokeG : fillG;
+    const unsigned int b = hasStrokeColor ? strokeB : fillB;
+    const unsigned int a = hasStrokeColor ? strokeA : fillA;
     const int lineJoin = FPDFPageObj_GetLineJoin(pathObj);
     const int lineCap = FPDFPageObj_GetLineCap(pathObj);
     freehandProps << "],"
                   << "\"strokeWidth\":" << strokeWidth << ","
                   << "\"alpha\":" << a << ","
+                  << "\"hasStroke\":" << (hasStrokeColor ? "true" : "false") << ","
+                  << "\"strokeR\":" << strokeR << ","
+                  << "\"strokeG\":" << strokeG << ","
+                  << "\"strokeB\":" << strokeB << ","
+                  << "\"strokeA\":" << strokeA << ","
+                  << "\"hasFill\":" << (hasFillColor ? "true" : "false") << ","
+                  << "\"fillR\":" << fillR << ","
+                  << "\"fillG\":" << fillG << ","
+                  << "\"fillB\":" << fillB << ","
+                  << "\"fillA\":" << fillA << ","
                   << "\"mode\":\"" << (a == 125 ? "HIGHLIGHTER" : "BRUSH_PENS") << "\","
                   << "\"lineJoin\":" << lineJoin << ","
                   << "\"lineCap\":" << lineCap
@@ -12781,6 +12802,7 @@ static bool ApplyNativeAnnotationEditActions(
     jmethodID jsonArrayGetObject = env->GetMethodID(jsonArrayClass, "getJSONObject", "(I)Lorg/json/JSONObject;");
     jmethodID jsonGetDouble = env->GetMethodID(jsonClass, "getDouble", "(Ljava/lang/String;)D");
     jmethodID jsonOptDouble = env->GetMethodID(jsonClass, "optDouble", "(Ljava/lang/String;D)D");
+    jmethodID jsonOptInt = env->GetMethodID(jsonClass, "optInt", "(Ljava/lang/String;I)I");
     jmethodID jsonOptBoolean = env->GetMethodID(jsonClass, "optBoolean", "(Ljava/lang/String;Z)Z");
 
     std::map<int, std::vector<int>> removalMap;
@@ -12830,10 +12852,16 @@ static bool ApplyNativeAnnotationEditActions(
     std::map<int, std::vector<ContentImageUpdate>> contentImageUpdateMap;
     struct ContentPathStyleUpdate {
         int objectIndex;
-        int r;
-        int g;
-        int b;
-        int alpha;
+        bool hasStroke;
+        int strokeR;
+        int strokeG;
+        int strokeB;
+        int strokeAlpha;
+        bool hasFill;
+        int fillR;
+        int fillG;
+        int fillB;
+        int fillAlpha;
     };
     struct ContentPathTransformUpdate {
         int objectIndex;
@@ -12977,12 +13005,67 @@ static bool ApplyNativeAnnotationEditActions(
                 replacementBitmap
             });
         } else if (nativeSourceId >= 0 && nativeEditAction == 9) {
+            const int defaultR = env->GetIntField(obj, rField);
+            const int defaultG = env->GetIntField(obj, gField);
+            const int defaultB = env->GetIntField(obj, bField);
+            const int defaultAlpha = env->GetIntField(obj, alphaField);
+            bool hasStroke = true;
+            int strokeR = defaultR;
+            int strokeG = defaultG;
+            int strokeB = defaultB;
+            int strokeAlpha = defaultAlpha;
+            bool hasFill = false;
+            int fillR = defaultR;
+            int fillG = defaultG;
+            int fillB = defaultB;
+            int fillAlpha = defaultAlpha;
+
+            jstring pathProperties = static_cast<jstring>(
+                    env->GetObjectField(obj, dataPropsField)
+            );
+            if (pathProperties) {
+                jobject pathJson = env->NewObject(jsonClass, jsonInit, pathProperties);
+                if (pathJson) {
+                    auto optPathInt = [&](const char* key, int fallback) -> int {
+                        jstring jsonKey = env->NewStringUTF(key);
+                        const int value = env->CallIntMethod(
+                                pathJson, jsonOptInt, jsonKey, fallback);
+                        env->DeleteLocalRef(jsonKey);
+                        return value;
+                    };
+                    auto optPathBoolean = [&](const char* key, bool fallback) -> bool {
+                        jstring jsonKey = env->NewStringUTF(key);
+                        const bool value = env->CallBooleanMethod(
+                                pathJson, jsonOptBoolean, jsonKey, fallback ? JNI_TRUE : JNI_FALSE);
+                        env->DeleteLocalRef(jsonKey);
+                        return value;
+                    };
+                    hasStroke = optPathBoolean("hasStroke", true);
+                    strokeR = optPathInt("strokeR", defaultR);
+                    strokeG = optPathInt("strokeG", defaultG);
+                    strokeB = optPathInt("strokeB", defaultB);
+                    strokeAlpha = optPathInt("strokeA", defaultAlpha);
+                    hasFill = optPathBoolean("hasFill", false);
+                    fillR = optPathInt("fillR", defaultR);
+                    fillG = optPathInt("fillG", defaultG);
+                    fillB = optPathInt("fillB", defaultB);
+                    fillAlpha = optPathInt("fillA", defaultAlpha);
+                    env->DeleteLocalRef(pathJson);
+                }
+                env->DeleteLocalRef(pathProperties);
+            }
             contentPathStyleUpdateMap[pageIndex].push_back({
                 nativeSourceId,
-                env->GetIntField(obj, rField),
-                env->GetIntField(obj, gField),
-                env->GetIntField(obj, bField),
-                env->GetIntField(obj, alphaField)
+                hasStroke,
+                strokeR,
+                strokeG,
+                strokeB,
+                strokeAlpha,
+                hasFill,
+                fillR,
+                fillG,
+                fillB,
+                fillAlpha
             });
         } else if (nativeSourceId >= 0 && nativeEditAction == 10) {
             const int objectType = env->GetIntField(obj, typeField);
@@ -13267,11 +13350,23 @@ static bool ApplyNativeAnnotationEditActions(
                 int fillMode = FPDF_FILLMODE_NONE;
                 FPDF_BOOL isStroked = false;
                 if (!FPDFPath_GetDrawMode(pageObject, &fillMode, &isStroked)) continue;
-                if (isStroked) {
-                    FPDFPageObj_SetStrokeColor(pageObject, update.r, update.g, update.b, update.alpha);
+                if (isStroked && update.hasStroke) {
+                    FPDFPageObj_SetStrokeColor(
+                            pageObject,
+                            update.strokeR,
+                            update.strokeG,
+                            update.strokeB,
+                            update.strokeAlpha
+                    );
                 }
-                if (fillMode != FPDF_FILLMODE_NONE) {
-                    FPDFPageObj_SetFillColor(pageObject, update.r, update.g, update.b, update.alpha);
+                if (fillMode != FPDF_FILLMODE_NONE && update.hasFill) {
+                    FPDFPageObj_SetFillColor(
+                            pageObject,
+                            update.fillR,
+                            update.fillG,
+                            update.fillB,
+                            update.fillAlpha
+                    );
                 }
             }
         }
@@ -14167,6 +14262,12 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeSavePdfEdit
                 ? GetBridgeDataPropertyUtf8(
                         env, obj, dataPropsField, jsonClass, jsonInit, "imageProperties")
                 : std::string();
+        const bool isSvgPathStampEdit =
+                typeInt == 9 &&
+                (
+                    imagePropsUtf8.find("\"stampKind\":\"shape_element_svg\"") != std::string::npos ||
+                    imagePropsUtf8.find("\"assetFormat\":\"svg-path\"") != std::string::npos
+                );
         std::string contentMetadataKind;
         std::string contentMetadataSubtype;
         if (typeInt == 4) {
@@ -14180,6 +14281,11 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeSavePdfEdit
         } else if (typeInt == 6 && freehandPropsUtf8.find("Sign_draw") != std::string::npos) {
             contentMetadataKind = "signature";
             contentMetadataSubtype = "Sign_draw";
+        } else if (typeInt == 6) {
+            contentMetadataKind = "app_created";
+        } else if (IsPdfShapeNativeType(typeInt)) {
+            contentMetadataKind = "app_created";
+            contentMetadataSubtype = "pdf_shape";
         } else if (typeInt == 9 && imagePropsUtf8.find("Sign_Image") != std::string::npos) {
             contentMetadataKind = "signature";
             contentMetadataSubtype = "Sign_Image";
@@ -14193,6 +14299,9 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeSavePdfEdit
         ) {
             contentMetadataKind = "preset_stamp";
             contentMetadataSubtype = "image";
+        } else if (isSvgPathStampEdit) {
+            contentMetadataKind = "app_created";
+            contentMetadataSubtype = "shape_element_svg";
         }
         const int pageObjectCountBeforeSave = FPDFPage_CountObjects(currentPage);
 
@@ -14252,7 +14361,9 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeSavePdfEdit
 
         if (!contentMetadataKind.empty()) {
             const int pageObjectCountAfterSave = FPDFPage_CountObjects(currentPage);
-            const std::string groupId = "p" + std::to_string(pageIndex) + "_o" + std::to_string(i);
+            const std::string groupId = contentMetadataKind == "app_created"
+                                        ? std::string()
+                                        : "p" + std::to_string(pageIndex) + "_o" + std::to_string(i);
             for (int objectIndex = pageObjectCountBeforeSave;
                  objectIndex < pageObjectCountAfterSave;
                  ++objectIndex) {
@@ -16200,6 +16311,7 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeGetAnnotati
     const float pageHeight = FPDF_GetPageHeightF(page);
     int objectCount = FPDFPage_CountObjects(page);
     int formOrdinal = 0;
+    int pathOrdinal = 0;
     for (int i = 0; includeEditContent && i < objectCount; i++) {
         FPDF_PAGEOBJECT pageObj = FPDFPage_GetObject(page, i);
         if (!pageObj) continue;
@@ -16557,6 +16669,7 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeGetAnnotati
 
         // Unknown page objects are intentionally unsupported.
         if (pageObjectType != FPDF_PAGEOBJ_PATH) continue;
+        const int currentPathOrdinal = pathOrdinal++;
 
         float left = 0.0f, bottom = 0.0f, right = 0.0f, top = 0.0f;
         if (!FPDFPageObj_GetBounds(pageObj, &left, &bottom, &right, &top)) continue;
@@ -16618,16 +16731,38 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeGetAnnotati
         }
 
         unsigned int r = 0, g = 170, b = 90, a = 255;
-        FPDFPageObj_GetStrokeColor(pageObj, &r, &g, &b, &a);
         const bool isMarkedPdfStampPath =
                 contentMetadata.kind == "preset_stamp" && contentMetadata.subtype == "pdf";
-        if (a == 0 && !isMarkedPdfStampPath) continue;
+        FS_MATRIX pathMatrix{1.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f};
+        FPDFPageObj_GetMatrix(pageObj, &pathMatrix);
         std::string freehandProps;
-        if (!BuildFreehandPropsFromPathObject(pageObj, &freehandProps, &r, &g, &b, &a)) continue;
-        if (isMarkedPdfStampPath && a == 0) {
-            FPDFPageObj_GetFillColor(pageObj, &r, &g, &b, &a);
+        if (!BuildFreehandPropsFromPathObject(
+                pageObj,
+                &freehandProps,
+                &r,
+                &g,
+                &b,
+                &a
+        )) {
+            continue;
         }
-
+        if (!freehandProps.empty() && freehandProps.back() == '}') {
+            freehandProps.pop_back();
+            std::ostringstream pathMetadata;
+            pathMetadata << ",\"pathOrdinal\":" << currentPathOrdinal
+                         << ",\"sourceLeft\":" << std::min(left, right)
+                         << ",\"sourceTop\":" << std::max(top, bottom)
+                         << ",\"sourceRight\":" << std::max(left, right)
+                         << ",\"sourceBottom\":" << std::min(top, bottom)
+                         << ",\"matrixA\":" << pathMatrix.a
+                         << ",\"matrixB\":" << pathMatrix.b
+                         << ",\"matrixC\":" << pathMatrix.c
+                         << ",\"matrixD\":" << pathMatrix.d
+                         << ",\"matrixE\":" << pathMatrix.e
+                         << ",\"matrixF\":" << pathMatrix.f
+                         << "}";
+            freehandProps += pathMetadata.str();
+        }
         int dLeft, dTop, dRight, dBottom;
         FPDF_PageToDevice(page, 0, 0, viewWidth, viewHeight, 0, left, top, &dLeft, &dTop);
         FPDF_PageToDevice(page, 0, 0, viewWidth, viewHeight, 0, right, bottom, &dRight, &dBottom);
@@ -16662,6 +16797,15 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeGetAnnotati
         }
         if (duplicatesLoadedNativeAnnot && !contentMetadata.isValid()) continue;
 
+        const bool isAppCreatedPath =
+                contentMetadata.kind == "app_created" ||
+                isMarkedPdfStampPath;
+        if (isAppCreatedPath &&
+            !freehandProps.empty() &&
+            freehandProps.back() == '}') {
+            freehandProps.pop_back();
+            freehandProps += ",\"appCreated\":true}";
+        }
         jstring jFhProps = env->NewStringUTF(freehandProps.c_str());
         if (contentMetadata.kind == "signature") {
             std::u16string signatureSubtype(
