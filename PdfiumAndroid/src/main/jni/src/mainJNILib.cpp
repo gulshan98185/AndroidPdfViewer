@@ -12278,6 +12278,42 @@ static void ApplyExistingAnnotationColor(
     }
 }
 
+static int GetLufickNativePathStableId(FPDF_PAGEOBJECT pathObj) {
+    if (!pathObj) return -1;
+    const int markCount = FPDFPageObj_CountMarks(pathObj);
+    for (int markIndex = 0; markIndex < markCount; ++markIndex) {
+        FPDF_PAGEOBJECTMARK mark = FPDFPageObj_GetMark(
+                pathObj,
+                static_cast<unsigned long>(markIndex)
+        );
+        if (!mark) continue;
+
+        unsigned long nameLength = 0;
+        if (!FPDFPageObjMark_GetName(mark, nullptr, 0, &nameLength) || nameLength < 2) {
+            continue;
+        }
+        std::vector<FPDF_WCHAR> nameBuffer((nameLength / sizeof(FPDF_WCHAR)) + 1, 0);
+        if (!FPDFPageObjMark_GetName(
+                mark,
+                nameBuffer.data(),
+                nameLength,
+                &nameLength
+        )) {
+            continue;
+        }
+        const std::u16string markName(
+                reinterpret_cast<const char16_t*>(nameBuffer.data())
+        );
+        if (markName != u"LufickPath") continue;
+
+        int stablePathId = -1;
+        if (FPDFPageObjMark_GetParamIntValue(mark, "MCID", &stablePathId)) {
+            return stablePathId;
+        }
+    }
+    return -1;
+}
+
 static bool BuildFreehandPropsFromPathObject(
         FPDF_PAGEOBJECT pathObj,
         std::string* outProps,
@@ -12343,6 +12379,20 @@ static bool BuildFreehandPropsFromPathObject(
     const unsigned int a = hasStrokeColor ? strokeA : fillA;
     const int lineJoin = FPDFPageObj_GetLineJoin(pathObj);
     const int lineCap = FPDFPageObj_GetLineCap(pathObj);
+    float dashPhase = 0.0f;
+    FPDFPageObj_GetDashPhase(pathObj, &dashPhase);
+    const int dashCount = FPDFPageObj_GetDashCount(pathObj);
+    std::vector<float> dashArray;
+    if (dashCount > 0) {
+        dashArray.resize(static_cast<size_t>(dashCount));
+        if (!FPDFPageObj_GetDashArray(
+                pathObj,
+                dashArray.data(),
+                static_cast<size_t>(dashCount)
+        )) {
+            dashArray.clear();
+        }
+    }
     freehandProps << "],"
                   << "\"strokeWidth\":" << strokeWidth << ","
                   << "\"alpha\":" << a << ","
@@ -12358,7 +12408,14 @@ static bool BuildFreehandPropsFromPathObject(
                   << "\"fillA\":" << fillA << ","
                   << "\"mode\":\"" << (a == 125 ? "HIGHLIGHTER" : "BRUSH_PENS") << "\","
                   << "\"lineJoin\":" << lineJoin << ","
-                  << "\"lineCap\":" << lineCap
+                  << "\"lineCap\":" << lineCap << ","
+                  << "\"dashPhase\":" << dashPhase << ","
+                  << "\"dashArray\":[";
+    for (size_t dashIndex = 0; dashIndex < dashArray.size(); ++dashIndex) {
+        if (dashIndex > 0) freehandProps << ",";
+        freehandProps << dashArray[dashIndex];
+    }
+    freehandProps << "]"
                   << "}";
 
     *outProps = freehandProps.str();
@@ -16735,6 +16792,10 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeGetAnnotati
                 contentMetadata.kind == "preset_stamp" && contentMetadata.subtype == "pdf";
         FS_MATRIX pathMatrix{1.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f};
         FPDFPageObj_GetMatrix(pageObj, &pathMatrix);
+        const int stablePathId = GetLufickNativePathStableId(pageObj);
+        FPDF_CLIPPATH clipPath = FPDFPageObj_GetClipPath(pageObj);
+        const bool hasClipPath =
+                clipPath != nullptr && FPDFClipPath_CountPaths(clipPath) > 0;
         std::string freehandProps;
         if (!BuildFreehandPropsFromPathObject(
                 pageObj,
@@ -16750,6 +16811,7 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeGetAnnotati
             freehandProps.pop_back();
             std::ostringstream pathMetadata;
             pathMetadata << ",\"pathOrdinal\":" << currentPathOrdinal
+                         << ",\"stablePathId\":" << stablePathId
                          << ",\"sourceLeft\":" << std::min(left, right)
                          << ",\"sourceTop\":" << std::max(top, bottom)
                          << ",\"sourceRight\":" << std::max(left, right)
@@ -16760,6 +16822,7 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeGetAnnotati
                          << ",\"matrixD\":" << pathMatrix.d
                          << ",\"matrixE\":" << pathMatrix.e
                          << ",\"matrixF\":" << pathMatrix.f
+                         << ",\"hasClipPath\":" << (hasClipPath ? "true" : "false")
                          << "}";
             freehandProps += pathMetadata.str();
         }
