@@ -1839,7 +1839,7 @@ static const char* MapPdfCommentNameToStickyNoteIconKey(const std::u16string& pd
     if (pdfName == u"RightPointer") return "right_pointer";
     if (pdfName == u"Star") return "star";
     if (pdfName == u"Note" || pdfName.empty()) return "comment";
-    return "right_pointer";
+    return "comment";
 }
 
 static void AppendPdfCirclePath(std::ostringstream& stream, float cx, float cy, float radius) {
@@ -6320,15 +6320,21 @@ static std::u16string BuildStickyNoteAppearanceStream(
                << x(0.84f) << ' ' << y(0.24f) << " l "
                << x(0.22f) << ' ' << y(0.52f) << " l h f ";
     } else if (resolvedIconKey == "comment") {
-        const float bubbleLeft = x(0.12f);
-        const float bubbleRight = x(0.82f);
-        const float bubbleTop = y(0.12f);
-        const float bubbleBottom = y(0.76f);
-        const float bubbleRadius = (bubbleTop - bubbleBottom) * 0.22f;
+        const float bubbleLeft = x(0.10f);
+        const float bubbleRight = x(0.88f);
+        const float bubbleTop = y(0.14f);
+        const float bubbleBottom = y(0.74f);
+        const float bubbleRadius = std::min(width, height) * 0.12f;
         AppendPdfRoundedRectPath(stream, bubbleLeft, bubbleBottom, bubbleRight, bubbleTop, bubbleRadius);
-        stream << bubbleLeft + ((bubbleRight - bubbleLeft) * 0.26f) << ' ' << bubbleBottom << " m "
-               << bubbleLeft + ((bubbleRight - bubbleLeft) * 0.38f) << ' ' << y(0.94f) << " l "
-               << bubbleLeft + ((bubbleRight - bubbleLeft) * 0.46f) << ' ' << bubbleBottom << " l h f ";
+        stream << "S "
+               << x(0.28f) << ' ' << bubbleBottom << " m "
+               << x(0.22f) << ' ' << y(0.91f) << " l "
+               << x(0.46f) << ' ' << bubbleBottom << " l S "
+               << (strokeWidth * 0.72f) << " w "
+               << x(0.25f) << ' ' << y(0.34f) << " m "
+               << x(0.73f) << ' ' << y(0.34f) << " l "
+               << x(0.25f) << ' ' << y(0.52f) << " m "
+               << x(0.65f) << ' ' << y(0.52f) << " l S ";
     } else if (resolvedIconKey == "help") {
         stream << x(0.32f) << ' ' << y(0.28f) << " m "
                << x(0.32f) << ' ' << y(0.18f) << ' '
@@ -7608,10 +7614,12 @@ static void processStickyNoteComment(
     jmethodID optString = env->GetMethodID(jsonClass, "optString", "(Ljava/lang/String;)Ljava/lang/String;");
     jstring titleKey = env->NewStringUTF("title");
     jstring textKey = env->NewStringUTF("text");
+    jstring richTextKey = env->NewStringUTF("richText");
     jstring iconKeyKey = env->NewStringUTF("iconKey");
     jstring createdAtRawKey = env->NewStringUTF("createdAtRaw");
     jstring jTitle = (jstring)env->CallObjectMethod(json, optString, titleKey);
     jstring jText = (jstring)env->CallObjectMethod(json, optString, textKey);
+    jstring jRichText = (jstring)env->CallObjectMethod(json, optString, richTextKey);
     jstring jIconKey = (jstring)env->CallObjectMethod(json, optString, iconKeyKey);
     jstring jCreatedAtRaw = (jstring)env->CallObjectMethod(json, optString, createdAtRawKey);
 
@@ -7620,6 +7628,9 @@ static void processStickyNoteComment(
     }
     if (jText && env->GetStringLength(jText) > 0) {
         SetAnnotWideStringValueFromJString(env, annot, "Contents", jText);
+    }
+    if (jRichText) {
+        SetAnnotWideStringValueFromJString(env, annot, "RC", jRichText);
     }
     if (jCreatedAtRaw && env->GetStringLength(jCreatedAtRaw) > 0) {
         SetAnnotWideStringValueFromJString(env, annot, "CreationDate", jCreatedAtRaw);
@@ -7652,11 +7663,13 @@ static void processStickyNoteComment(
 
     env->DeleteLocalRef(jIconKey);
     env->DeleteLocalRef(jText);
+    env->DeleteLocalRef(jRichText);
     env->DeleteLocalRef(jTitle);
     env->DeleteLocalRef(jCreatedAtRaw);
     env->DeleteLocalRef(createdAtRawKey);
     env->DeleteLocalRef(iconKeyKey);
     env->DeleteLocalRef(textKey);
+    env->DeleteLocalRef(richTextKey);
     env->DeleteLocalRef(titleKey);
     env->DeleteLocalRef(json);
     env->DeleteLocalRef(jJsonStr);
