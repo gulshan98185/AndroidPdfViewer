@@ -39,12 +39,16 @@ using namespace android;
 #include <fstream>
 #include <iterator>
 #include <cstdint>
+#include <cfloat>
 #include <chrono>
 #include <fpdf_text.h>
 
 #define WM_LOGE(...) do {} while (0)
 
 static Mutex sLibraryLock;
+static Mutex sTextEditFontCacheLock;
+static std::map<FPDF_DOCUMENT, std::map<std::string, FPDF_FONT>> sTextEditFontCache;
+static void clearTextEditFontCache(FPDF_DOCUMENT document);
 
 static int sLibraryReferenceCount = 0;
 
@@ -90,6 +94,7 @@ FPDF_BITMAP ConvertToFPDFBitmap(JNIEnv *pEnv, jobject pJobject);
 
 DocumentFile::~DocumentFile() {
     if (pdfDocument != NULL) {
+        clearTextEditFontCache(pdfDocument);
         FPDF_CloseDocument(pdfDocument);
     }
 
@@ -1840,6 +1845,12 @@ static const char* MapPdfCommentNameToStickyNoteIconKey(const std::u16string& pd
     if (pdfName == u"Star") return "star";
     if (pdfName == u"Note" || pdfName.empty()) return "comment";
     return "comment";
+}
+
+static void clearTextEditFontCache(FPDF_DOCUMENT document) {
+    if (!document) return;
+    Mutex::Autolock lock(sTextEditFontCacheLock);
+    sTextEditFontCache.erase(document);
 }
 
 static void AppendPdfCirclePath(std::ostringstream& stream, float cx, float cy, float radius) {
@@ -14711,6 +14722,1071 @@ static bool processRedactionContent(
     return true;
 }
 
+static std::string GetPageObjectMarkName(FPDF_PAGEOBJECTMARK mark) {
+    if (!mark) return std::string();
+    unsigned long byteLength = 0;
+    if (!FPDFPageObjMark_GetName(mark, nullptr, 0, &byteLength) ||
+        byteLength < sizeof(FPDF_WCHAR)) {
+        return std::string();
+    }
+    std::vector<FPDF_WCHAR> buffer((byteLength / sizeof(FPDF_WCHAR)) + 1, 0);
+    if (!FPDFPageObjMark_GetName(mark, buffer.data(), byteLength, &byteLength)) {
+        return std::string();
+    }
+    return Utf16ToSimpleUtf8(std::u16string(
+            reinterpret_cast<const char16_t*>(buffer.data())));
+}
+
+static FPDF_PAGEOBJECT FindTextEditPreviewObject(
+        FPDF_PAGE page,
+        const std::string& markPrefix,
+        const std::string& exactMarkName,
+        std::vector<FPDF_PAGEOBJECT>* staleObjects) {
+    if (!page) return nullptr;
+    FPDF_PAGEOBJECT exactObject = nullptr;
+    const int objectCount = FPDFPage_CountObjects(page);
+    for (int objectIndex = 0; objectIndex < objectCount; ++objectIndex) {
+        FPDF_PAGEOBJECT object = FPDFPage_GetObject(page, objectIndex);
+        if (!object || FPDFPageObj_GetType(object) != FPDF_PAGEOBJ_TEXT) continue;
+        const int markCount = FPDFPageObj_CountMarks(object);
+        for (int markIndex = 0; markIndex < markCount; ++markIndex) {
+            const std::string markName = GetPageObjectMarkName(
+                    FPDFPageObj_GetMark(object, static_cast<unsigned long>(markIndex)));
+            if (markName.rfind(markPrefix, 0) != 0) continue;
+            if (markName == exactMarkName) {
+                exactObject = object;
+            } else if (staleObjects) {
+                staleObjects->push_back(object);
+            }
+            break;
+        }
+    }
+    return exactObject;
+}
+
+static void RemoveTextEditPreviewObjects(FPDF_PAGE page, const std::string& markPrefix) {
+    if (!page) return;
+    std::vector<FPDF_PAGEOBJECT> objectsToRemove;
+    const int objectCount = FPDFPage_CountObjects(page);
+    for (int objectIndex = 0; objectIndex < objectCount; ++objectIndex) {
+        FPDF_PAGEOBJECT object = FPDFPage_GetObject(page, objectIndex);
+        if (!object) continue;
+        const int markCount = FPDFPageObj_CountMarks(object);
+        for (int markIndex = 0; markIndex < markCount; ++markIndex) {
+            const std::string markName = GetPageObjectMarkName(
+                    FPDFPageObj_GetMark(object, static_cast<unsigned long>(markIndex)));
+            if (markName.rfind(markPrefix, 0) == 0) {
+                objectsToRemove.push_back(object);
+                break;
+            }
+        }
+    }
+    for (FPDF_PAGEOBJECT object : objectsToRemove) {
+        if (FPDFPage_RemoveObject(page, object)) FPDFPageObj_Destroy(object);
+    }
+}
+
+static void ApplyTextEditLiveFontStyle(
+        FPDF_PAGEOBJECT textObject,
+        bool resetAppearance,
+        bool isBold,
+        bool isItalic,
+        int sourceFontWeight,
+        float sourceItalicAngle,
+        float fontSize,
+        unsigned int r,
+        unsigned int g,
+        unsigned int b,
+        unsigned int a) {
+    if (!textObject || !resetAppearance) return;
+    const bool sourceIsBold = sourceFontWeight >= 600;
+    if (isBold && !sourceIsBold) {
+        FPDFPageObj_SetStrokeColor(textObject, r, g, b, a);
+        FPDFPageObj_SetStrokeWidth(textObject, fmax(fontSize * 0.025f, 0.2f));
+        FPDFTextObj_SetTextRenderMode(textObject, FPDF_TEXTRENDERMODE_FILL_STROKE);
+    } else if (!isBold && !sourceIsBold) {
+        FPDFTextObj_SetTextRenderMode(textObject, FPDF_TEXTRENDERMODE_FILL);
+    }
+
+    if (isItalic && fabsf(sourceItalicAngle) <= 0.1f) {
+        FS_MATRIX matrix = {1, 0, 0, 1, 0, 0};
+        if (FPDFPageObj_GetMatrix(textObject, &matrix)) {
+            const float italicShear = tanf(12.0f * static_cast<float>(M_PI) / 180.0f);
+            matrix.c += matrix.a * italicShear;
+            matrix.d += matrix.b * italicShear;
+            FPDFPageObj_SetMatrix(textObject, &matrix);
+        }
+    }
+}
+
+static void AppendTextEditLiveDecoration(
+        FPDF_PAGE page,
+        FPDF_PAGEOBJECT textObject,
+        bool underline,
+        bool strikeout,
+        unsigned int r,
+        unsigned int g,
+        unsigned int b,
+        unsigned int a,
+        const std::string& markPrefix,
+        int objectOrdinal) {
+    if (!page || !textObject || (!underline && !strikeout)) return;
+    FS_QUADPOINTSF quad = {};
+    if (!FPDFPageObj_GetRotatedBounds(textObject, &quad)) return;
+    FS_MATRIX matrix = {1, 0, 0, 1, 0, 0};
+    if (!FPDFPageObj_GetMatrix(textObject, &matrix)) return;
+
+    float baselineX = matrix.a;
+    float baselineY = matrix.b;
+    float baselineLength = hypotf(baselineX, baselineY);
+    if (baselineLength <= 0.0001f) return;
+    baselineX /= baselineLength;
+    baselineY /= baselineLength;
+    const float normalX = -baselineY;
+    const float normalY = baselineX;
+    const float points[4][2] = {
+            {quad.x1, quad.y1}, {quad.x2, quad.y2},
+            {quad.x3, quad.y3}, {quad.x4, quad.y4}
+    };
+    float minBaseline = FLT_MAX;
+    float maxBaseline = -FLT_MAX;
+    float minNormal = FLT_MAX;
+    float maxNormal = -FLT_MAX;
+    for (const auto& point : points) {
+        const float baselineProjection = point[0] * baselineX + point[1] * baselineY;
+        const float normalProjection = point[0] * normalX + point[1] * normalY;
+        minBaseline = fminf(minBaseline, baselineProjection);
+        maxBaseline = fmaxf(maxBaseline, baselineProjection);
+        minNormal = fminf(minNormal, normalProjection);
+        maxNormal = fmaxf(maxNormal, normalProjection);
+    }
+    const float textHeight = fmaxf(maxNormal - minNormal, 1.0f);
+    if (maxBaseline - minBaseline <= 0.01f) return;
+
+    auto appendLine = [&](float normalRatio, const char* suffix) {
+        const float lineNormal = minNormal + textHeight * normalRatio;
+        const float startX = baselineX * minBaseline + normalX * lineNormal;
+        const float startY = baselineY * minBaseline + normalY * lineNormal;
+        const float endX = baselineX * maxBaseline + normalX * lineNormal;
+        const float endY = baselineY * maxBaseline + normalY * lineNormal;
+        FPDF_PAGEOBJECT line = FPDFPageObj_CreateNewPath(startX, startY);
+        if (!line) return;
+        FPDFPath_LineTo(line, endX, endY);
+        FPDFPageObj_SetStrokeColor(line, r, g, b, a);
+        FPDFPageObj_SetStrokeWidth(line, fmaxf(textHeight * 0.055f, 0.35f));
+        FPDFPath_SetDrawMode(line, 0, JNI_TRUE);
+        FPDFPageObj_AddMark(
+                line,
+                (markPrefix + suffix + "_" + std::to_string(objectOrdinal)).c_str());
+        FPDFPage_InsertObject(page, line);
+    };
+    if (underline) appendLine(0.08f, "underline");
+    if (strikeout) appendLine(0.52f, "strikeout");
+}
+
+static bool TextEditNeedsCompatibleFont(JNIEnv* env, jstring originalText, jstring replacementText) {
+    if (!env || !replacementText) return false;
+    const jsize replacementLength = env->GetStringLength(replacementText);
+    const jsize originalLength = originalText ? env->GetStringLength(originalText) : 0;
+    const jchar* replacementChars = env->GetStringChars(replacementText, nullptr);
+    const jchar* originalChars = originalText ? env->GetStringChars(originalText, nullptr) : nullptr;
+    bool needsCompatibleFont = false;
+    for (jsize index = 0; replacementChars && index < replacementLength; ++index) {
+        const uint16_t ch = replacementChars[index];
+        const bool complexScript =
+                (ch >= 0x0590 && ch <= 0x08FF) ||
+                (ch >= 0x0900 && ch <= 0x0D7F) ||
+                (ch >= 0x0E00 && ch <= 0x0E7F) ||
+                (ch >= 0x2E80 && ch <= 0x9FFF) ||
+                (ch >= 0xAC00 && ch <= 0xD7AF);
+        const bool existedInOriginal = originalChars &&
+                std::find(originalChars, originalChars + originalLength, ch) != originalChars + originalLength;
+        if (complexScript || !existedInOriginal) {
+            needsCompatibleFont = true;
+            break;
+        }
+    }
+    if (originalChars) env->ReleaseStringChars(originalText, originalChars);
+    if (replacementChars) env->ReleaseStringChars(replacementText, replacementChars);
+    return needsCompatibleFont;
+}
+
+static void CopyTextEditObjectAppearance(
+        FPDF_PAGEOBJECT sourceObject,
+        FPDF_PAGEOBJECT replacementObject) {
+    if (!sourceObject || !replacementObject) return;
+    FS_MATRIX matrix = {1, 0, 0, 1, 0, 0};
+    if (FPDFPageObj_GetMatrix(sourceObject, &matrix)) {
+        FPDFPageObj_SetMatrix(replacementObject, &matrix);
+    }
+    unsigned int r = 0, g = 0, b = 0, a = 255;
+    if (FPDFPageObj_GetFillColor(sourceObject, &r, &g, &b, &a)) {
+        FPDFPageObj_SetFillColor(replacementObject, r, g, b, a);
+    }
+    if (FPDFPageObj_GetStrokeColor(sourceObject, &r, &g, &b, &a)) {
+        FPDFPageObj_SetStrokeColor(replacementObject, r, g, b, a);
+    }
+    float strokeWidth = 0.0f;
+    if (FPDFPageObj_GetStrokeWidth(sourceObject, &strokeWidth)) {
+        FPDFPageObj_SetStrokeWidth(replacementObject, strokeWidth);
+    }
+    FPDFTextObj_SetTextRenderMode(
+            replacementObject,
+            FPDFTextObj_GetTextRenderMode(sourceObject));
+}
+
+static float MeasureTextEditRunAdvance(
+        FPDF_DOCUMENT doc,
+        FPDF_FONT font,
+        float fontSize,
+        const std::u16string& text) {
+    if (!doc || !font || text.empty()) return 0.0f;
+    char16_t sentinel = u'M';
+    for (char16_t value : text) {
+        if (value != u' ' && value != u'\t' && value != u'\r' && value != u'\n') {
+            sentinel = value;
+            break;
+        }
+    }
+
+    auto measureBoundsWidth = [&](const std::u16string& value) -> float {
+        FPDF_PAGEOBJECT measurementObject = FPDFPageObj_CreateTextObj(doc, font, fontSize);
+        if (!measurementObject) return 0.0f;
+        std::vector<unsigned short> utf16(value.begin(), value.end());
+        utf16.push_back(0);
+        float width = 0.0f;
+        if (FPDFText_SetText(
+                measurementObject,
+                reinterpret_cast<FPDF_WIDESTRING>(utf16.data()))) {
+            float left = 0.0f, bottom = 0.0f, right = 0.0f, top = 0.0f;
+            if (FPDFPageObj_GetBounds(
+                    measurementObject,
+                    &left,
+                    &bottom,
+                    &right,
+                    &top)) {
+                width = fmaxf(0.0f, right - left);
+            }
+        }
+        FPDFPageObj_Destroy(measurementObject);
+        return width;
+    };
+
+    std::u16string surroundedText;
+    surroundedText.reserve(text.size() + 2);
+    surroundedText.push_back(sentinel);
+    surroundedText.append(text);
+    surroundedText.push_back(sentinel);
+    const std::u16string sentinelPair(2, sentinel);
+    const float surroundedWidth = measureBoundsWidth(surroundedText);
+    const float sentinelPairWidth = measureBoundsWidth(sentinelPair);
+    return fmaxf(0.0f, surroundedWidth - sentinelPairWidth);
+}
+
+static FPDF_FONT LoadTextEditFallbackFont(
+        FPDF_DOCUMENT doc,
+        const char* fontPath,
+        bool useCache) {
+    if (!doc || !fontPath || strlen(fontPath) == 0) return nullptr;
+    if (useCache) {
+        Mutex::Autolock lock(sTextEditFontCacheLock);
+        const auto documentEntry = sTextEditFontCache.find(doc);
+        if (documentEntry != sTextEditFontCache.end()) {
+            const auto fontEntry = documentEntry->second.find(fontPath);
+            if (fontEntry != documentEntry->second.end()) return fontEntry->second;
+        }
+    }
+
+    FILE* fontFile = fopen(fontPath, "rb");
+    if (!fontFile) return nullptr;
+    fseek(fontFile, 0, SEEK_END);
+    const long fontSizeBytes = ftell(fontFile);
+    rewind(fontFile);
+    if (fontSizeBytes <= 0) {
+        fclose(fontFile);
+        return nullptr;
+    }
+    std::vector<uint8_t> fontBytes(static_cast<size_t>(fontSizeBytes));
+    const size_t bytesRead = fread(fontBytes.data(), 1, fontBytes.size(), fontFile);
+    fclose(fontFile);
+    if (bytesRead != fontBytes.size()) return nullptr;
+    FPDF_FONT font = FPDFText_LoadFont(
+            doc,
+            fontBytes.data(),
+            static_cast<uint32_t>(fontBytes.size()),
+            FPDF_FONT_TRUETYPE,
+            true);
+    if (font && useCache) {
+        Mutex::Autolock lock(sTextEditFontCacheLock);
+        sTextEditFontCache[doc][fontPath] = font;
+    }
+    return font;
+}
+
+static FPDF_PAGEOBJECT CreateTextEditRunObject(
+        FPDF_DOCUMENT doc,
+        FPDF_PAGEOBJECT sourceObject,
+        FPDF_FONT font,
+        const std::u16string& text,
+        float advance,
+        bool requestedBold,
+        bool requestedItalic,
+        float* outWidth) {
+    if (!doc || !sourceObject || !font || text.empty()) return nullptr;
+    float sourceFontSize = 12.0f;
+    FPDFTextObj_GetFontSize(sourceObject, &sourceFontSize);
+    FPDF_PAGEOBJECT runObject = FPDFPageObj_CreateTextObj(doc, font, sourceFontSize);
+    if (!runObject) return nullptr;
+    std::vector<unsigned short> utf16(text.begin(), text.end());
+    utf16.push_back(0);
+    if (!FPDFText_SetText(runObject, reinterpret_cast<FPDF_WIDESTRING>(utf16.data()))) {
+        FPDFPageObj_Destroy(runObject);
+        return nullptr;
+    }
+    float width = MeasureTextEditRunAdvance(doc, font, sourceFontSize, text);
+    if (width <= 0.0f) {
+        float left = 0.0f, bottom = 0.0f, right = 0.0f, top = 0.0f;
+        width = FPDFPageObj_GetBounds(runObject, &left, &bottom, &right, &top)
+                ? fmaxf(0.0f, right - left)
+                : 0.0f;
+    }
+    CopyTextEditObjectAppearance(sourceObject, runObject);
+    const bool usesFallbackFont = font != FPDFTextObj_GetFont(sourceObject);
+    FPDF_FONT sourceFont = FPDFTextObj_GetFont(sourceObject);
+    const int sourceFontWeight = FPDFFont_GetWeight(sourceFont);
+    int sourceItalicAngle = 0;
+    FPDFFont_GetItalicAngle(sourceFont, &sourceItalicAngle);
+    std::string sourceFontName;
+    const size_t sourceFontNameLength = FPDFFont_GetBaseFontName(sourceFont, nullptr, 0);
+    if (sourceFontNameLength > 0) {
+        std::vector<char> nameBuffer(sourceFontNameLength);
+        if (FPDFFont_GetBaseFontName(sourceFont, nameBuffer.data(), sourceFontNameLength) > 0) {
+            sourceFontName.assign(nameBuffer.data());
+            std::transform(
+                    sourceFontName.begin(),
+                    sourceFontName.end(),
+                    sourceFontName.begin(),
+                    [](unsigned char value) { return static_cast<char>(std::tolower(value)); });
+        }
+    }
+    const bool sourceIsBold = sourceFontWeight >= 600 ||
+            sourceFontName.find("bold") != std::string::npos ||
+            sourceFontName.find("black") != std::string::npos ||
+            sourceFontName.find("semibold") != std::string::npos ||
+            sourceFontName.find("demibold") != std::string::npos;
+    const bool sourceIsItalic = sourceItalicAngle != 0 ||
+            sourceFontName.find("italic") != std::string::npos ||
+            sourceFontName.find("oblique") != std::string::npos;
+    if (requestedBold && (!sourceIsBold || usesFallbackFont)) {
+        unsigned int r = 0, g = 0, b = 0, a = 255;
+        FPDFPageObj_GetFillColor(sourceObject, &r, &g, &b, &a);
+        FPDFPageObj_SetStrokeColor(runObject, r, g, b, a);
+        FPDFTextObj_SetTextRenderMode(runObject, FPDF_TEXTRENDERMODE_FILL_STROKE);
+        FPDFPageObj_SetStrokeWidth(runObject, fmax(sourceFontSize * 0.025f, 0.2f));
+    } else if (!requestedBold && !sourceIsBold) {
+        FPDFTextObj_SetTextRenderMode(runObject, FPDF_TEXTRENDERMODE_FILL);
+    }
+    FS_MATRIX matrix = {1, 0, 0, 1, 0, 0};
+    if (FPDFPageObj_GetMatrix(sourceObject, &matrix)) {
+        if (requestedItalic && (!sourceIsItalic || usesFallbackFont)) {
+            const float italicShear = tanf(
+                    (sourceIsItalic ? fabsf(static_cast<float>(sourceItalicAngle)) : 12.0f) *
+                    static_cast<float>(M_PI) / 180.0f);
+            matrix.c += matrix.a * italicShear;
+            matrix.d += matrix.b * italicShear;
+        }
+        matrix.e += matrix.a * advance;
+        matrix.f += matrix.b * advance;
+        FPDFPageObj_SetMatrix(runObject, &matrix);
+    }
+    if (outWidth) *outWidth = width;
+    return runObject;
+}
+
+static bool CreateSegmentedCompatibleTextEditObjects(
+        JNIEnv* env,
+        FPDF_DOCUMENT doc,
+        FPDF_PAGE page,
+        FPDF_PAGEOBJECT sourceObject,
+        jstring originalText,
+        jstring replacementText,
+        const char* fontPath,
+        bool cacheFallbackFont,
+        const std::string& markPrefix,
+        std::vector<FPDF_PAGEOBJECT>* outObjects) {
+    if (!env || !doc || !page || !sourceObject || !originalText || !replacementText ||
+        !fontPath || strlen(fontPath) == 0 || !outObjects) return false;
+
+    const jsize originalLength = env->GetStringLength(originalText);
+    const jsize replacementLength = env->GetStringLength(replacementText);
+    const jchar* originalChars = env->GetStringChars(originalText, nullptr);
+    const jchar* replacementChars = env->GetStringChars(replacementText, nullptr);
+    if (!originalChars || !replacementChars) {
+        if (originalChars) env->ReleaseStringChars(originalText, originalChars);
+        if (replacementChars) env->ReleaseStringChars(replacementText, replacementChars);
+        return false;
+    }
+    size_t prefixLength = 0;
+    while (prefixLength < static_cast<size_t>(originalLength) &&
+           prefixLength < static_cast<size_t>(replacementLength) &&
+           originalChars[prefixLength] == replacementChars[prefixLength]) {
+        ++prefixLength;
+    }
+    size_t suffixLength = 0;
+    while (suffixLength + prefixLength < static_cast<size_t>(originalLength) &&
+           suffixLength + prefixLength < static_cast<size_t>(replacementLength) &&
+           originalChars[originalLength - 1 - suffixLength] ==
+                   replacementChars[replacementLength - 1 - suffixLength]) {
+        ++suffixLength;
+    }
+    const std::u16string prefix(
+            reinterpret_cast<const char16_t*>(originalChars),
+            prefixLength);
+    const std::u16string changed(
+            reinterpret_cast<const char16_t*>(replacementChars + prefixLength),
+            static_cast<size_t>(replacementLength) - prefixLength - suffixLength);
+    const std::u16string suffix(
+            reinterpret_cast<const char16_t*>(originalChars + originalLength - suffixLength),
+            suffixLength);
+    env->ReleaseStringChars(originalText, originalChars);
+    env->ReleaseStringChars(replacementText, replacementChars);
+
+    FPDF_FONT fallbackFont = LoadTextEditFallbackFont(doc, fontPath, cacheFallbackFont);
+    FPDF_FONT originalFont = FPDFTextObj_GetFont(sourceObject);
+    if (!fallbackFont || !originalFont) return false;
+    const int sourceFontWeight = FPDFFont_GetWeight(originalFont);
+    int sourceItalicAngle = 0;
+    FPDFFont_GetItalicAngle(originalFont, &sourceItalicAngle);
+    const bool sourceBold = sourceFontWeight >= 600;
+    const bool sourceItalic = sourceItalicAngle != 0;
+
+    float advance = 0.0f;
+    auto appendRun = [&](FPDF_FONT font, const std::u16string& text, const char* suffixName) -> bool {
+        if (text.empty()) return true;
+        float runWidth = 0.0f;
+        FPDF_PAGEOBJECT runObject = CreateTextEditRunObject(
+                doc,
+                sourceObject,
+                font,
+                text,
+                advance,
+                sourceBold,
+                sourceItalic,
+                &runWidth);
+        if (!runObject) return false;
+        FPDFPageObj_AddMark(runObject, (markPrefix + suffixName).c_str());
+        FPDFPage_InsertObject(page, runObject);
+        outObjects->push_back(runObject);
+        advance += runWidth;
+        return true;
+    };
+
+    if (!appendRun(originalFont, prefix, "prefix") ||
+        !appendRun(fallbackFont, changed, "changed") ||
+        !appendRun(originalFont, suffix, "suffix")) {
+        for (FPDF_PAGEOBJECT object : *outObjects) {
+            if (FPDFPage_RemoveObject(page, object)) FPDFPageObj_Destroy(object);
+        }
+        outObjects->clear();
+        return false;
+    }
+    return !outObjects->empty();
+}
+
+struct TextEditCharacterStyle {
+    bool bold = false;
+    bool italic = false;
+    bool underline = false;
+    bool strikeout = false;
+
+    TextEditCharacterStyle() = default;
+    TextEditCharacterStyle(bool boldValue, bool italicValue, bool underlineValue, bool strikeoutValue)
+            : bold(boldValue),
+              italic(italicValue),
+              underline(underlineValue),
+              strikeout(strikeoutValue) {}
+
+    bool operator==(const TextEditCharacterStyle& other) const {
+        return bold == other.bold && italic == other.italic &&
+               underline == other.underline && strikeout == other.strikeout;
+    }
+};
+
+struct StyledTextEditObject {
+    FPDF_PAGEOBJECT object = nullptr;
+    TextEditCharacterStyle style;
+
+    StyledTextEditObject(FPDF_PAGEOBJECT objectValue, const TextEditCharacterStyle& styleValue)
+            : object(objectValue), style(styleValue) {}
+};
+
+static std::vector<TextEditCharacterStyle> ParseTextEditCharacterStyles(
+        const char* encodedStyles,
+        size_t textLength,
+        const TextEditCharacterStyle& fallbackStyle) {
+    std::vector<TextEditCharacterStyle> styles(textLength, fallbackStyle);
+    if (!encodedStyles || strlen(encodedStyles) == 0) return styles;
+    std::stringstream stream(encodedStyles);
+    std::string encodedRun;
+    while (std::getline(stream, encodedRun, ';')) {
+        int start = 0, end = 0, bold = 0, italic = 0, underline = 0, strikeout = 0;
+        if (sscanf(
+                encodedRun.c_str(),
+                "%d,%d,%d,%d,%d,%d",
+                &start,
+                &end,
+                &bold,
+                &italic,
+                &underline,
+                &strikeout) != 6) continue;
+        const int safeStart = std::max(0, std::min(start, static_cast<int>(textLength)));
+        const int safeEnd = std::max(safeStart, std::min(end, static_cast<int>(textLength)));
+        const TextEditCharacterStyle style = {
+                bold != 0,
+                italic != 0,
+                underline != 0,
+                strikeout != 0
+        };
+        for (int index = safeStart; index < safeEnd; ++index) styles[index] = style;
+    }
+    return styles;
+}
+
+static bool CreateStyledTextEditObjects(
+        JNIEnv* env,
+        FPDF_DOCUMENT doc,
+        FPDF_PAGE page,
+        FPDF_PAGEOBJECT sourceObject,
+        jstring originalText,
+        jstring replacementText,
+        const char* fallbackFontPath,
+        bool useCompatibleFont,
+        bool cacheFallbackFont,
+        const char* encodedStyles,
+        const std::string& markPrefix,
+        std::vector<StyledTextEditObject>* outObjects) {
+    if (!env || !doc || !page || !sourceObject || !replacementText || !outObjects) return false;
+    const jsize replacementLength = env->GetStringLength(replacementText);
+    const jchar* replacementChars = env->GetStringChars(replacementText, nullptr);
+    if (!replacementChars || replacementLength <= 0) {
+        if (replacementChars) env->ReleaseStringChars(replacementText, replacementChars);
+        return false;
+    }
+    const jsize originalLength = originalText ? env->GetStringLength(originalText) : 0;
+    const jchar* originalChars = originalText ? env->GetStringChars(originalText, nullptr) : nullptr;
+    size_t prefixLength = 0;
+    while (originalChars && prefixLength < static_cast<size_t>(originalLength) &&
+           prefixLength < static_cast<size_t>(replacementLength) &&
+           originalChars[prefixLength] == replacementChars[prefixLength]) {
+        ++prefixLength;
+    }
+    size_t suffixLength = 0;
+    while (originalChars && suffixLength + prefixLength < static_cast<size_t>(originalLength) &&
+           suffixLength + prefixLength < static_cast<size_t>(replacementLength) &&
+           originalChars[originalLength - 1 - suffixLength] ==
+                   replacementChars[replacementLength - 1 - suffixLength]) {
+        ++suffixLength;
+    }
+    if (originalChars) env->ReleaseStringChars(originalText, originalChars);
+
+    FPDF_FONT originalFont = FPDFTextObj_GetFont(sourceObject);
+    if (!originalFont) {
+        env->ReleaseStringChars(replacementText, replacementChars);
+        return false;
+    }
+    FPDF_FONT fallbackFont = nullptr;
+    if (useCompatibleFont) {
+        if (!fallbackFontPath || strlen(fallbackFontPath) == 0) {
+            env->ReleaseStringChars(replacementText, replacementChars);
+            return false;
+        }
+        fallbackFont = LoadTextEditFallbackFont(doc, fallbackFontPath, cacheFallbackFont);
+        if (!fallbackFont) {
+            env->ReleaseStringChars(replacementText, replacementChars);
+            return false;
+        }
+    }
+
+    const int sourceWeight = FPDFFont_GetWeight(originalFont);
+    int sourceItalicAngle = 0;
+    FPDFFont_GetItalicAngle(originalFont, &sourceItalicAngle);
+    const TextEditCharacterStyle sourceStyle = {
+            sourceWeight >= 600,
+            sourceItalicAngle != 0,
+            false,
+            false
+    };
+    const std::vector<TextEditCharacterStyle> styles = ParseTextEditCharacterStyles(
+            encodedStyles,
+            static_cast<size_t>(replacementLength),
+            sourceStyle);
+    const size_t changedEnd = static_cast<size_t>(replacementLength) - suffixLength;
+    float advance = 0.0f;
+    size_t runStart = 0;
+    int runOrdinal = 0;
+    while (runStart < static_cast<size_t>(replacementLength)) {
+        const bool useFallback = useCompatibleFont &&
+                runStart >= prefixLength && runStart < changedEnd;
+        const TextEditCharacterStyle runStyle = styles[runStart];
+        size_t runEnd = runStart + 1;
+        while (runEnd < static_cast<size_t>(replacementLength)) {
+            const bool nextUsesFallback = useCompatibleFont &&
+                    runEnd >= prefixLength && runEnd < changedEnd;
+            if (nextUsesFallback != useFallback || !(styles[runEnd] == runStyle)) break;
+            ++runEnd;
+        }
+        const std::u16string runText(
+                reinterpret_cast<const char16_t*>(replacementChars + runStart),
+                runEnd - runStart);
+        float runWidth = 0.0f;
+        FPDF_PAGEOBJECT runObject = CreateTextEditRunObject(
+                doc,
+                sourceObject,
+                useFallback ? fallbackFont : originalFont,
+                runText,
+                advance,
+                runStyle.bold,
+                runStyle.italic,
+                &runWidth);
+        if (!runObject) {
+            for (const StyledTextEditObject& created : *outObjects) {
+                if (FPDFPage_RemoveObject(page, created.object)) FPDFPageObj_Destroy(created.object);
+            }
+            outObjects->clear();
+            env->ReleaseStringChars(replacementText, replacementChars);
+            return false;
+        }
+        FPDFPageObj_AddMark(
+                runObject,
+                (markPrefix + "styled_" + std::to_string(runOrdinal++)).c_str());
+        FPDFPage_InsertObject(page, runObject);
+        outObjects->emplace_back(runObject, runStyle);
+        advance += runWidth;
+        runStart = runEnd;
+    }
+    env->ReleaseStringChars(replacementText, replacementChars);
+    return !outObjects->empty();
+}
+
+
+static bool ApplyNativeTextContentEdits(
+        JNIEnv* env,
+        FPDF_DOCUMENT doc,
+        jobjectArray textEditsArray,
+        FPDF_PAGE providedPage,
+        int providedPageIndex,
+        bool validateOriginalText,
+        bool cacheFallbackFonts = false) {
+    if (!textEditsArray) return true;
+
+    jclass editClass = env->FindClass("com/cv/lufick/compose_editor/data_class/PdfTextEditNative");
+    if (!editClass) return false;
+    jfieldID pageField = env->GetFieldID(editClass, "pageIndex", "I");
+    jfieldID objectField = env->GetFieldID(editClass, "objectIndex", "I");
+    jfieldID originalTextField = env->GetFieldID(editClass, "originalText", "Ljava/lang/String;");
+    jfieldID leftField = env->GetFieldID(editClass, "left", "F");
+    jfieldID bottomField = env->GetFieldID(editClass, "bottom", "F");
+    jfieldID rightField = env->GetFieldID(editClass, "right", "F");
+    jfieldID topField = env->GetFieldID(editClass, "top", "F");
+    jfieldID newTextField = env->GetFieldID(editClass, "newText", "Ljava/lang/String;");
+    jfieldID scaleXField = env->GetFieldID(editClass, "scaleX", "F");
+    jfieldID translateXField = env->GetFieldID(editClass, "translateX", "F");
+    jfieldID translateYField = env->GetFieldID(editClass, "translateY", "F");
+    jfieldID fontSizeField = env->GetFieldID(editClass, "fontSize", "F");
+    jfieldID fontWeightField = env->GetFieldID(editClass, "fontWeight", "I");
+    jfieldID italicAngleField = env->GetFieldID(editClass, "italicAngle", "F");
+    jfieldID redField = env->GetFieldID(editClass, "r", "I");
+    jfieldID greenField = env->GetFieldID(editClass, "g", "I");
+    jfieldID blueField = env->GetFieldID(editClass, "b", "I");
+    jfieldID alphaField = env->GetFieldID(editClass, "a", "I");
+    jfieldID matrixAField = env->GetFieldID(editClass, "matrixA", "F");
+    jfieldID matrixBField = env->GetFieldID(editClass, "matrixB", "F");
+    jfieldID matrixCField = env->GetFieldID(editClass, "matrixC", "F");
+    jfieldID matrixDField = env->GetFieldID(editClass, "matrixD", "F");
+    jfieldID matrixEField = env->GetFieldID(editClass, "matrixE", "F");
+    jfieldID matrixFField = env->GetFieldID(editClass, "matrixF", "F");
+    jfieldID boldField = env->GetFieldID(editClass, "isBold", "Z");
+    jfieldID italicField = env->GetFieldID(editClass, "isItalic", "Z");
+    jfieldID underlineField = env->GetFieldID(editClass, "isUnderline", "Z");
+    jfieldID strikeoutField = env->GetFieldID(editClass, "isStrikeout", "Z");
+    jfieldID styleChangedField = env->GetFieldID(editClass, "styleChanged", "Z");
+    jfieldID styleRunsField = env->GetFieldID(editClass, "styleRuns", "Ljava/lang/String;");
+    jfieldID resetAppearanceField = env->GetFieldID(
+            editClass,
+            "resetNativeAppearance",
+            "Z");
+    jfieldID fontPathField = env->GetFieldID(editClass, "fontPath", "Ljava/lang/String;");
+    jfieldID sourceFontSupportsReplacementField = env->GetFieldID(
+            editClass,
+            "sourceFontSupportsReplacement",
+            "Z");
+    bool allApplied = true;
+    std::vector<std::pair<int, std::string>> pendingMarkedTextRemovals;
+
+    const int editCount = env->GetArrayLength(textEditsArray);
+    for (int editIndex = 0; editIndex < editCount; ++editIndex) {
+        jobject edit = env->GetObjectArrayElement(textEditsArray, editIndex);
+        if (!edit) {
+            allApplied = false;
+            continue;
+        }
+        const int pageIndex = env->GetIntField(edit, pageField);
+        const int objectIndex = env->GetIntField(edit, objectField);
+        const bool usesProvidedPage = providedPage && pageIndex == providedPageIndex;
+        FPDF_PAGE page = usesProvidedPage ? providedPage : FPDF_LoadPage(doc, pageIndex);
+        const std::string liveStyleMarkPrefix = "LufickTextEditPreviewStyle_" +
+                std::to_string(pageIndex) + "_" + std::to_string(objectIndex) + "_";
+        if (page && usesProvidedPage) {
+            RemoveTextEditPreviewObjects(page, liveStyleMarkPrefix);
+        }
+        if (!page || objectIndex < 0 || objectIndex >= FPDFPage_CountObjects(page)) {
+            if (page && !usesProvidedPage) FPDF_ClosePage(page);
+            env->DeleteLocalRef(edit);
+            allApplied = false;
+            continue;
+        }
+
+        FPDF_PAGEOBJECT textObject = FPDFPage_GetObject(page, objectIndex);
+        float actualLeft = 0.0f, actualBottom = 0.0f, actualRight = 0.0f, actualTop = 0.0f;
+        const bool isTextObject = textObject && FPDFPageObj_GetType(textObject) == FPDF_PAGEOBJ_TEXT;
+        const bool hasBounds = isTextObject &&
+                FPDFPageObj_GetBounds(textObject, &actualLeft, &actualBottom, &actualRight, &actualTop);
+        const float expectedLeft = env->GetFloatField(edit, leftField);
+        const float expectedBottom = env->GetFloatField(edit, bottomField);
+        const float expectedRight = env->GetFloatField(edit, rightField);
+        const float expectedTop = env->GetFloatField(edit, topField);
+        const float boundsTolerance = 0.5f;
+        const bool boundsMatch = hasBounds &&
+                std::fabs(actualLeft - expectedLeft) <= boundsTolerance &&
+                std::fabs(actualBottom - expectedBottom) <= boundsTolerance &&
+                std::fabs(actualRight - expectedRight) <= boundsTolerance &&
+                std::fabs(actualTop - expectedTop) <= boundsTolerance;
+
+        jstring expectedText = (jstring)env->GetObjectField(edit, originalTextField);
+        jstring replacementText = (jstring)env->GetObjectField(edit, newTextField);
+        jstring replacementFontPath = (jstring)env->GetObjectField(edit, fontPathField);
+        jstring encodedStyleRuns = (jstring)env->GetObjectField(edit, styleRunsField);
+        const char* replacementFontPathChars = replacementFontPath
+                                               ? env->GetStringUTFChars(replacementFontPath, nullptr)
+                                               : nullptr;
+        const char* encodedStyleRunChars = encodedStyleRuns
+                                           ? env->GetStringUTFChars(encodedStyleRuns, nullptr)
+                                           : nullptr;
+        bool textMatches = !validateOriginalText;
+        if (validateOriginalText && isTextObject && expectedText) {
+            FPDF_TEXTPAGE textPage = FPDFText_LoadPage(page);
+            if (textPage) {
+                const unsigned long textBytes = FPDFTextObj_GetText(textObject, textPage, nullptr, 0);
+                if (textBytes >= sizeof(FPDF_WCHAR)) {
+                    const size_t bufferLength = textBytes / sizeof(FPDF_WCHAR);
+                    std::vector<FPDF_WCHAR> buffer(bufferLength);
+                    FPDFTextObj_GetText(textObject, textPage, buffer.data(), textBytes);
+                    const jsize actualLength = static_cast<jsize>(bufferLength - 1);
+                    const jsize expectedLength = env->GetStringLength(expectedText);
+                    const jchar* expectedChars = env->GetStringChars(expectedText, nullptr);
+                    textMatches = expectedChars && actualLength == expectedLength &&
+                            std::equal(expectedChars, expectedChars + expectedLength, buffer.begin());
+                    if (expectedChars) env->ReleaseStringChars(expectedText, expectedChars);
+                }
+                FPDFText_ClosePage(textPage);
+            }
+        }
+
+        // Object index plus complete original text is the stable validation. Character-derived
+        // visual block bounds can legitimately cover only part of this owner object.
+        bool applied = isTextObject && textMatches && replacementText;
+        if (applied) {
+            const bool resetAppearance = env->GetBooleanField(
+                    edit,
+                    resetAppearanceField) == JNI_TRUE;
+            const bool isBold = env->GetBooleanField(edit, boldField) == JNI_TRUE;
+            const bool isItalic = env->GetBooleanField(edit, italicField) == JNI_TRUE;
+            const bool isUnderline = env->GetBooleanField(edit, underlineField) == JNI_TRUE;
+            const bool isStrikeout = env->GetBooleanField(edit, strikeoutField) == JNI_TRUE;
+            const bool hasCharacterStyleChanges = env->GetBooleanField(
+                    edit,
+                    styleChangedField) == JNI_TRUE;
+            const float requestedFontSize = env->GetFloatField(edit, fontSizeField);
+            const int sourceFontWeight = env->GetIntField(edit, fontWeightField);
+            const float sourceItalicAngle = env->GetFloatField(edit, italicAngleField);
+            const unsigned int textR = static_cast<unsigned int>(env->GetIntField(edit, redField));
+            const unsigned int textG = static_cast<unsigned int>(env->GetIntField(edit, greenField));
+            const unsigned int textB = static_cast<unsigned int>(env->GetIntField(edit, blueField));
+            const unsigned int textA = static_cast<unsigned int>(env->GetIntField(edit, alphaField));
+            if (resetAppearance) {
+                FS_MATRIX originalMatrix = {
+                        env->GetFloatField(edit, matrixAField),
+                        env->GetFloatField(edit, matrixBField),
+                        env->GetFloatField(edit, matrixCField),
+                        env->GetFloatField(edit, matrixDField),
+                        env->GetFloatField(edit, matrixEField),
+                        env->GetFloatField(edit, matrixFField)
+                };
+                FPDFPageObj_SetMatrix(textObject, &originalMatrix);
+            }
+            const jsize replacementLength = env->GetStringLength(replacementText);
+            const bool sourceFontSupportsReplacement = env->GetBooleanField(
+                    edit,
+                    sourceFontSupportsReplacementField) == JNI_TRUE;
+            const bool useCompatibleFont = replacementLength > 0 &&
+                    replacementFontPathChars && strlen(replacementFontPathChars) > 0 &&
+                    !sourceFontSupportsReplacement &&
+                    TextEditNeedsCompatibleFont(env, expectedText, replacementText);
+            bool usedCompatibleFontObject = false;
+            bool stylesAppliedPerRun = false;
+            std::vector<StyledTextEditObject> liveStyleObjects;
+            if (replacementLength == 0 && !usesProvidedPage) {
+                // FPDFText_SetText() traps for an empty string in this Pdfium build. Final save
+                // removes the object after all indexed replacements have been applied, so an
+                // earlier removal cannot shift the object indices of later edits.
+                const std::string removalMark = "LufickTextEditOriginal_" +
+                        std::to_string(pageIndex) + "_" + std::to_string(objectIndex);
+                FPDFPageObj_AddMark(textObject, removalMark.c_str());
+                pendingMarkedTextRemovals.emplace_back(pageIndex, removalMark);
+                applied = FPDFPage_GenerateContent(page) != 0;
+            } else if (hasCharacterStyleChanges) {
+                const std::string runMarkPrefix = "LufickTextEditPreview_" +
+                        std::to_string(pageIndex) + "_" + std::to_string(objectIndex) + "_";
+                if (usesProvidedPage) RemoveTextEditPreviewObjects(page, runMarkPrefix);
+                applied = CreateStyledTextEditObjects(
+                        env,
+                        doc,
+                        page,
+                        textObject,
+                        expectedText,
+                        replacementText,
+                        replacementFontPathChars,
+                        useCompatibleFont,
+                        cacheFallbackFonts,
+                        encodedStyleRunChars,
+                        runMarkPrefix,
+                        &liveStyleObjects);
+                if (applied) {
+                    const float scaleX = env->GetFloatField(edit, scaleXField);
+                    const float translateX = env->GetFloatField(edit, translateXField);
+                    const float translateY = env->GetFloatField(edit, translateYField);
+                    for (const StyledTextEditObject& replacementObject : liveStyleObjects) {
+                        if (scaleX == 1.0f && translateX == 0.0f && translateY == 0.0f) continue;
+                        FPDFPageObj_Transform(
+                                replacementObject.object,
+                                scaleX,
+                                0,
+                                0,
+                                1,
+                                translateX,
+                                translateY);
+                    }
+                    usedCompatibleFontObject = true;
+                    stylesAppliedPerRun = true;
+                    if (usesProvidedPage) {
+                        const unsigned short previewPlaceholder[2] = {
+                                static_cast<unsigned short>(' '), 0
+                        };
+                        applied = FPDFText_SetText(
+                                textObject,
+                                reinterpret_cast<FPDF_WIDESTRING>(previewPlaceholder)) != 0;
+                    } else {
+                        const std::string removalMark = "LufickTextEditOriginal_" +
+                                std::to_string(pageIndex) + "_" + std::to_string(objectIndex);
+                        FPDFPageObj_AddMark(textObject, removalMark.c_str());
+                        pendingMarkedTextRemovals.emplace_back(pageIndex, removalMark);
+                    }
+                }
+            } else if (useCompatibleFont) {
+                const std::string runMarkPrefix = (usesProvidedPage
+                        ? "LufickTextEditPreview_"
+                        : "LufickTextEditFinal_") +
+                        std::to_string(pageIndex) + "_" + std::to_string(objectIndex) + "_";
+                if (usesProvidedPage) RemoveTextEditPreviewObjects(page, runMarkPrefix);
+                std::vector<FPDF_PAGEOBJECT> replacementObjects;
+                applied = CreateSegmentedCompatibleTextEditObjects(
+                        env,
+                        doc,
+                        page,
+                        textObject,
+                        expectedText,
+                        replacementText,
+                        replacementFontPathChars,
+                        cacheFallbackFonts,
+                        runMarkPrefix,
+                        &replacementObjects);
+                if (applied) {
+                    const float scaleX = env->GetFloatField(edit, scaleXField);
+                    const float translateX = env->GetFloatField(edit, translateXField);
+                    const float translateY = env->GetFloatField(edit, translateYField);
+                    for (FPDF_PAGEOBJECT replacementObject : replacementObjects) {
+                        if (scaleX == 1.0f && translateX == 0.0f && translateY == 0.0f) continue;
+                        FPDFPageObj_Transform(
+                                replacementObject,
+                                scaleX,
+                                0,
+                                0,
+                                1,
+                                translateX,
+                                translateY);
+                    }
+                    usedCompatibleFontObject = true;
+                    for (FPDF_PAGEOBJECT replacementObject : replacementObjects) {
+                        liveStyleObjects.emplace_back(
+                                replacementObject,
+                                TextEditCharacterStyle(
+                                        isBold,
+                                        isItalic,
+                                        isUnderline,
+                                        isStrikeout));
+                    }
+                    if (usesProvidedPage) {
+                        const unsigned short previewPlaceholder[2] = {
+                                static_cast<unsigned short>(' '), 0
+                        };
+                        applied = FPDFText_SetText(
+                                textObject,
+                                reinterpret_cast<FPDF_WIDESTRING>(previewPlaceholder)) != 0;
+                    } else {
+                        const std::string removalMark = "LufickTextEditOriginal_" +
+                                std::to_string(pageIndex) + "_" + std::to_string(objectIndex);
+                        FPDFPageObj_AddMark(textObject, removalMark.c_str());
+                        pendingMarkedTextRemovals.emplace_back(pageIndex, removalMark);
+                    }
+                }
+            } else {
+                if (usesProvidedPage) {
+                    const std::string markPrefix = "LufickTextEditPreview_" +
+                            std::to_string(pageIndex) + "_" + std::to_string(objectIndex) + "_";
+                    std::vector<FPDF_PAGEOBJECT> stalePreviewObjects;
+                    FindTextEditPreviewObject(page, markPrefix, markPrefix + "none", &stalePreviewObjects);
+                    for (FPDF_PAGEOBJECT staleObject : stalePreviewObjects) {
+                        if (FPDFPage_RemoveObject(page, staleObject)) {
+                            FPDFPageObj_Destroy(staleObject);
+                        }
+                    }
+                }
+                const jchar* replacementChars = env->GetStringChars(replacementText, nullptr);
+                std::vector<unsigned short> replacement(
+                        static_cast<size_t>(std::max<jsize>(replacementLength, 1)) + 1,
+                        0);
+                if (replacementLength == 0) {
+                    // Keep the preview object alive and visually blank. A later keystroke can
+                    // replace this space on the same native object without changing its index.
+                    replacement[0] = static_cast<unsigned short>(' ');
+                } else {
+                    for (jsize i = 0; i < replacementLength; ++i) {
+                        replacement[i] = static_cast<unsigned short>(replacementChars[i]);
+                    }
+                }
+                applied = FPDFText_SetText(
+                        textObject,
+                        reinterpret_cast<FPDF_WIDESTRING>(replacement.data())) != 0;
+                if (applied) {
+                    liveStyleObjects.emplace_back(
+                            textObject,
+                            TextEditCharacterStyle(
+                                    isBold,
+                                    isItalic,
+                                    isUnderline,
+                                    isStrikeout));
+                }
+                if (replacementChars) {
+                    env->ReleaseStringChars(replacementText, replacementChars);
+                }
+            }
+            if (applied) {
+                if (!usedCompatibleFontObject && (replacementLength > 0 || usesProvidedPage)) {
+                    const float scaleX = env->GetFloatField(edit, scaleXField);
+                    const float translateX = env->GetFloatField(edit, translateXField);
+                    const float translateY = env->GetFloatField(edit, translateYField);
+                    if (scaleX != 1.0f || translateX != 0.0f || translateY != 0.0f) {
+                        FPDFPageObj_Transform(textObject, scaleX, 0, 0, 1, translateX, translateY);
+                    }
+                }
+                if (usesProvidedPage) {
+                    int liveObjectOrdinal = 0;
+                    for (const StyledTextEditObject& styledObject : liveStyleObjects) {
+                        FPDF_PAGEOBJECT liveObject = styledObject.object;
+                        ApplyTextEditLiveFontStyle(
+                                liveObject,
+                                resetAppearance && !stylesAppliedPerRun,
+                                styledObject.style.bold,
+                                styledObject.style.italic,
+                                sourceFontWeight,
+                                sourceItalicAngle,
+                                requestedFontSize,
+                                textR,
+                                textG,
+                                textB,
+                                textA);
+                        if (replacementLength > 0) {
+                            AppendTextEditLiveDecoration(
+                                    page,
+                                    liveObject,
+                                    styledObject.style.underline,
+                                    styledObject.style.strikeout,
+                                    textR,
+                                    textG,
+                                    textB,
+                                    textA,
+                                    liveStyleMarkPrefix,
+                                    liveObjectOrdinal++);
+                        }
+                    }
+                }
+                applied = FPDFPage_GenerateContent(page) != 0;
+            }
+        }
+
+        if (!applied) {
+            LOGE("PDF_EDIT_NATIVE text edit rejected page=%d object=%d", pageIndex, objectIndex);
+            allApplied = false;
+        }
+        if (expectedText) env->DeleteLocalRef(expectedText);
+        if (replacementText) env->DeleteLocalRef(replacementText);
+        if (replacementFontPathChars) {
+            env->ReleaseStringUTFChars(replacementFontPath, replacementFontPathChars);
+        }
+        if (encodedStyleRunChars) {
+            env->ReleaseStringUTFChars(encodedStyleRuns, encodedStyleRunChars);
+        }
+        if (encodedStyleRuns) env->DeleteLocalRef(encodedStyleRuns);
+        if (replacementFontPath) env->DeleteLocalRef(replacementFontPath);
+        if (!usesProvidedPage) FPDF_ClosePage(page);
+        env->DeleteLocalRef(edit);
+    }
+
+    for (const auto& removal : pendingMarkedTextRemovals) {
+        FPDF_PAGE page = FPDF_LoadPage(doc, removal.first);
+        if (!page) {
+            if (page) FPDF_ClosePage(page);
+            allApplied = false;
+            continue;
+        }
+        FPDF_PAGEOBJECT textObject = nullptr;
+        const int objectCount = FPDFPage_CountObjects(page);
+        for (int objectIndex = 0; objectIndex < objectCount && !textObject; ++objectIndex) {
+            FPDF_PAGEOBJECT candidate = FPDFPage_GetObject(page, objectIndex);
+            if (!candidate || FPDFPageObj_GetType(candidate) != FPDF_PAGEOBJ_TEXT) continue;
+            const int markCount = FPDFPageObj_CountMarks(candidate);
+            for (int markIndex = 0; markIndex < markCount; ++markIndex) {
+                if (GetPageObjectMarkName(FPDFPageObj_GetMark(
+                        candidate,
+                        static_cast<unsigned long>(markIndex))) == removal.second) {
+                    textObject = candidate;
+                    break;
+                }
+            }
+        }
+        const bool removed = textObject && FPDFPage_RemoveObject(page, textObject);
+        if (removed) {
+            FPDFPageObj_Destroy(textObject);
+            if (!FPDFPage_GenerateContent(page)) allApplied = false;
+        } else {
+            allApplied = false;
+        }
+        FPDF_ClosePage(page);
+    }
+    env->DeleteLocalRef(editClass);
+    return allApplied;
+}
+
 JNIEXPORT jboolean JNICALL
 Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeSavePdfEditObjects(
         JNIEnv* env,
@@ -14718,7 +15794,8 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeSavePdfEdit
         jstring inputPath_,
         jstring outputPath_,
         jobjectArray editObjectsArray,
-        jobjectArray savedContentUpdatesArray) {
+        jobjectArray savedContentUpdatesArray,
+        jobjectArray textContentUpdatesArray) {
     const char* inputPath = env->GetStringUTFChars(inputPath_, 0);
     const char* outputPath = env->GetStringUTFChars(outputPath_, 0);
     LOGE("PDF_EDIT_NATIVE nativeSavePdfEditObjects start input=%s output=%s array=%p", inputPath, outputPath, editObjectsArray);
@@ -14763,6 +15840,12 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeSavePdfEdit
             FPDF_GetPageCount(doc),
             editObjectCount
     );
+    if (!ApplyNativeTextContentEdits(env, doc, textContentUpdatesArray, nullptr, -1, true)) {
+        FPDF_CloseDocument(doc);
+        env->ReleaseStringUTFChars(inputPath_, inputPath);
+        env->ReleaseStringUTFChars(outputPath_, outputPath);
+        return JNI_FALSE;
+    }
     ApplyNativeAnnotationEditActions(env, doc, savedContentUpdatesArray, nullptr, -1, false);
     LOGE("PDF_EDIT_NATIVE nativeSavePdfEditObjects after ApplyNativeAnnotationEditActions(processNewObjects=false)");
 
@@ -15082,7 +16165,7 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeSaveScanned
                 env, thiz, inputPath_, outputPath_, annotationObjects);
     } else if (annotationCount == 0) {
         success = Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeSavePdfEditObjects(
-                env, thiz, inputPath_, outputPath_, contentObjects, nullptr);
+                env, thiz, inputPath_, outputPath_, contentObjects, nullptr, nullptr);
     } else if (contentCount == 0) {
         success = Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeSaveAnnotations(
                 env, thiz, inputPath_, outputPath_, annotationObjects);
@@ -15093,7 +16176,7 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeSaveScanned
         jstring contentStagePath_ = env->NewStringUTF(contentStagePath.c_str());
 
         success = Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeSavePdfEditObjects(
-                env, thiz, inputPath_, contentStagePath_, contentObjects, nullptr);
+                env, thiz, inputPath_, contentStagePath_, contentObjects, nullptr, nullptr);
         if (success == JNI_TRUE) {
             success = Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeSaveAnnotations(
                     env, thiz, contentStagePath_, outputPath_, annotationObjects);
@@ -17592,6 +18675,32 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeApplyAnnota
     return ApplyNativeAnnotationEditActions(env, docFile->pdfDocument, highlightsArray, page, pageIndex) ? JNI_TRUE : JNI_FALSE;
 }
 
+JNIEXPORT jboolean JNICALL
+Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeApplyTextEdits(
+        JNIEnv* env,
+        jobject thiz,
+        jlong docPtr,
+        jlong pagePtr,
+        jint pageIndex,
+        jobjectArray textEditsArray) {
+    DocumentFile* docFile = reinterpret_cast<DocumentFile*>(docPtr);
+    FPDF_PAGE page = reinterpret_cast<FPDF_PAGE>(pagePtr);
+    if (!docFile || !docFile->pdfDocument || !page || !textEditsArray) return JNI_FALSE;
+    // Preview edits target the already-open page used by rendering. Repeated keystrokes replace
+    // that same native object with the latest complete text, so validation against the original
+    // string is reserved for the final file save path.
+    return ApplyNativeTextContentEdits(
+            env,
+            docFile->pdfDocument,
+            textEditsArray,
+            page,
+            pageIndex,
+            false,
+            true)
+           ? JNI_TRUE
+           : JNI_FALSE;
+}
+
 
 // text editing part (not final or tested - code from old branch)
 #define LOG_TAG "PDF_EDIT_NATIVE"
@@ -18002,85 +19111,211 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeGetTextObje
         JNIEnv* env,
         jobject thiz,
         jlong pagePtr,
-        jint pageIndex) {
-
+        jint pageIndex,
+        jstring fontCacheDir_) {
     FPDF_PAGE page = reinterpret_cast<FPDF_PAGE>(pagePtr);
     if (!page) return nullptr;
-
-    // 🔹 Create text page (REQUIRED in your version)
+    const char* fontCacheDirChars = fontCacheDir_
+                                    ? env->GetStringUTFChars(fontCacheDir_, nullptr)
+                                    : nullptr;
+    const std::string fontCacheDir = fontCacheDirChars ? fontCacheDirChars : "";
     FPDF_TEXTPAGE textPage = FPDFText_LoadPage(page);
-    if (!textPage) return nullptr;
-
-    float pageHeight = FPDF_GetPageHeightF(page);
+    if (!textPage) {
+        if (fontCacheDirChars) env->ReleaseStringUTFChars(fontCacheDir_, fontCacheDirChars);
+        return nullptr;
+    }
     int objectCount = FPDFPage_CountObjects(page);
-
-    // Count text objects
-    int textObjectCount = 0;
-    for (int i = 0; i < objectCount; i++) {
-        FPDF_PAGEOBJECT obj = FPDFPage_GetObject(page, i);
-        if (obj && FPDFPageObj_GetType(obj) == FPDF_PAGEOBJ_TEXT)
-            textObjectCount++;
-    }
-
     jclass stringClass = env->FindClass("java/lang/String");
-    jobjectArray result =
-            env->NewObjectArray(textObjectCount * 6, stringClass, nullptr);
-
-    int resultIndex = 0;
-
-    for (int i = 0; i < objectCount; i++) {
-
-        FPDF_PAGEOBJECT obj = FPDFPage_GetObject(page, i);
-        if (!obj) continue;
-
-        if (FPDFPageObj_GetType(obj) != FPDF_PAGEOBJ_TEXT)
-            continue;
-
-        float left, bottom, right, top;
-        if (!FPDFPageObj_GetBounds(obj, &left, &bottom, &right, &top))
-            continue;
-
-        float androidTop = pageHeight - top;
-        float androidBottom = pageHeight - bottom;
-
-        // 🔹 Get required buffer length
-        unsigned long length =
-                FPDFTextObj_GetText(obj, textPage, nullptr, 0);
-
-        if (length == 0)
-            continue;
-
-        std::vector<FPDF_WCHAR> buffer(length);
-
-        FPDFTextObj_GetText(obj, textPage, buffer.data(), length);
-
-        // Convert UTF16 → jstring
-//        jstring text = env->NewString(
-//                reinterpret_cast<jchar*>(buffer.data()),
-//                length - 1); // remove null
-
-        int actualCharCount = (length > 0) ? length - 1 : 0;
-        jstring text = (actualCharCount > 0)
-                       ? env->NewString(reinterpret_cast<const jchar*>(buffer.data()), actualCharCount)
-                       : env->NewStringUTF("");
-
-        // Store values
-        env->SetObjectArrayElement(result, resultIndex++,
-                                   env->NewStringUTF(std::to_string(left).c_str()));
-        env->SetObjectArrayElement(result, resultIndex++,
-                                   env->NewStringUTF(std::to_string(androidTop).c_str()));
-        env->SetObjectArrayElement(result, resultIndex++,
-                                   env->NewStringUTF(std::to_string(right).c_str()));
-        env->SetObjectArrayElement(result, resultIndex++,
-                                   env->NewStringUTF(std::to_string(androidBottom).c_str()));
-        env->SetObjectArrayElement(result, resultIndex++, text);
-        env->SetObjectArrayElement(result, resultIndex++,
-                                   env->NewStringUTF(std::to_string(i).c_str()));
+    std::vector<jstring> values;
+    auto appendValue = [&](const std::string& value) {
+        values.push_back(env->NewStringUTF(value.c_str()));
+    };
+    std::map<FPDF_PAGEOBJECT, int> objectIndices;
+    std::map<FPDF_PAGEOBJECT, int> textObjectOrdinals;
+    int textObjectOrdinal = 0;
+    for (int i = 0; i < objectCount; ++i) {
+        FPDF_PAGEOBJECT object = FPDFPage_GetObject(page, i);
+        if (object && FPDFPageObj_GetType(object) == FPDF_PAGEOBJ_TEXT) {
+            objectIndices[object] = i;
+            textObjectOrdinals[object] = textObjectOrdinal++;
+        }
     }
+    std::map<FPDF_PAGEOBJECT, int> ownerOffsets;
+    FPDF_PAGEOBJECT segmentOwner = nullptr;
+    int segmentStart = 0;
+    int segmentEnd = 0;
+    double segmentLeft = 0, segmentBottom = 0, segmentRight = 0, segmentTop = 0;
+    double previousRight = 0, previousCenterY = 0, previousHeight = 0;
+    std::vector<jchar> segmentText;
 
-    // 🔹 Destroy text page (VERY IMPORTANT)
+    auto appendSegment = [&]() {
+        if (!segmentOwner || segmentText.empty()) return;
+        const int objectIndex = objectIndices[segmentOwner];
+        unsigned long ownerTextBytes = FPDFTextObj_GetText(segmentOwner, textPage, nullptr, 0);
+        std::vector<FPDF_WCHAR> ownerTextBuffer(ownerTextBytes / sizeof(FPDF_WCHAR));
+        int ownerCharCount = 0;
+        if (ownerTextBytes >= sizeof(FPDF_WCHAR)) {
+            FPDFTextObj_GetText(segmentOwner, textPage, ownerTextBuffer.data(), ownerTextBytes);
+            ownerCharCount = static_cast<int>(ownerTextBuffer.size()) - 1;
+        }
+        std::string fontName;
+        FPDF_FONT font = FPDFTextObj_GetFont(segmentOwner);
+        int fontWeight = 400;
+        int italicAngle = 0;
+        std::string sourceFontPath;
+        if (font) {
+            const size_t nameLength = FPDFFont_GetBaseFontName(font, nullptr, 0);
+            if (nameLength > 0) {
+                std::vector<char> nameBuffer(nameLength);
+                if (FPDFFont_GetBaseFontName(font, nameBuffer.data(), nameLength) > 0) {
+                    fontName.assign(nameBuffer.data());
+                }
+            }
+            const int extractedWeight = FPDFFont_GetWeight(font);
+            if (extractedWeight > 0) fontWeight = extractedWeight;
+            FPDFFont_GetItalicAngle(font, &italicAngle);
+            size_t fontDataSize = 0;
+            if (!fontCacheDir.empty() &&
+                FPDFFont_GetFontData(font, nullptr, 0, &fontDataSize) &&
+                fontDataSize > 0) {
+                std::vector<uint8_t> fontData(fontDataSize);
+                size_t writtenSize = 0;
+                if (FPDFFont_GetFontData(
+                        font,
+                        fontData.data(),
+                        fontData.size(),
+                        &writtenSize) &&
+                    writtenSize == fontDataSize) {
+                    uint64_t fontHash = 1469598103934665603ULL;
+                    for (uint8_t byte : fontData) {
+                        fontHash ^= byte;
+                        fontHash *= 1099511628211ULL;
+                    }
+                    const bool isOpenType = fontData.size() >= 4 &&
+                            fontData[0] == 'O' && fontData[1] == 'T' &&
+                            fontData[2] == 'T' && fontData[3] == 'O';
+                    const bool isType1 = (fontData.size() >= 2 &&
+                            fontData[0] == 0x80 && fontData[1] == 0x01) ||
+                            (fontData.size() >= 2 &&
+                             fontData[0] == '%' && fontData[1] == '!');
+                    const char* fontExtension = isOpenType
+                                                ? ".otf"
+                                                : (isType1 ? ".pfb" : ".ttf");
+                    sourceFontPath = fontCacheDir + "/source_" +
+                            std::to_string(fontHash) + fontExtension;
+                    std::ifstream existingFont(sourceFontPath, std::ios::binary | std::ios::ate);
+                    const bool hasCachedFont = existingFont &&
+                            static_cast<size_t>(existingFont.tellg()) == fontDataSize;
+                    existingFont.close();
+                    if (!hasCachedFont) {
+                        std::ofstream fontOutput(sourceFontPath, std::ios::binary | std::ios::trunc);
+                        if (fontOutput) {
+                            fontOutput.write(
+                                    reinterpret_cast<const char*>(fontData.data()),
+                                    static_cast<std::streamsize>(fontData.size()));
+                        }
+                        if (!fontOutput.good()) sourceFontPath.clear();
+                    }
+                } else {
+                    sourceFontPath.clear();
+                }
+            }
+        }
+        float fontSize = 0.0f;
+        FPDFTextObj_GetFontSize(segmentOwner, &fontSize);
+        unsigned int r = 0, g = 0, b = 0, a = 255;
+        FPDFPageObj_GetFillColor(segmentOwner, &r, &g, &b, &a);
+        FS_MATRIX matrix = {1, 0, 0, 1, 0, 0};
+        FPDFPageObj_GetMatrix(segmentOwner, &matrix);
+
+        appendValue(std::to_string(objectIndex));
+        values.push_back(env->NewString(segmentText.data(), static_cast<jsize>(segmentText.size())));
+        appendValue(std::to_string(segmentLeft));
+        appendValue(std::to_string(segmentBottom));
+        appendValue(std::to_string(segmentRight));
+        appendValue(std::to_string(segmentTop));
+        appendValue(fontName);
+        appendValue(std::to_string(fontSize));
+        appendValue(std::to_string(r));
+        appendValue(std::to_string(g));
+        appendValue(std::to_string(b));
+        appendValue(std::to_string(a));
+        appendValue(std::to_string(matrix.a));
+        appendValue(std::to_string(matrix.b));
+        appendValue(std::to_string(matrix.c));
+        appendValue(std::to_string(matrix.d));
+        appendValue(std::to_string(matrix.e));
+        appendValue(std::to_string(matrix.f));
+        values.push_back(ownerCharCount > 0
+                         ? env->NewString(reinterpret_cast<const jchar*>(ownerTextBuffer.data()), ownerCharCount)
+                         : env->NewStringUTF(""));
+        appendValue(std::to_string(segmentStart));
+        appendValue(std::to_string(segmentEnd));
+        appendValue(std::to_string(textObjectOrdinals[segmentOwner]));
+        appendValue(std::to_string(fontWeight));
+        appendValue(std::to_string(italicAngle));
+        appendValue(sourceFontPath);
+        segmentText.clear();
+    };
+
+    const int charCount = FPDFText_CountChars(textPage);
+    for (int charIndex = 0; charIndex < charCount; ++charIndex) {
+        FPDF_PAGEOBJECT owner = FPDFText_GetTextObject(textPage, charIndex);
+        if (!owner || objectIndices.find(owner) == objectIndices.end()) continue;
+        const unsigned int unicode = FPDFText_GetUnicode(textPage, charIndex);
+        const int utf16Units = unicode > 0xFFFF ? 2 : (unicode == 0 ? 0 : 1);
+        const int ownerOffset = ownerOffsets[owner];
+        ownerOffsets[owner] += utf16Units;
+        double left, right, bottom, top;
+        if (unicode == 0 || unicode == '\r' || unicode == '\n' ||
+            !FPDFText_GetCharBox(textPage, charIndex, &left, &right, &bottom, &top)) {
+            appendSegment();
+            segmentOwner = nullptr;
+            continue;
+        }
+        const double centerY = (top + bottom) * 0.5;
+        const double height = std::fabs(top - bottom);
+        const bool newVisualLine = segmentOwner &&
+                (owner != segmentOwner ||
+                 std::fabs(centerY - previousCenterY) > std::max(height, previousHeight) * 0.55 ||
+                 left < previousRight - std::max(height, previousHeight) * 0.25 ||
+                 left - previousRight > std::max(height, previousHeight) * 2.0);
+        if (newVisualLine) appendSegment();
+        if (segmentText.empty()) {
+            segmentOwner = owner;
+            segmentStart = ownerOffset;
+            segmentEnd = ownerOffset;
+            segmentLeft = left;
+            segmentBottom = bottom;
+            segmentRight = right;
+            segmentTop = top;
+        } else {
+            segmentLeft = std::min(segmentLeft, left);
+            segmentBottom = std::min(segmentBottom, bottom);
+            segmentRight = std::max(segmentRight, right);
+            segmentTop = std::max(segmentTop, top);
+        }
+        if (unicode <= 0xFFFF) {
+            segmentText.push_back(static_cast<jchar>(unicode));
+        } else {
+            const unsigned int codePoint = unicode - 0x10000;
+            segmentText.push_back(static_cast<jchar>(0xD800 + (codePoint >> 10)));
+            segmentText.push_back(static_cast<jchar>(0xDC00 + (codePoint & 0x3FF)));
+        }
+        segmentEnd = ownerOffset + utf16Units;
+        previousRight = right;
+        previousCenterY = centerY;
+        previousHeight = height;
+    }
+    appendSegment();
     FPDFText_ClosePage(textPage);
-
+    jobjectArray result = env->NewObjectArray((jsize)values.size(), stringClass, nullptr);
+    for (jsize i = 0; i < (jsize)values.size(); ++i) {
+        env->SetObjectArrayElement(result, i, values[i]);
+        env->DeleteLocalRef(values[i]);
+    }
+    env->DeleteLocalRef(stringClass);
+    if (fontCacheDirChars) env->ReleaseStringUTFChars(fontCacheDir_, fontCacheDirChars);
     return result;
 }
 
