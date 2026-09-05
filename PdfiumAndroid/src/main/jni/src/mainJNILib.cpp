@@ -14953,6 +14953,38 @@ static std::string GetPageObjectMarkName(FPDF_PAGEOBJECTMARK mark) {
             reinterpret_cast<const char16_t*>(buffer.data())));
 }
 
+static bool PageObjectHasExactMark(
+        FPDF_PAGEOBJECT object,
+        const std::string& expectedMarkName) {
+    if (!object || expectedMarkName.empty()) return false;
+    const int markCount = FPDFPageObj_CountMarks(object);
+    for (int markIndex = 0; markIndex < markCount; ++markIndex) {
+        if (GetPageObjectMarkName(
+                FPDFPageObj_GetMark(object, static_cast<unsigned long>(markIndex))) ==
+            expectedMarkName) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool PageObjectHasMarkPrefix(
+        FPDF_PAGEOBJECT object,
+        const char* expectedPrefix) {
+    if (!object || !expectedPrefix || !*expectedPrefix) return false;
+    const size_t prefixLength = strlen(expectedPrefix);
+    const int markCount = FPDFPageObj_CountMarks(object);
+    for (int markIndex = 0; markIndex < markCount; ++markIndex) {
+        const std::string markName = GetPageObjectMarkName(
+                FPDFPageObj_GetMark(object, static_cast<unsigned long>(markIndex)));
+        if (markName.size() >= prefixLength &&
+            markName.compare(0, prefixLength, expectedPrefix) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static FPDF_PAGEOBJECT FindTextEditPreviewObject(
         FPDF_PAGE page,
         const std::string& markPrefix,
@@ -15433,11 +15465,14 @@ static FPDF_FONT LoadTextEditFallbackFont(
     const size_t bytesRead = fread(fontBytes.data(), 1, fontBytes.size(), fontFile);
     fclose(fontFile);
     if (bytesRead != fontBytes.size()) return nullptr;
+    const bool isType1 = (fontBytes.size() >= 2 &&
+                          ((fontBytes[0] == 0x80 && fontBytes[1] == 0x01) ||
+                           (fontBytes[0] == '%' && fontBytes[1] == '!')));
     FPDF_FONT font = FPDFText_LoadFont(
             doc,
             fontBytes.data(),
             static_cast<uint32_t>(fontBytes.size()),
-            FPDF_FONT_TRUETYPE,
+            isType1 ? FPDF_FONT_TYPE1 : FPDF_FONT_TRUETYPE,
             true);
     if (font && useCache) {
         Mutex::Autolock lock(sTextEditFontCacheLock);
@@ -15454,11 +15489,17 @@ static FPDF_PAGEOBJECT CreateTextEditRunObject(
         float advance,
         bool requestedBold,
         bool requestedItalic,
-        float* outWidth) {
+        float* outWidth,
+        float fontSizeScale = 1.0f,
+        bool exactSourceFont = false) {
     if (!doc || !sourceObject || !font || text.empty()) return nullptr;
     float sourceFontSize = 12.0f;
     FPDFTextObj_GetFontSize(sourceObject, &sourceFontSize);
-    FPDF_PAGEOBJECT runObject = FPDFPageObj_CreateTextObj(doc, font, sourceFontSize);
+    const float runFontSize = sourceFontSize *
+            (std::isfinite(fontSizeScale)
+             ? std::max(0.25f, std::min(4.0f, fontSizeScale))
+             : 1.0f);
+    FPDF_PAGEOBJECT runObject = FPDFPageObj_CreateTextObj(doc, font, runFontSize);
     if (!runObject) return nullptr;
     std::vector<unsigned short> utf16(text.begin(), text.end());
     utf16.push_back(0);
@@ -15466,7 +15507,7 @@ static FPDF_PAGEOBJECT CreateTextEditRunObject(
         FPDFPageObj_Destroy(runObject);
         return nullptr;
     }
-    float width = MeasureTextEditRunAdvance(doc, font, sourceFontSize, text);
+    float width = MeasureTextEditRunAdvance(doc, font, runFontSize, text);
     if (width <= 0.0f) {
         float left = 0.0f, bottom = 0.0f, right = 0.0f, top = 0.0f;
         width = FPDFPageObj_GetBounds(runObject, &left, &bottom, &right, &top)
@@ -15474,16 +15515,17 @@ static FPDF_PAGEOBJECT CreateTextEditRunObject(
                 : 0.0f;
     }
     CopyTextEditObjectAppearance(sourceObject, runObject);
-    const bool usesFallbackFont = font != FPDFTextObj_GetFont(sourceObject);
     FPDF_FONT sourceFont = FPDFTextObj_GetFont(sourceObject);
-    const int sourceFontWeight = FPDFFont_GetWeight(sourceFont);
+    const bool usesFallbackFont = !exactSourceFont && font != sourceFont;
+    FPDF_FONT appearanceFont = exactSourceFont ? font : sourceFont;
+    const int sourceFontWeight = FPDFFont_GetWeight(appearanceFont);
     int sourceItalicAngle = 0;
-    FPDFFont_GetItalicAngle(sourceFont, &sourceItalicAngle);
+    FPDFFont_GetItalicAngle(appearanceFont, &sourceItalicAngle);
     std::string sourceFontName;
-    const size_t sourceFontNameLength = FPDFFont_GetBaseFontName(sourceFont, nullptr, 0);
+    const size_t sourceFontNameLength = FPDFFont_GetBaseFontName(appearanceFont, nullptr, 0);
     if (sourceFontNameLength > 0) {
         std::vector<char> nameBuffer(sourceFontNameLength);
-        if (FPDFFont_GetBaseFontName(sourceFont, nameBuffer.data(), sourceFontNameLength) > 0) {
+        if (FPDFFont_GetBaseFontName(appearanceFont, nameBuffer.data(), sourceFontNameLength) > 0) {
             sourceFontName.assign(nameBuffer.data());
             std::transform(
                     sourceFontName.begin(),
@@ -15496,18 +15538,19 @@ static FPDF_PAGEOBJECT CreateTextEditRunObject(
             sourceFontName.find("bold") != std::string::npos ||
             sourceFontName.find("black") != std::string::npos ||
             sourceFontName.find("semibold") != std::string::npos ||
-            sourceFontName.find("demibold") != std::string::npos;
+            sourceFontName.find("demibold") != std::string::npos ||
+            sourceFontName.find("medi") != std::string::npos;
     const bool sourceIsItalic = sourceItalicAngle != 0 ||
             sourceFontName.find("italic") != std::string::npos ||
-            sourceFontName.find("oblique") != std::string::npos;
+            sourceFontName.find("oblique") != std::string::npos ||
+            sourceFontName.find("ital") != std::string::npos ||
+            sourceFontName.find("slant") != std::string::npos;
     if (requestedBold && (!sourceIsBold || usesFallbackFont)) {
         unsigned int r = 0, g = 0, b = 0, a = 255;
         FPDFPageObj_GetFillColor(sourceObject, &r, &g, &b, &a);
         FPDFPageObj_SetStrokeColor(runObject, r, g, b, a);
         FPDFTextObj_SetTextRenderMode(runObject, FPDF_TEXTRENDERMODE_FILL_STROKE);
-        FPDFPageObj_SetStrokeWidth(runObject, fmax(sourceFontSize * 0.025f, 0.2f));
-    } else if (!requestedBold && !sourceIsBold) {
-        FPDFTextObj_SetTextRenderMode(runObject, FPDF_TEXTRENDERMODE_FILL);
+        FPDFPageObj_SetStrokeWidth(runObject, fmax(runFontSize * 0.025f, 0.2f));
     }
     FS_MATRIX matrix = {1, 0, 0, 1, 0, 0};
     if (FPDFPageObj_GetMatrix(sourceObject, &matrix)) {
@@ -15772,7 +15815,11 @@ static void CollectEditableTextObjectsFromObject(
     if (!object || !textObjects) return;
     const int objectType = FPDFPageObj_GetType(object);
     if (objectType == FPDF_PAGEOBJ_TEXT) {
-        textObjects->push_back(object);
+        if (!PageObjectHasExactMark(object, "LufickStyleOverlay") &&
+            !PageObjectHasMarkPrefix(object, "LufickTextEditPreview_") &&
+            !PageObjectHasMarkPrefix(object, "LufickTextEditFinal_")) {
+            textObjects->push_back(object);
+        }
         return;
     }
     if (objectType != FPDF_PAGEOBJ_FORM) return;
@@ -15796,6 +15843,92 @@ static std::vector<FPDF_PAGEOBJECT> CollectEditableTextObjects(FPDF_PAGE page) {
     return textObjects;
 }
 
+static std::string TextEditFontName(FPDF_FONT font) {
+    if (!font) return "";
+    const size_t length = FPDFFont_GetBaseFontName(font, nullptr, 0);
+    if (length == 0) return "";
+    std::vector<char> buffer(length);
+    if (FPDFFont_GetBaseFontName(font, buffer.data(), length) == 0) return "";
+    std::string name(buffer.data());
+    std::transform(name.begin(), name.end(), name.begin(), [](unsigned char value) {
+        return static_cast<char>(std::tolower(value));
+    });
+    return name;
+}
+
+static std::string TextEditFontFamily(FPDF_FONT font) {
+    std::string name = TextEditFontName(font);
+    const size_t subset = name.find('+');
+    if (subset != std::string::npos) name = name.substr(subset + 1);
+    name.erase(std::remove_if(name.begin(), name.end(), [](unsigned char value) {
+        return !std::isalnum(value);
+    }), name.end());
+    static const char* suffixes[] = {
+            "semibolditalic", "demibolditalic", "mediumitalic", "bolditalic",
+            "semiboldoblique", "demiboldoblique", "boldoblique", "mediumoblique",
+            "reguital", "mediital", "regularitalic", "regularoblique",
+            "semibold", "demibold", "medium", "bold", "black",
+            "regular", "roman", "regu", "medi", "italic", "oblique", "ital", "slant"
+    };
+    bool removed = true;
+    while (removed) {
+        removed = false;
+        for (const char* suffix : suffixes) {
+            const size_t suffixLength = strlen(suffix);
+            if (name.size() > suffixLength &&
+                name.compare(name.size() - suffixLength, suffixLength, suffix) == 0) {
+                name.erase(name.size() - suffixLength);
+                removed = true;
+                break;
+            }
+        }
+    }
+    return name;
+}
+
+static bool TextEditFontIsBold(FPDF_FONT font) {
+    const std::string name = TextEditFontName(font);
+    return FPDFFont_GetWeight(font) >= 600 ||
+           name.find("bold") != std::string::npos ||
+           name.find("black") != std::string::npos ||
+           name.find("semibold") != std::string::npos ||
+           name.find("demibold") != std::string::npos ||
+           name.find("medi") != std::string::npos;
+}
+
+static bool TextEditFontIsItalic(FPDF_FONT font) {
+    int angle = 0;
+    FPDFFont_GetItalicAngle(font, &angle);
+    const std::string name = TextEditFontName(font);
+    return angle != 0 || name.find("italic") != std::string::npos ||
+           name.find("oblique") != std::string::npos ||
+           name.find("ital") != std::string::npos ||
+           name.find("slant") != std::string::npos;
+}
+
+static FPDF_FONT FindTextEditEmbeddedStyleFont(
+        FPDF_PAGE page,
+        FPDF_FONT sourceFont,
+        bool bold,
+        bool italic) {
+    if (!page || !sourceFont) return sourceFont;
+    if (TextEditFontIsBold(sourceFont) == bold && TextEditFontIsItalic(sourceFont) == italic) {
+        return sourceFont;
+    }
+    const std::string family = TextEditFontFamily(sourceFont);
+    if (family.empty()) return sourceFont;
+    for (FPDF_PAGEOBJECT object : CollectEditableTextObjects(page)) {
+        if (!object || FPDFPageObj_GetType(object) != FPDF_PAGEOBJ_TEXT) continue;
+        FPDF_FONT candidate = FPDFTextObj_GetFont(object);
+        if (candidate && TextEditFontFamily(candidate) == family &&
+            TextEditFontIsBold(candidate) == bold &&
+            TextEditFontIsItalic(candidate) == italic) {
+            return candidate;
+        }
+    }
+    return sourceFont;
+}
+
 struct TextEditCharacterStyle {
     bool bold = false;
     bool italic = false;
@@ -15803,21 +15936,24 @@ struct TextEditCharacterStyle {
     bool strikeout = false;
     bool hasColor = false;
     uint32_t color = 0xFF000000u;
+    float sizeScale = 1.0f;
 
     TextEditCharacterStyle() = default;
     TextEditCharacterStyle(bool boldValue, bool italicValue, bool underlineValue, bool strikeoutValue,
-                           bool hasColorValue = false, uint32_t colorValue = 0xFF000000u)
+                           bool hasColorValue = false, uint32_t colorValue = 0xFF000000u,
+                           float sizeScaleValue = 1.0f)
             : bold(boldValue),
               italic(italicValue),
               underline(underlineValue),
               strikeout(strikeoutValue),
               hasColor(hasColorValue),
-              color(colorValue) {}
+              color(colorValue), sizeScale(sizeScaleValue) {}
 
     bool operator==(const TextEditCharacterStyle& other) const {
         return bold == other.bold && italic == other.italic &&
                underline == other.underline && strikeout == other.strikeout &&
-               hasColor == other.hasColor && (!hasColor || color == other.color);
+               hasColor == other.hasColor && (!hasColor || color == other.color) &&
+               sizeScale == other.sizeScale;
     }
 };
 
@@ -15840,16 +15976,18 @@ static std::vector<TextEditCharacterStyle> ParseTextEditCharacterStyles(
     while (std::getline(stream, encodedRun, ';')) {
         int start = 0, end = 0, bold = 0, italic = 0, underline = 0, strikeout = 0;
         long long color = static_cast<long long>(INT_MIN);
+        float sizeScale = 1.0f;
         const int parsed = sscanf(
                 encodedRun.c_str(),
-                "%d,%d,%d,%d,%d,%d,%lld",
+                "%d,%d,%d,%d,%d,%d,%lld,%f",
                 &start,
                 &end,
                 &bold,
                 &italic,
                 &underline,
                 &strikeout,
-                &color);
+                &color,
+                &sizeScale);
         if (parsed < 6) continue;
         const int safeStart = std::max(0, std::min(start, static_cast<int>(textLength)));
         const int safeEnd = std::max(safeStart, std::min(end, static_cast<int>(textLength)));
@@ -15859,7 +15997,8 @@ static std::vector<TextEditCharacterStyle> ParseTextEditCharacterStyles(
                 underline != 0,
                 strikeout != 0,
                 parsed >= 7 && color != static_cast<long long>(INT_MIN),
-                static_cast<uint32_t>(color)
+                static_cast<uint32_t>(color),
+                std::isfinite(sizeScale) ? std::max(0.25f, std::min(4.0f, sizeScale)) : 1.0f
         };
         for (int index = safeStart; index < safeEnd; ++index) styles[index] = style;
     }
@@ -15879,9 +16018,13 @@ static bool CreateStyledTextEditObjects(
         int replacementFontRangeStart,
         int replacementFontRangeEnd,
         const char* encodedVisualLineEnds,
+        const char* encodedVisualLineOffsets,
+        const char* encodedVisualLineYOffsets,
         float visualLineHeight,
         bool cacheFallbackFont,
+        bool preserveOriginalGlyphAdvances,
         const char* encodedStyles,
+        const char* encodedFontRuns,
         const char* encodedAdvances,
         const std::string& markPrefix,
         std::vector<StyledTextEditObject>* outObjects) {
@@ -15915,29 +16058,65 @@ static bool CreateStyledTextEditObjects(
     }
     FPDF_FONT fallbackFont = nullptr;
     if (useCompatibleFont) {
-        if (!fallbackFontPath || strlen(fallbackFontPath) == 0) {
+        if ((!fallbackFontPath || strlen(fallbackFontPath) == 0) &&
+            (!encodedFontRuns || strlen(encodedFontRuns) == 0)) {
             if (originalChars) env->ReleaseStringChars(originalText, originalChars);
             env->ReleaseStringChars(replacementText, replacementChars);
             return false;
         }
-        fallbackFont = LoadTextEditFallbackFont(doc, fallbackFontPath, cacheFallbackFont);
-        if (!fallbackFont) {
+        if (fallbackFontPath && strlen(fallbackFontPath) > 0) {
+            fallbackFont = LoadTextEditFallbackFont(doc, fallbackFontPath, cacheFallbackFont);
+        }
+        if (!fallbackFont && (!encodedFontRuns || strlen(encodedFontRuns) == 0)) {
             if (originalChars) env->ReleaseStringChars(originalText, originalChars);
             env->ReleaseStringChars(replacementText, replacementChars);
             return false;
         }
     }
 
-    const int sourceWeight = FPDFFont_GetWeight(originalFont);
+    struct TextEditFontRun {
+        size_t start;
+        size_t end;
+        FPDF_FONT font;
+    };
+    std::vector<TextEditFontRun> fontRuns;
+    if (encodedFontRuns && *encodedFontRuns) {
+        std::stringstream stream(encodedFontRuns);
+        std::string encodedRun;
+        while (std::getline(stream, encodedRun, ';')) {
+            const size_t firstComma = encodedRun.find(',');
+            const size_t secondComma = firstComma == std::string::npos
+                    ? std::string::npos : encodedRun.find(',', firstComma + 1);
+            if (firstComma == std::string::npos || secondComma == std::string::npos) continue;
+            const std::string startToken = encodedRun.substr(0, firstComma);
+            const std::string endToken = encodedRun.substr(
+                    firstComma + 1,
+                    secondComma - firstComma - 1);
+            char* startEnd = nullptr;
+            char* endEnd = nullptr;
+            const long start = strtol(startToken.c_str(), &startEnd, 10);
+            const long end = strtol(endToken.c_str(), &endEnd, 10);
+            const std::string path = encodedRun.substr(secondComma + 1);
+            if (!startEnd || *startEnd != '\0' || !endEnd || *endEnd != '\0' ||
+                start < 0 || end <= start ||
+                end > replacementLength || path.empty()) continue;
+            FPDF_FONT runFont = LoadTextEditFallbackFont(doc, path.c_str(), cacheFallbackFont);
+            if (!runFont) {
+                if (originalChars) env->ReleaseStringChars(originalText, originalChars);
+                env->ReleaseStringChars(replacementText, replacementChars);
+                return false;
+            }
+            fontRuns.push_back({static_cast<size_t>(start), static_cast<size_t>(end), runFont});
+        }
+    }
+
     float sourceFontSize = 12.0f;
     FPDFTextObj_GetFontSize(sourceObject, &sourceFontSize);
-    int sourceItalicAngle = 0;
-    FPDFFont_GetItalicAngle(originalFont, &sourceItalicAngle);
     unsigned int sourceR = 0, sourceG = 0, sourceB = 0, sourceA = 255;
     FPDFPageObj_GetFillColor(sourceObject, &sourceR, &sourceG, &sourceB, &sourceA);
     const TextEditCharacterStyle sourceStyle = {
-            sourceWeight >= 600,
-            sourceItalicAngle != 0,
+            TextEditFontIsBold(originalFont),
+            TextEditFontIsItalic(originalFont),
             false,
             false,
             true,
@@ -15948,6 +16127,9 @@ static bool CreateStyledTextEditObjects(
             encodedStyles,
             static_cast<size_t>(replacementLength),
             sourceStyle);
+    auto isSourceFamilyFont = [&](FPDF_FONT font) -> bool {
+        return font && font == originalFont;
+    };
     std::vector<float> positions;
     if (encodedAdvances && *encodedAdvances) {
         std::stringstream positionStream(encodedAdvances);
@@ -15973,13 +16155,30 @@ static bool CreateStyledTextEditObjects(
     const bool hasReplacementFontRange = replacementFontRangeStart >= 0 &&
             replacementFontRangeEnd > replacementFontRangeStart;
     auto usesReplacementFontAt = [&](size_t index, bool isChangedText) -> bool {
+        for (const TextEditFontRun& run : fontRuns) {
+            if (index >= run.start && index < run.end) return true;
+        }
         if (!useCompatibleFont) return false;
+        if (!replaceUnchangedFont && !fontRuns.empty()) return false;
         if (!replaceUnchangedFont) return isChangedText;
         if (!hasReplacementFontRange) return true;
         return index >= static_cast<size_t>(replacementFontRangeStart) &&
                index < static_cast<size_t>(replacementFontRangeEnd);
     };
+    auto fontAt = [&](size_t index, bool isChangedText) -> FPDF_FONT {
+        for (const TextEditFontRun& run : fontRuns) {
+            if (index >= run.start && index < run.end) return run.font;
+        }
+        if (usesReplacementFontAt(index, isChangedText)) return fallbackFont;
+        const TextEditCharacterStyle& style = styles[index];
+        return preserveOriginalGlyphAdvances
+                ? originalFont
+                : FindTextEditEmbeddedStyleFont(page, originalFont, style.bold, style.italic);
+    };
     int runOrdinal = 0;
+    auto isTextEditWhitespace = [](jchar value) {
+        return value == u' ' || value == u'\t' || value == u'\r' || value == u'\n';
+    };
     auto appendRun = [&](size_t runStart, size_t runEnd, FPDF_FONT font, float advance,
                          float lineOffset) -> float {
         if (runStart >= runEnd) return 0.0f;
@@ -15996,7 +16195,9 @@ static bool CreateStyledTextEditObjects(
                 advance,
                 runStyle.bold,
                 runStyle.italic,
-                &runWidth);
+                &runWidth,
+                runStyle.sizeScale,
+                isSourceFamilyFont(font));
         if (!runObject) {
             for (const StyledTextEditObject& created : *outObjects) {
                 if (FPDFPage_RemoveObject(page, created.object)) FPDFPageObj_Destroy(created.object);
@@ -16005,14 +16206,14 @@ static bool CreateStyledTextEditObjects(
             return -1.0f;
         }
         if (runStyle.hasColor) {
-            FPDFPageObj_SetFillColor(
-                    runObject,
-                    (runStyle.color >> 16u) & 0xFFu,
-                    (runStyle.color >> 8u) & 0xFFu,
-                    runStyle.color & 0xFFu,
-                    (runStyle.color >> 24u) & 0xFFu);
+            const unsigned int runR = (runStyle.color >> 16u) & 0xFFu;
+            const unsigned int runG = (runStyle.color >> 8u) & 0xFFu;
+            const unsigned int runB = runStyle.color & 0xFFu;
+            const unsigned int runA = (runStyle.color >> 24u) & 0xFFu;
+            FPDFPageObj_SetFillColor(runObject, runR, runG, runB, runA);
+            FPDFPageObj_SetStrokeColor(runObject, runR, runG, runB, runA);
         }
-        if (lineOffset > 0.0f) {
+        if (std::isfinite(lineOffset) && lineOffset != 0.0f) {
             FS_MATRIX runMatrix = {1, 0, 0, 1, 0, 0};
             if (FPDFPageObj_GetMatrix(runObject, &runMatrix)) {
                 runMatrix.e -= runMatrix.c * lineOffset;
@@ -16032,19 +16233,50 @@ static bool CreateStyledTextEditObjects(
         size_t replacementIndex = replacementStart;
         size_t originalIndex = originalStart;
         while (replacementIndex < replacementEnd) {
+            if (!preserveOriginalGlyphAdvances) {
+                if (isTextEditWhitespace(replacementChars[replacementIndex])) {
+                    ++replacementIndex;
+                    ++originalIndex;
+                    continue;
+                }
+                const size_t chunkStart = replacementIndex;
+                const size_t originalChunkStart = originalIndex;
+                const TextEditCharacterStyle chunkStyle = styles[chunkStart];
+                const FPDF_FONT chunkFont = fontAt(chunkStart, false);
+                while (replacementIndex < replacementEnd &&
+                       !isTextEditWhitespace(replacementChars[replacementIndex]) &&
+                       styles[replacementIndex] == chunkStyle &&
+                       fontAt(replacementIndex, false) == chunkFont) {
+                    ++replacementIndex;
+                    ++originalIndex;
+                }
+                if (appendRun(
+                        chunkStart,
+                        replacementIndex,
+                        chunkFont,
+                        positions[originalChunkStart] - baseAdvance + offset,
+                        0.0f) < 0.0f) {
+                    return false;
+                }
+                continue;
+            }
             const jchar value = replacementChars[replacementIndex];
             size_t glyphLength = 1;
-            if (value >= 0xD800 && value <= 0xDBFF && replacementIndex + 1 < replacementEnd &&
+            if (value >= 0xD800 && value <= 0xDBFF &&
+                replacementIndex + 1 < replacementEnd &&
                 replacementChars[replacementIndex + 1] >= 0xDC00 &&
-                replacementChars[replacementIndex + 1] <= 0xDFFF) glyphLength = 2;
-            if (value != u' ' && value != u'\t' && value != u'\r' && value != u'\n') {
+                replacementChars[replacementIndex + 1] <= 0xDFFF) {
+                glyphLength = 2;
+            }
+            if (!isTextEditWhitespace(value)) {
                 if (appendRun(
                         replacementIndex,
                         replacementIndex + glyphLength,
-                        usesReplacementFontAt(replacementIndex, false)
-                                ? fallbackFont : originalFont,
+                        fontAt(replacementIndex, false),
                         positions[originalIndex] - baseAdvance + offset,
-                        0.0f) < 0.0f) return false;
+                        0.0f) < 0.0f) {
+                    return false;
+                }
             }
             replacementIndex += glyphLength;
             originalIndex += glyphLength;
@@ -16075,51 +16307,114 @@ static bool CreateStyledTextEditObjects(
     bool success = true;
     const bool textChanged = originalLength != replacementLength ||
             !std::equal(originalChars, originalChars + originalLength, replacementChars);
-    if (visualLineEnds.size() > 1) {
+    if (visualLineEnds.size() > 1 || (encodedVisualLineYOffsets && *encodedVisualLineYOffsets)) {
+        std::vector<float> lineOffsets;
+        std::vector<float> lineYOffsets;
+        if (encodedVisualLineYOffsets && *encodedVisualLineYOffsets) {
+            std::stringstream stream(encodedVisualLineYOffsets);
+            std::string value;
+            while (std::getline(stream, value, ',')) {
+                char* end = nullptr;
+                const float offset = strtof(value.c_str(), &end);
+                if (!end || end == value.c_str() || *end != '\0' || !std::isfinite(offset)) {
+                    success = false;
+                    break;
+                }
+                lineYOffsets.push_back(offset);
+            }
+            if (lineYOffsets.size() != visualLineEnds.size()) success = false;
+            if (!success) LOGE("PDF_EDIT_NATIVE invalid paragraph baseline offsets");
+        }
+        if (encodedVisualLineOffsets && *encodedVisualLineOffsets) {
+            std::stringstream offsetStream(encodedVisualLineOffsets);
+            std::string value;
+            while (std::getline(offsetStream, value, ',')) {
+                char* end = nullptr;
+                const float offset = strtof(value.c_str(), &end);
+                if (!end || end == value.c_str() || *end != '\0' || !std::isfinite(offset)) {
+                    success = false;
+                    break;
+                }
+                lineOffsets.push_back(offset);
+            }
+            if (lineOffsets.size() != visualLineEnds.size()) success = false;
+            if (!success) LOGE("PDF_EDIT_NATIVE invalid block reflow offsets");
+        }
         size_t lineStart = 0;
-        const float resolvedLineHeight = visualLineHeight > 0.0f
+        const float resolvedLineHeight = std::isfinite(visualLineHeight) && visualLineHeight != 0.0f
                 ? visualLineHeight : sourceFontSize * 1.2f;
         for (size_t lineIndex = 0; success && lineIndex < visualLineEnds.size(); ++lineIndex) {
             const size_t lineEnd = visualLineEnds[lineIndex];
-            float lineAdvance = 0.0f;
+            float lineAdvance = lineOffsets.empty() ? 0.0f : lineOffsets[lineIndex];
             size_t runStart = lineStart;
             while (success && runStart < lineEnd) {
                 const TextEditCharacterStyle runStyle = styles[runStart];
                 const bool isChangedText = runStart >= prefixLength && runStart < changedEnd;
-                const bool runUsesReplacementFont = usesReplacementFontAt(runStart, isChangedText);
+                const FPDF_FONT runFont = fontAt(runStart, isChangedText);
+                const bool runUsesReplacementFont = !isSourceFamilyFont(runFont);
                 size_t runEnd = runStart + 1;
                 if (!runUsesReplacementFont && replacementChars[runStart] >= 0xD800 &&
                     replacementChars[runStart] <= 0xDBFF && runEnd < lineEnd &&
                     replacementChars[runEnd] >= 0xDC00 && replacementChars[runEnd] <= 0xDFFF) {
                     ++runEnd;
                 }
-                while (runUsesReplacementFont && runEnd < lineEnd && styles[runEnd] == runStyle) {
+                while (runEnd < lineEnd && styles[runEnd] == runStyle) {
                     const bool nextChanged = runEnd >= prefixLength && runEnd < changedEnd;
-                    if (usesReplacementFontAt(runEnd, nextChanged) != runUsesReplacementFont) break;
+                    if (nextChanged != isChangedText ||
+                        fontAt(runEnd, nextChanged) != runFont) break;
                     ++runEnd;
                 }
-                const float width = appendRun(
-                        runStart,
-                        runEnd,
-                        runUsesReplacementFont ? fallbackFont : originalFont,
-                        lineAdvance,
-                        static_cast<float>(lineIndex) * resolvedLineHeight);
-                if (width < 0.0f) success = false;
-                else {
-                    float positionedWidth = width;
-                    if (!runUsesReplacementFont && !isChangedText) {
-                        const size_t originalRunStart = runStart < prefixLength
-                                ? runStart
-                                : originalSuffixStart + (runStart - changedEnd);
-                        const size_t originalRunEnd = originalRunStart + (runEnd - runStart);
-                        if (originalRunEnd < positions.size()) {
-                            positionedWidth = positions[originalRunEnd] -
-                                    positions[originalRunStart];
+                const float lineYOffset = lineYOffsets.empty()
+                        ? static_cast<float>(lineIndex) * resolvedLineHeight
+                        : lineYOffsets[lineIndex];
+                if (!runUsesReplacementFont && !isChangedText) {
+                    const size_t originalRunStart = runStart < prefixLength
+                            ? runStart
+                            : originalSuffixStart + (runStart - changedEnd);
+                    const size_t originalRunEnd = originalRunStart + (runEnd - runStart);
+                    if (originalRunEnd >= positions.size()) {
+                        success = false;
+                    } else {
+                        size_t chunkStart = runStart;
+                        while (success && chunkStart < runEnd) {
+                            if (isTextEditWhitespace(replacementChars[chunkStart])) {
+                                ++chunkStart;
+                                continue;
+                            }
+                            size_t chunkEnd = chunkStart + 1;
+                            while (chunkEnd < runEnd &&
+                                   !isTextEditWhitespace(replacementChars[chunkEnd])) {
+                                ++chunkEnd;
+                            }
+                            const size_t originalChunkStart = originalRunStart +
+                                    (chunkStart - runStart);
+                            const float chunkAdvance = lineAdvance +
+                                    (positions[originalChunkStart] -
+                                     positions[originalRunStart]) * runStyle.sizeScale;
+                            if (appendRun(
+                                    chunkStart,
+                                    chunkEnd,
+                                    runFont,
+                                    chunkAdvance,
+                                    lineYOffset) < 0.0f) {
+                                success = false;
+                            }
+                            chunkStart = chunkEnd;
                         }
+                        lineAdvance += (positions[originalRunEnd] -
+                                positions[originalRunStart]) * runStyle.sizeScale;
                     }
-                    lineAdvance += positionedWidth;
-                    runStart = runEnd;
+                } else {
+                    const float width = appendRun(
+                            runStart,
+                            runEnd,
+                            runFont,
+                            lineAdvance,
+                            lineYOffset);
+                    if (width < 0.0f) success = false;
+                    else lineAdvance += width;
                 }
+                runStart = runEnd;
             }
             lineStart = lineEnd;
         }
@@ -16173,14 +16468,14 @@ static bool CreateStyledTextEditObjects(
         size_t runStart = prefixLength;
         while (success && runStart < changedEnd) {
             const TextEditCharacterStyle runStyle = styles[runStart];
-            const bool runUsesReplacementFont = usesReplacementFontAt(runStart, true);
+            const FPDF_FONT runFont = fontAt(runStart, true);
             size_t runEnd = runStart + 1;
             while (runEnd < changedEnd && styles[runEnd] == runStyle &&
-                   usesReplacementFontAt(runEnd, true) == runUsesReplacementFont) ++runEnd;
+                   fontAt(runEnd, true) == runFont) ++runEnd;
             const float width = appendRun(
                     runStart,
                     runEnd,
-                    runUsesReplacementFont ? fallbackFont : originalFont,
+                    runFont,
                     changedAdvance,
                     0.0f);
             if (width < 0.0f) {
@@ -16257,6 +16552,7 @@ static bool ApplyNativeTextContentEdits(
     jfieldID strikeoutField = env->GetFieldID(editClass, "isStrikeout", "Z");
     jfieldID styleChangedField = env->GetFieldID(editClass, "styleChanged", "Z");
     jfieldID styleRunsField = env->GetFieldID(editClass, "styleRuns", "Ljava/lang/String;");
+    jfieldID fontRunsField = env->GetFieldID(editClass, "fontRuns", "Ljava/lang/String;");
     jfieldID resetAppearanceField = env->GetFieldID(
             editClass,
             "resetNativeAppearance",
@@ -16277,6 +16573,8 @@ static bool ApplyNativeTextContentEdits(
             "visualLineEnds",
             "Ljava/lang/String;");
     jfieldID visualLineHeightField = env->GetFieldID(editClass, "visualLineHeight", "F");
+    jfieldID visualLineOffsetsField = env->GetFieldID(editClass, "visualLineOffsets", "Ljava/lang/String;");
+    jfieldID visualLineYOffsetsField = env->GetFieldID(editClass, "visualLineYOffsets", "Ljava/lang/String;");
     jfieldID originalCursorAdvancesField = env->GetFieldID(
             editClass,
             "originalCursorAdvances",
@@ -16298,7 +16596,7 @@ static bool ApplyNativeTextContentEdits(
         const std::string liveStyleMarkPrefix = "LufickTextEditPreviewStyle_" +
                 std::to_string(pageIndex) + "_" + std::to_string(objectIndex) + "_";
         if (page && usesProvidedPage) {
-            RemoveTextEditPreviewObjects(page, "LufickTextEditPreviewStyle_");
+            RemoveTextEditPreviewObjects(page, liveStyleMarkPrefix);
         }
         const std::vector<FPDF_PAGEOBJECT> editableTextObjects =
                 CollectEditableTextObjects(page);
@@ -16311,6 +16609,10 @@ static bool ApplyNativeTextContentEdits(
         }
 
         FPDF_PAGEOBJECT textObject = editableTextObjects[objectIndex];
+        const std::string liveSourceMark = "LufickTextEditPreviewSource_" +
+                std::to_string(pageIndex) + "_" + std::to_string(objectIndex);
+        const bool isRetainedLiveSource = usesProvidedPage &&
+                PageObjectHasExactMark(textObject, liveSourceMark);
         float actualLeft = 0.0f, actualBottom = 0.0f, actualRight = 0.0f, actualTop = 0.0f;
         const bool isTextObject = textObject && FPDFPageObj_GetType(textObject) == FPDF_PAGEOBJ_TEXT;
         const bool hasBounds = isTextObject &&
@@ -16330,15 +16632,25 @@ static bool ApplyNativeTextContentEdits(
         jstring replacementText = (jstring)env->GetObjectField(edit, newTextField);
         jstring replacementFontPath = (jstring)env->GetObjectField(edit, fontPathField);
         jstring encodedStyleRuns = (jstring)env->GetObjectField(edit, styleRunsField);
+        jstring encodedFontRuns = (jstring)env->GetObjectField(edit, fontRunsField);
         jstring encodedAdvances = (jstring)env->GetObjectField(
                 edit,
                 originalCursorAdvancesField);
         jstring encodedVisualLineEnds = (jstring)env->GetObjectField(edit, visualLineEndsField);
+        jstring encodedVisualLineOffsets = (jstring)env->GetObjectField(edit, visualLineOffsetsField);
+        jstring encodedVisualLineYOffsets = (jstring)env->GetObjectField(edit, visualLineYOffsetsField);
+        const char* encodedVisualLineYOffsetChars = encodedVisualLineYOffsets
+                ? env->GetStringUTFChars(encodedVisualLineYOffsets, nullptr) : nullptr;
+        const char* encodedVisualLineOffsetChars = encodedVisualLineOffsets
+                ? env->GetStringUTFChars(encodedVisualLineOffsets, nullptr) : nullptr;
         const char* replacementFontPathChars = replacementFontPath
                                                ? env->GetStringUTFChars(replacementFontPath, nullptr)
                                                : nullptr;
         const char* encodedStyleRunChars = encodedStyleRuns
-                                           ? env->GetStringUTFChars(encodedStyleRuns, nullptr)
+                                            ? env->GetStringUTFChars(encodedStyleRuns, nullptr)
+                                            : nullptr;
+        const char* encodedFontRunChars = encodedFontRuns
+                                           ? env->GetStringUTFChars(encodedFontRuns, nullptr)
                                            : nullptr;
         const char* encodedAdvanceChars = encodedAdvances
                                           ? env->GetStringUTFChars(encodedAdvances, nullptr)
@@ -16346,8 +16658,8 @@ static bool ApplyNativeTextContentEdits(
         const char* encodedVisualLineEndChars = encodedVisualLineEnds
                                                 ? env->GetStringUTFChars(encodedVisualLineEnds, nullptr)
                                                 : nullptr;
-        bool textMatches = !validateOriginalText;
-        if (validateOriginalText && isTextObject && expectedText) {
+        bool textMatches = !validateOriginalText || isRetainedLiveSource;
+        if (validateOriginalText && !isRetainedLiveSource && isTextObject && expectedText) {
             FPDF_TEXTPAGE textPage = FPDFText_LoadPage(page);
             if (textPage) {
                 const unsigned long textBytes = FPDFTextObj_GetText(textObject, textPage, nullptr, 0);
@@ -16422,13 +16734,17 @@ static bool ApplyNativeTextContentEdits(
             const int replacementFontRangeStart = env->GetIntField(edit, fontRangeStartField);
             const int replacementFontRangeEnd = env->GetIntField(edit, fontRangeEndField);
             const float visualLineHeight = env->GetFloatField(edit, visualLineHeightField);
+            const bool hasDefaultReplacementFont = replacementFontPathChars &&
+                    strlen(replacementFontPathChars) > 0;
+            const bool hasScriptFontRuns = encodedFontRunChars && *encodedFontRunChars;
             const bool useCompatibleFont = replacementLength > 0 &&
-                    replacementFontPathChars && strlen(replacementFontPathChars) > 0 &&
-                    (forceReplacementFont ||
-                     (!sourceFontSupportsReplacement &&
-                      TextEditNeedsCompatibleFont(env, expectedText, replacementText)));
-            const bool hasVisualReflow = encodedVisualLineEndChars &&
-                    strchr(encodedVisualLineEndChars, ',') != nullptr;
+                    (hasScriptFontRuns || (hasDefaultReplacementFont &&
+                     (forceReplacementFont ||
+                      (!sourceFontSupportsReplacement &&
+                       TextEditNeedsCompatibleFont(env, expectedText, replacementText)))));
+            const bool hasVisualReflow = (encodedVisualLineEndChars &&
+                    strchr(encodedVisualLineEndChars, ',') != nullptr) ||
+                    (encodedVisualLineYOffsetChars && *encodedVisualLineYOffsetChars);
             bool usedCompatibleFontObject = false;
             bool stylesAppliedPerRun = false;
             std::vector<StyledTextEditObject> liveStyleObjects;
@@ -16458,9 +16774,13 @@ static bool ApplyNativeTextContentEdits(
                         replacementFontRangeStart,
                         replacementFontRangeEnd,
                         encodedVisualLineEndChars,
+                        encodedVisualLineOffsetChars,
+                        encodedVisualLineYOffsetChars,
                         visualLineHeight,
                         cacheFallbackFonts,
+                        usesProvidedPage,
                         encodedStyleRunChars,
+                        encodedFontRunChars,
                         encodedAdvanceChars,
                         runMarkPrefix,
                         &liveStyleObjects);
@@ -16514,9 +16834,13 @@ static bool ApplyNativeTextContentEdits(
                         replacementFontRangeStart,
                         replacementFontRangeEnd,
                         encodedVisualLineEndChars,
+                        encodedVisualLineOffsetChars,
+                        encodedVisualLineYOffsetChars,
                         visualLineHeight,
                         cacheFallbackFonts,
+                        usesProvidedPage,
                         encodedStyleRunChars,
+                        encodedFontRunChars,
                         encodedAdvanceChars,
                         runMarkPrefix,
                         &liveStyleObjects);
@@ -16643,6 +16967,9 @@ static bool ApplyNativeTextContentEdits(
                 }
             }
             if (applied) {
+                if (usesProvidedPage && !isRetainedLiveSource) {
+                    FPDFPageObj_AddMark(textObject, liveSourceMark.c_str());
+                }
                 if (!usedCompatibleFontObject && (replacementLength > 0 || usesProvidedPage)) {
                     const float scaleX = env->GetFloatField(edit, scaleXField);
                     const float translateX = env->GetFloatField(edit, translateXField);
@@ -16690,6 +17017,12 @@ static bool ApplyNativeTextContentEdits(
                     }
                     int decorationOrdinal = 0;
                     size_t decorationStart = 0;
+                    const unsigned int originalDecorationColor =
+                            ((textA & 0xFFu) << 24u) | ((textR & 0xFFu) << 16u) |
+                            ((textG & 0xFFu) << 8u) | (textB & 0xFFu);
+                    auto decorationColorForStyle = [&](const TextEditCharacterStyle& style) {
+                        return style.hasColor ? style.color : originalDecorationColor;
+                    };
                     while (replacementLength > 0 && decorationStart < liveStyleObjects.size()) {
                         const TextEditCharacterStyle& style =
                                 liveStyleObjects[decorationStart].style;
@@ -16697,12 +17030,14 @@ static bool ApplyNativeTextContentEdits(
                             ++decorationStart;
                             continue;
                         }
+                        const unsigned int decorationColor = decorationColorForStyle(style);
                         size_t decorationEnd = decorationStart + 1;
                         while (decorationEnd < liveStyleObjects.size()) {
                             const TextEditCharacterStyle& nextStyle =
                                     liveStyleObjects[decorationEnd].style;
                             if (nextStyle.underline != style.underline ||
-                                nextStyle.strikeout != style.strikeout) break;
+                                nextStyle.strikeout != style.strikeout ||
+                                decorationColorForStyle(nextStyle) != decorationColor) break;
                             ++decorationEnd;
                         }
                         std::vector<FPDF_PAGEOBJECT> decorationObjects;
@@ -16715,10 +17050,10 @@ static bool ApplyNativeTextContentEdits(
                                 decorationObjects,
                                 style.underline && !usesNativeUnderline,
                                 style.strikeout && !usesNativeStrikeout,
-                                textR,
-                                textG,
-                                textB,
-                                textA,
+                                (decorationColor >> 16u) & 0xFFu,
+                                (decorationColor >> 8u) & 0xFFu,
+                                decorationColor & 0xFFu,
+                                (decorationColor >> 24u) & 0xFFu,
                                 liveStyleMarkPrefix,
                                 decorationOrdinal++);
                         decorationStart = decorationEnd;
@@ -16743,13 +17078,23 @@ static bool ApplyNativeTextContentEdits(
         if (encodedStyleRunChars) {
             env->ReleaseStringUTFChars(encodedStyleRuns, encodedStyleRunChars);
         }
+        if (encodedFontRunChars) {
+            env->ReleaseStringUTFChars(encodedFontRuns, encodedFontRunChars);
+        }
         if (encodedAdvanceChars) {
             env->ReleaseStringUTFChars(encodedAdvances, encodedAdvanceChars);
         }
         if (encodedVisualLineEndChars) {
             env->ReleaseStringUTFChars(encodedVisualLineEnds, encodedVisualLineEndChars);
         }
+        if (encodedVisualLineOffsetChars) {
+            env->ReleaseStringUTFChars(encodedVisualLineOffsets, encodedVisualLineOffsetChars);
+        }
+        if (encodedVisualLineOffsets) env->DeleteLocalRef(encodedVisualLineOffsets);
+        if (encodedVisualLineYOffsetChars) env->ReleaseStringUTFChars(encodedVisualLineYOffsets, encodedVisualLineYOffsetChars);
+        if (encodedVisualLineYOffsets) env->DeleteLocalRef(encodedVisualLineYOffsets);
         if (encodedStyleRuns) env->DeleteLocalRef(encodedStyleRuns);
+        if (encodedFontRuns) env->DeleteLocalRef(encodedFontRuns);
         if (encodedAdvances) env->DeleteLocalRef(encodedAdvances);
         if (encodedVisualLineEnds) env->DeleteLocalRef(encodedVisualLineEnds);
         if (replacementFontPath) env->DeleteLocalRef(replacementFontPath);
