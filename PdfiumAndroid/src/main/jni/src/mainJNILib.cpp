@@ -102,6 +102,53 @@ inline typename string_type::value_type *WriteInto(string_type *str, size_t leng
     return &((*str)[0]);
 }
 
+static std::string jstringToUtf8(JNIEnv *env, jstring value) {
+    if (value == nullptr) {
+        return std::string();
+    }
+
+    const jsize length = env->GetStringLength(value);
+    const jchar *chars = env->GetStringChars(value, nullptr);
+    if (chars == nullptr) {
+        return std::string();
+    }
+
+    std::string utf8;
+    utf8.reserve(static_cast<size_t>(length) * 3);
+
+    for (jsize index = 0; index < length; index++) {
+        uint32_t codePoint = chars[index];
+        if (codePoint >= 0xD800 && codePoint <= 0xDBFF &&
+            index + 1 < length &&
+            chars[index + 1] >= 0xDC00 && chars[index + 1] <= 0xDFFF) {
+            codePoint = 0x10000 +
+                        ((codePoint - 0xD800) << 10) +
+                        (chars[++index] - 0xDC00);
+        } else if (codePoint >= 0xD800 && codePoint <= 0xDFFF) {
+            codePoint = 0xFFFD;
+        }
+
+        if (codePoint <= 0x7F) {
+            utf8.push_back(static_cast<char>(codePoint));
+        } else if (codePoint <= 0x7FF) {
+            utf8.push_back(static_cast<char>(0xC0 | (codePoint >> 6)));
+            utf8.push_back(static_cast<char>(0x80 | (codePoint & 0x3F)));
+        } else if (codePoint <= 0xFFFF) {
+            utf8.push_back(static_cast<char>(0xE0 | (codePoint >> 12)));
+            utf8.push_back(static_cast<char>(0x80 | ((codePoint >> 6) & 0x3F)));
+            utf8.push_back(static_cast<char>(0x80 | (codePoint & 0x3F)));
+        } else {
+            utf8.push_back(static_cast<char>(0xF0 | (codePoint >> 18)));
+            utf8.push_back(static_cast<char>(0x80 | ((codePoint >> 12) & 0x3F)));
+            utf8.push_back(static_cast<char>(0x80 | ((codePoint >> 6) & 0x3F)));
+            utf8.push_back(static_cast<char>(0x80 | (codePoint & 0x3F)));
+        }
+    }
+
+    env->ReleaseStringChars(value, chars);
+    return utf8;
+}
+
 inline long getFileSize(int fd) {
     struct stat file_state;
 
@@ -357,11 +404,32 @@ extern "C" { //For JNI support
 static int getBlock(void *param, unsigned long position, unsigned char *outBuffer,
                     unsigned long size) {
     const int fd = reinterpret_cast<intptr_t>(param);
-    const int readCount = pread(fd, outBuffer, size, position);
-    if (readCount < 0) {
-        LOGE("Cannot read from file descriptor. Error:%d", errno);
+    size_t totalRead = 0;
+
+    while (totalRead < size) {
+        const ssize_t readCount = pread(
+                fd,
+                outBuffer + totalRead,
+                static_cast<size_t>(size) - totalRead,
+                static_cast<off_t>(position + totalRead));
+
+        if (readCount > 0) {
+            totalRead += static_cast<size_t>(readCount);
+            continue;
+        }
+
+        if (readCount < 0 && errno == EINTR) {
+            continue;
+        }
+
+        if (readCount < 0) {
+            LOGE("Cannot read from file descriptor. Error:%d", errno);
+        } else {
+            LOGE("Unexpected end of file at position %lu", position + totalRead);
+        }
         return 0;
     }
+
     return 1;
 }
 
@@ -657,16 +725,10 @@ JNI_FUNC(jlong, PdfiumCore, nativeOpenDocument)(JNI_ARGS, jint fd, jstring passw
     loader.m_Param = reinterpret_cast<void *>(intptr_t(fd));
     loader.m_GetBlock = &getBlock;
 
-    const char *cpassword = NULL;
-    if (password != NULL) {
-        cpassword = env->GetStringUTFChars(password, NULL);
-    }
+    const std::string passwordUtf8 = jstringToUtf8(env, password);
+    const char *cpassword = password != nullptr ? passwordUtf8.c_str() : nullptr;
 
     FPDF_DOCUMENT document = FPDF_LoadCustomDocument(&loader, cpassword);
-
-    if (cpassword != NULL) {
-        env->ReleaseStringUTFChars(password, cpassword);
-    }
 
     if (!document) {
         delete docFile;
@@ -695,10 +757,8 @@ JNI_FUNC(jlong, PdfiumCore, nativeOpenDocument)(JNI_ARGS, jint fd, jstring passw
 JNI_FUNC(jlong, PdfiumCore, nativeOpenMemDocument)(JNI_ARGS, jbyteArray data, jstring password) {
     DocumentFile *docFile = new DocumentFile();
 
-    const char *cpassword = NULL;
-    if (password != NULL) {
-        cpassword = env->GetStringUTFChars(password, NULL);
-    }
+    const std::string passwordUtf8 = jstringToUtf8(env, password);
+    const char *cpassword = password != nullptr ? passwordUtf8.c_str() : nullptr;
 
     jbyte *cData = env->GetByteArrayElements(data, NULL);
     int size = (int) env->GetArrayLength(data);
@@ -707,10 +767,6 @@ JNI_FUNC(jlong, PdfiumCore, nativeOpenMemDocument)(JNI_ARGS, jbyteArray data, js
     FPDF_DOCUMENT document = FPDF_LoadMemDocument(reinterpret_cast<const void *>(cDataCopy),
                                                   size, cpassword);
     env->ReleaseByteArrayElements(data, cData, JNI_ABORT);
-
-    if (cpassword != NULL) {
-        env->ReleaseStringUTFChars(password, cpassword);
-    }
 
     if (!document) {
         delete docFile;
