@@ -42,6 +42,7 @@ using namespace android;
 #include <cfloat>
 #include <climits>
 #include <chrono>
+#include <zlib.h>
 #include <fpdf_text.h>
 
 #define WM_LOGE(...) do {} while (0)
@@ -1704,6 +1705,20 @@ struct RawPdfWatermarkSpec;
 static bool CollectPageLevelTextWatermarkPatternSpec(JNIEnv* env, jobject obj, jfieldID dataPropsField, jclass jsonClass, jmethodID jsonInit, RawPdfWatermarkSpec* outSpec);
 static bool PatchRawPdfWatermarkPatterns(JNIEnv* env, const char* outputPath, const std::vector<RawPdfWatermarkSpec>& specs);
 static bool AppendPdfEditContentMarker(const char* outputPath);
+static bool PdfFileHasPdfiumGraphicsStateWrapperMarker(const char* inputPath);
+static bool AppendPdfiumGraphicsStateWrapperMarker(const char* outputPath);
+static bool PreparePdfiumGraphicsStateWrappedInput(
+        const char* inputPath,
+        const char* wrappedInputPath,
+        const std::set<int>& pageIndexes,
+        std::set<int>* forceRgbPageIndexes,
+        std::set<int>* protectedTransparencyPageIndexes);
+static bool SavePdfiumUnmodifiedCopy(const char* inputPath, const char* outputPath);
+static void NativeCollectIndirectRefsInRange(
+        const std::string& body,
+        size_t start,
+        size_t end,
+        std::set<std::pair<int, int>>* refs);
 static bool PdfFileHasEditContentMarker(const char* inputPath);
 static bool AppendPageLevelTextWatermarkGlyphPaths(FPDF_PAGE page, const char* fontPath, const jchar* textContent, jsize textLength, int textR, int textG, int textB, int textA, bool isBold, double scale, double letterSpacing, double textHeight, double cosA, double sinA, double skewX, float minX, float maxX, float minY, float maxY, float centerX, float centerY, float tileWidth, float tileHeight, int maxStampObjects);
 
@@ -3685,6 +3700,15 @@ static bool FindBalancedPdfDictionary(
         size_t* outStart,
         size_t* outEnd
 );
+static std::set<std::pair<int, int>> PatchEligibleTextEditsInOriginalStreams(
+        JNIEnv* env,
+        const char* pdfPath,
+        jobjectArray textEditsArray);
+static bool ValidateOriginalStreamTextPatches(
+        JNIEnv* env,
+        const char* pdfPath,
+        jobjectArray textEditsArray,
+        const std::set<std::pair<int, int>>& patchedEdits);
 
 static bool ExtractLastTrailerDictionary(const std::string& data, std::string* outTrailer) {
     if (!outTrailer) return false;
@@ -3987,6 +4011,27 @@ static bool WriteStringToFile(const char* path, const std::string& data) {
     std::ofstream output(path, std::ios::binary | std::ios::trunc);
     if (!output) return false;
     output.write(data.data(), static_cast<std::streamsize>(data.size()));
+    return true;
+}
+
+static bool ReadFileTailToString(
+        const char* path,
+        size_t maximumBytes,
+        std::string* outData) {
+    if (!path || maximumBytes == 0 || !outData) return false;
+    std::ifstream input(path, std::ios::binary | std::ios::ate);
+    if (!input) return false;
+    const std::streamoff fileSize = input.tellg();
+    if (fileSize < 0) return false;
+    const std::streamoff bytesToRead = std::min<std::streamoff>(
+            fileSize,
+            static_cast<std::streamoff>(maximumBytes));
+    input.seekg(fileSize - bytesToRead, std::ios::beg);
+    outData->resize(static_cast<size_t>(bytesToRead));
+    if (bytesToRead > 0) {
+        input.read(outData->data(), bytesToRead);
+        if (!input) return false;
+    }
     return true;
 }
 
@@ -4432,6 +4477,8 @@ static std::string EscapePdfLiteralString(const std::string& value) {
 }
 
 static const char* kPdfEditContentMarker = "CVPdfEditContent";
+static const char* kPdfiumGraphicsStateWrapperMarker =
+        "CVPdfiumGraphicsStateWrapperV1";
 
 static bool PdfFileHasEditContentMarker(const char* inputPath) {
     if (!inputPath) return false;
@@ -4457,6 +4504,57 @@ static bool AppendPdfEditContentMarker(const char* outputPath) {
     data.append(kPdfEditContentMarker);
     data.append("\n");
     return WriteStringToFile(outputPath, data);
+}
+
+static bool PdfFileHasPdfiumGraphicsStateWrapperMarker(const char* inputPath) {
+    if (!inputPath) return false;
+    std::string tail;
+    // Allow for later incremental revisions written after our trailing marker
+    // without falling back to a complete file read for ordinary documents.
+    return ReadFileTailToString(inputPath, 1024 * 1024, &tail) &&
+           tail.find(kPdfiumGraphicsStateWrapperMarker) != std::string::npos;
+}
+
+static bool AppendPdfiumGraphicsStateWrapperMarker(const char* outputPath) {
+    if (!outputPath) return false;
+    std::string data;
+    if (!ReadFileToString(outputPath, &data)) return false;
+    if (data.find(kPdfiumGraphicsStateWrapperMarker) != std::string::npos) return true;
+    data.append("\n%");
+    data.append(kPdfiumGraphicsStateWrapperMarker);
+    data.append("\n");
+    return WriteStringToFile(outputPath, data);
+}
+
+// The edit save previously loaded and rewrote the complete output once for
+// each marker. Both markers are trailing PDF comments, so checking a small
+// tail and appending them in one write preserves the same behavior without
+// copying a large document two additional times.
+static bool AppendPdfEditSaveMarkers(
+        const char* outputPath,
+        bool includeGraphicsStateWrapperMarker) {
+    if (!outputPath) return false;
+    std::string tail;
+    if (!ReadFileTailToString(outputPath, 4096, &tail)) return false;
+
+    std::string markers;
+    if (tail.find(kPdfEditContentMarker) == std::string::npos) {
+        markers.append("\n%");
+        markers.append(kPdfEditContentMarker);
+        markers.push_back('\n');
+    }
+    if (includeGraphicsStateWrapperMarker &&
+        tail.find(kPdfiumGraphicsStateWrapperMarker) == std::string::npos) {
+        markers.append("\n%");
+        markers.append(kPdfiumGraphicsStateWrapperMarker);
+        markers.push_back('\n');
+    }
+    if (markers.empty()) return true;
+
+    std::ofstream output(outputPath, std::ios::binary | std::ios::app);
+    if (!output) return false;
+    output.write(markers.data(), static_cast<std::streamsize>(markers.size()));
+    return output.good();
 }
 
 static std::string BuildPdfWatermarkPatternStream(
@@ -14985,6 +15083,29 @@ static bool PageObjectHasMarkPrefix(
     return false;
 }
 
+// Live text previews keep the original PDFium text object and mark it with a
+// stable logical identity.  The editable-object ordinal is only a lookup hint:
+// adding/removing preview objects can change that ordinal between keystrokes.
+static FPDF_PAGEOBJECT FindPageObjectWithExactMark(
+        FPDF_PAGE page,
+        const std::string& expectedMarkName) {
+    if (!page || expectedMarkName.empty()) return nullptr;
+    const int objectCount = FPDFPage_CountObjects(page);
+    for (int objectIndex = 0; objectIndex < objectCount; ++objectIndex) {
+        FPDF_PAGEOBJECT object = FPDFPage_GetObject(page, objectIndex);
+        if (!object) continue;
+        if (PageObjectHasExactMark(object, expectedMarkName)) return object;
+        if (FPDFPageObj_GetType(object) != FPDF_PAGEOBJ_FORM) continue;
+        const int childCount = FPDFFormObj_CountObjects(object);
+        for (int childIndex = 0; childIndex < childCount; ++childIndex) {
+            FPDF_PAGEOBJECT child = FPDFFormObj_GetObject(
+                    object, static_cast<unsigned long>(childIndex));
+            if (PageObjectHasExactMark(child, expectedMarkName)) return child;
+        }
+    }
+    return nullptr;
+}
+
 static FPDF_PAGEOBJECT FindTextEditPreviewObject(
         FPDF_PAGE page,
         const std::string& markPrefix,
@@ -15438,6 +15559,78 @@ static float MeasureTextEditRunAdvance(
     return fmaxf(0.0f, surroundedWidth - sentinelPairWidth);
 }
 
+// PDFium 155 serializes a text object's stored character positions as a TJ
+// array. Restore those positions after FPDFText_SetText() when the edit keeps
+// the same UTF-16 code-unit count. This keeps the original object, font, matrix,
+// and per-glyph spacing instead of allowing SetText() to replace the spacing
+// with the font's default advances.
+//
+// Insertions, deletions, and surrogate pairs intentionally use PDFium's
+// natural layout. The public API requires exactly one position per character
+// after the first, so reusing the source positions in those cases would create
+// incorrect spacing.
+static bool RestoreTextEditCharacterPositions(
+        JNIEnv* env,
+        FPDF_PAGEOBJECT textObject,
+        jstring originalText,
+        jstring replacementText,
+        const char* encodedAdvances,
+        bool* attempted) {
+    if (attempted) *attempted = false;
+    if (!env || !textObject || !originalText || !replacementText ||
+        !encodedAdvances || !*encodedAdvances) {
+        return true;
+    }
+
+    const jsize originalLength = env->GetStringLength(originalText);
+    const jsize replacementLength = env->GetStringLength(replacementText);
+    if (originalLength < 2 || replacementLength != originalLength) return true;
+
+    const jchar* originalChars = env->GetStringChars(originalText, nullptr);
+    const jchar* replacementChars = env->GetStringChars(replacementText, nullptr);
+    if (!originalChars || !replacementChars) {
+        if (originalChars) env->ReleaseStringChars(originalText, originalChars);
+        if (replacementChars) env->ReleaseStringChars(replacementText, replacementChars);
+        return true;
+    }
+    bool hasSurrogate = false;
+    for (jsize index = 0; index < originalLength && !hasSurrogate; ++index) {
+        hasSurrogate = (originalChars[index] >= 0xD800 && originalChars[index] <= 0xDFFF) ||
+                (replacementChars[index] >= 0xD800 && replacementChars[index] <= 0xDFFF);
+    }
+    env->ReleaseStringChars(originalText, originalChars);
+    env->ReleaseStringChars(replacementText, replacementChars);
+    if (hasSurrogate) return true;
+
+    std::vector<float> cursorPositions;
+    std::stringstream positionStream(encodedAdvances);
+    std::string positionValue;
+    while (std::getline(positionStream, positionValue, ',')) {
+        char* end = nullptr;
+        const float value = strtof(positionValue.c_str(), &end);
+        if (!end || end == positionValue.c_str() || *end != '\0' || !std::isfinite(value)) {
+            cursorPositions.clear();
+            break;
+        }
+        cursorPositions.push_back(value);
+    }
+    if (cursorPositions.size() != static_cast<size_t>(originalLength) + 1) return true;
+
+    const float firstOrigin = cursorPositions.front();
+    std::vector<float> characterPositions(static_cast<size_t>(replacementLength) - 1);
+    for (jsize index = 1; index < replacementLength; ++index) {
+        const float position = cursorPositions[static_cast<size_t>(index)] - firstOrigin;
+        if (!std::isfinite(position)) return true;
+        characterPositions[static_cast<size_t>(index) - 1] = position;
+    }
+
+    if (attempted) *attempted = true;
+    return FPDFText_SetPositions(
+            textObject,
+            characterPositions.data(),
+            characterPositions.size()) != 0;
+}
+
 static FPDF_FONT LoadTextEditFallbackFont(
         FPDF_DOCUMENT doc,
         const char* fontPath,
@@ -15809,15 +16002,53 @@ static bool CreatePositionedSourceTextEditObjects(
     return true;
 }
 
+static void CollectActiveTextEditPreviewPrefixesFromObject(
+        FPDF_PAGEOBJECT object,
+        std::set<std::string>* activePreviewPrefixes) {
+    if (!object || !activePreviewPrefixes) return;
+    static const std::string sourcePrefix = "LufickTextEditPreviewSource_";
+    const int markCount = FPDFPageObj_CountMarks(object);
+    for (int markIndex = 0; markIndex < markCount; ++markIndex) {
+        const std::string markName = GetPageObjectMarkName(
+                FPDFPageObj_GetMark(object, static_cast<unsigned long>(markIndex)));
+        if (markName.rfind(sourcePrefix, 0) == 0) {
+            activePreviewPrefixes->insert(
+                    "LufickTextEditPreview_" + markName.substr(sourcePrefix.size()) + "_");
+        }
+    }
+    if (FPDFPageObj_GetType(object) != FPDF_PAGEOBJ_FORM) return;
+    const int childCount = FPDFFormObj_CountObjects(object);
+    for (int childIndex = 0; childIndex < childCount; ++childIndex) {
+        CollectActiveTextEditPreviewPrefixesFromObject(
+                FPDFFormObj_GetObject(object, static_cast<unsigned long>(childIndex)),
+                activePreviewPrefixes);
+    }
+}
+
+static bool IsActiveTextEditPreviewObject(
+        FPDF_PAGEOBJECT object,
+        const std::set<std::string>& activePreviewPrefixes) {
+    if (!object || activePreviewPrefixes.empty()) return false;
+    const int markCount = FPDFPageObj_CountMarks(object);
+    for (int markIndex = 0; markIndex < markCount; ++markIndex) {
+        const std::string markName = GetPageObjectMarkName(
+                FPDFPageObj_GetMark(object, static_cast<unsigned long>(markIndex)));
+        for (const std::string& prefix : activePreviewPrefixes) {
+            if (markName.rfind(prefix, 0) == 0) return true;
+        }
+    }
+    return false;
+}
+
 static void CollectEditableTextObjectsFromObject(
         FPDF_PAGEOBJECT object,
+        const std::set<std::string>& activePreviewPrefixes,
         std::vector<FPDF_PAGEOBJECT>* textObjects) {
     if (!object || !textObjects) return;
     const int objectType = FPDFPageObj_GetType(object);
     if (objectType == FPDF_PAGEOBJ_TEXT) {
         if (!PageObjectHasExactMark(object, "LufickStyleOverlay") &&
-            !PageObjectHasMarkPrefix(object, "LufickTextEditPreview_") &&
-            !PageObjectHasMarkPrefix(object, "LufickTextEditFinal_")) {
+            !IsActiveTextEditPreviewObject(object, activePreviewPrefixes)) {
             textObjects->push_back(object);
         }
         return;
@@ -15827,6 +16058,7 @@ static void CollectEditableTextObjectsFromObject(
     for (int childIndex = 0; childIndex < childCount; ++childIndex) {
         CollectEditableTextObjectsFromObject(
                 FPDFFormObj_GetObject(object, static_cast<unsigned long>(childIndex)),
+                activePreviewPrefixes,
                 textObjects);
     }
 }
@@ -15835,9 +16067,16 @@ static std::vector<FPDF_PAGEOBJECT> CollectEditableTextObjects(FPDF_PAGE page) {
     std::vector<FPDF_PAGEOBJECT> textObjects;
     if (!page) return textObjects;
     const int objectCount = FPDFPage_CountObjects(page);
+    std::set<std::string> activePreviewPrefixes;
+    for (int objectIndex = 0; objectIndex < objectCount; ++objectIndex) {
+        CollectActiveTextEditPreviewPrefixesFromObject(
+                FPDFPage_GetObject(page, objectIndex),
+                &activePreviewPrefixes);
+    }
     for (int objectIndex = 0; objectIndex < objectCount; ++objectIndex) {
         CollectEditableTextObjectsFromObject(
                 FPDFPage_GetObject(page, objectIndex),
+                activePreviewPrefixes,
                 &textObjects);
     }
     return textObjects;
@@ -16510,6 +16749,176 @@ static bool CreateStyledTextEditObjects(
 }
 
 
+static int NormalizePdfiumPageObjectColorsToRgb(FPDF_PAGEOBJECT object) {
+    if (!object) return 0;
+    const int type = FPDFPageObj_GetType(object);
+    // A Form XObject owns an independent content stream and may also be a transparency
+    // group. Mutating one of its children marks that Form dirty and makes PDFium regenerate
+    // it, which can discard CMYK/transparency state that is unrelated to the edited text.
+    if (type == FPDF_PAGEOBJ_FORM) return 0;
+    if (type != FPDF_PAGEOBJ_TEXT && type != FPDF_PAGEOBJ_PATH) return 0;
+
+    unsigned int fillR = 0;
+    unsigned int fillG = 0;
+    unsigned int fillB = 0;
+    unsigned int fillA = 0;
+    unsigned int strokeR = 0;
+    unsigned int strokeG = 0;
+    unsigned int strokeB = 0;
+    unsigned int strokeA = 0;
+    const bool hasFill = FPDFPageObj_GetFillColor(
+            object, &fillR, &fillG, &fillB, &fillA) != 0;
+    const bool hasStroke = FPDFPageObj_GetStrokeColor(
+            object, &strokeR, &strokeG, &strokeB, &strokeA) != 0;
+    bool converted = false;
+    if (hasFill) {
+        converted = FPDFPageObj_SetFillColor(
+                object, fillR, fillG, fillB, fillA) != 0 || converted;
+    }
+    if (hasStroke) {
+        converted = FPDFPageObj_SetStrokeColor(
+                object, strokeR, strokeG, strokeB, strokeA) != 0 || converted;
+    }
+    return converted ? 1 : 0;
+}
+
+struct PdfiumCmykImageCandidate {
+    FPDF_PAGEOBJECT object = nullptr;
+    FPDF_IMAGEOBJ_METADATA metadata{};
+    FS_MATRIX matrix{};
+    bool hasMatrix = false;
+};
+
+static bool PdfiumImagesHaveSameGeometry(
+        const PdfiumCmykImageCandidate& first,
+        const PdfiumCmykImageCandidate& second) {
+    if (first.metadata.width != second.metadata.width ||
+        first.metadata.height != second.metadata.height ||
+        first.hasMatrix != second.hasMatrix) {
+        return false;
+    }
+    if (!first.hasMatrix) return true;
+    constexpr float kMatrixTolerance = 0.001f;
+    return std::fabs(first.matrix.a - second.matrix.a) <= kMatrixTolerance &&
+            std::fabs(first.matrix.b - second.matrix.b) <= kMatrixTolerance &&
+            std::fabs(first.matrix.c - second.matrix.c) <= kMatrixTolerance &&
+            std::fabs(first.matrix.d - second.matrix.d) <= kMatrixTolerance &&
+            std::fabs(first.matrix.e - second.matrix.e) <= kMatrixTolerance &&
+            std::fabs(first.matrix.f - second.matrix.f) <= kMatrixTolerance;
+}
+
+static int IsolatePdfiumCmykCompositeBaseImages(FPDF_PAGE page) {
+    if (!page) return 0;
+
+    std::vector<PdfiumCmykImageCandidate> cmykImages;
+    const int objectCount = FPDFPage_CountObjects(page);
+    for (int objectIndex = 0; objectIndex < objectCount; ++objectIndex) {
+        FPDF_PAGEOBJECT object = FPDFPage_GetObject(page, objectIndex);
+        if (!object || FPDFPageObj_GetType(object) != FPDF_PAGEOBJ_IMAGE) continue;
+
+        PdfiumCmykImageCandidate candidate;
+        candidate.object = object;
+        if (!FPDFImageObj_GetImageMetadata(object, page, &candidate.metadata) ||
+            candidate.metadata.colorspace != FPDF_COLORSPACE_DEVICECMYK) continue;
+        candidate.hasMatrix = FPDFPageObj_GetMatrix(object, &candidate.matrix) != 0;
+        cmykImages.push_back(candidate);
+    }
+
+    // Some generated PDFs paint a full CMYK image and then a same-size companion image
+    // through a text clipping path. PDFium does not serialize that text clip, so the mostly
+    // white companion can cover the base image. Move only the first (base) image after the
+    // regenerated stream. Standalone CMYK images, including images with soft masks, remain
+    // in their original stream and retain their original stacking order.
+    std::vector<FPDF_PAGEOBJECT> baseImages;
+    for (size_t imageIndex = 1; imageIndex < cmykImages.size(); ++imageIndex) {
+        if (PdfiumImagesHaveSameGeometry(cmykImages[imageIndex - 1], cmykImages[imageIndex])) {
+            baseImages.push_back(cmykImages[imageIndex - 1].object);
+            ++imageIndex;
+        }
+    }
+
+    int isolated = 0;
+    for (FPDF_PAGEOBJECT image : baseImages) {
+        if (!FPDFPage_RemoveObject(page, image)) continue;
+        // Re-insertion gives the preserved base image a new content-stream assignment after
+        // the regenerated original stream. Its raw image XObject is not decoded or replaced.
+        FPDFPage_InsertObject(page, image);
+        ++isolated;
+    }
+    return isolated;
+}
+
+static int NormalizePdfiumPageColorsToRgb(FPDF_PAGE page) {
+    if (!page) return 0;
+    int converted = 0;
+    const int objectCount = FPDFPage_CountObjects(page);
+    for (int objectIndex = 0; objectIndex < objectCount; ++objectIndex) {
+        converted += NormalizePdfiumPageObjectColorsToRgb(
+                FPDFPage_GetObject(page, objectIndex));
+    }
+    return converted;
+}
+
+static bool PdfiumPageObjectsHaveSameGeometry(
+        FPDF_PAGEOBJECT first,
+        FPDF_PAGEOBJECT second) {
+    if (!first || !second) return false;
+    float firstLeft = 0;
+    float firstBottom = 0;
+    float firstRight = 0;
+    float firstTop = 0;
+    float secondLeft = 0;
+    float secondBottom = 0;
+    float secondRight = 0;
+    float secondTop = 0;
+    if (!FPDFPageObj_GetBounds(
+            first, &firstLeft, &firstBottom, &firstRight, &firstTop) ||
+        !FPDFPageObj_GetBounds(
+            second, &secondLeft, &secondBottom, &secondRight, &secondTop)) {
+        return false;
+    }
+    constexpr float kGeometryTolerance = 0.01f;
+    return std::fabs(firstLeft - secondLeft) <= kGeometryTolerance &&
+            std::fabs(firstBottom - secondBottom) <= kGeometryTolerance &&
+            std::fabs(firstRight - secondRight) <= kGeometryTolerance &&
+            std::fabs(firstTop - secondTop) <= kGeometryTolerance;
+}
+
+static int RemoveRegeneratedDuplicateTransparencyForm(FPDF_PAGE page) {
+    if (!page) return 0;
+    std::vector<FPDF_PAGEOBJECT> forms;
+    const int objectCount = FPDFPage_CountObjects(page);
+    for (int objectIndex = 0; objectIndex < objectCount; ++objectIndex) {
+        FPDF_PAGEOBJECT object = FPDFPage_GetObject(page, objectIndex);
+        if (object && FPDFPageObj_GetType(object) == FPDF_PAGEOBJ_FORM) {
+            forms.push_back(object);
+        }
+    }
+
+    for (size_t firstIndex = 0; firstIndex < forms.size(); ++firstIndex) {
+        for (size_t secondIndex = firstIndex + 1; secondIndex < forms.size(); ++secondIndex) {
+            if (!PdfiumPageObjectsHaveSameGeometry(
+                    forms[firstIndex], forms[secondIndex])) {
+                continue;
+            }
+            // The raw preservation stream is inserted before the original page stream. The
+            // second matching Form is therefore the original copy PDFium would regenerate
+            // without its soft mask.
+            if (!FPDFPage_RemoveObject(page, forms[secondIndex])) return 0;
+            FPDFPageObj_Destroy(forms[secondIndex]);
+            return 1;
+        }
+    }
+    // On the protected page, exactly two Forms means the prepended preservation invocation
+    // plus the original invocation. Bounds can differ when PDFium accounts for the
+    // original page clip, even though both Forms reference the same XObject.
+    if (forms.size() == 2 && FPDFPage_RemoveObject(page, forms.back())) {
+        FPDFPageObj_Destroy(forms.back());
+        return 1;
+    }
+    return 0;
+}
+
 static bool ApplyNativeTextContentEdits(
         JNIEnv* env,
         FPDF_DOCUMENT doc,
@@ -16517,7 +16926,10 @@ static bool ApplyNativeTextContentEdits(
         FPDF_PAGE providedPage,
         int providedPageIndex,
         bool validateOriginalText,
-        bool cacheFallbackFonts = false) {
+        bool cacheFallbackFonts = false,
+        const std::set<int>* forceRgbPageIndexes = nullptr,
+        const std::set<int>* protectedTransparencyPageIndexes = nullptr,
+        const std::set<std::pair<int, int>>* rawPatchedTextEdits = nullptr) {
     if (!textEditsArray) return true;
 
     jclass editClass = env->FindClass("com/cv/lufick/compose_editor/data_class/PdfTextEditNative");
@@ -16581,6 +16993,8 @@ static bool ApplyNativeTextContentEdits(
             "Ljava/lang/String;");
     bool allApplied = true;
     std::vector<std::pair<int, std::string>> pendingMarkedTextRemovals;
+    std::set<int> rgbNormalizedPages;
+    std::set<int> transparencyPreparedPages;
 
     const int editCount = env->GetArrayLength(textEditsArray);
     for (int editIndex = 0; editIndex < editCount; ++editIndex) {
@@ -16591,8 +17005,40 @@ static bool ApplyNativeTextContentEdits(
         }
         const int pageIndex = env->GetIntField(edit, pageField);
         const int objectIndex = env->GetIntField(edit, objectField);
+        if (rawPatchedTextEdits &&
+            rawPatchedTextEdits->find({pageIndex, objectIndex}) != rawPatchedTextEdits->end()) {
+            LOGE(
+                    "PDF_EDIT_NATIVE original-stream text patch retained page=%d object=%d",
+                    pageIndex,
+                    objectIndex);
+            env->DeleteLocalRef(edit);
+            continue;
+        }
         const bool usesProvidedPage = providedPage && pageIndex == providedPageIndex;
         FPDF_PAGE page = usesProvidedPage ? providedPage : FPDF_LoadPage(doc, pageIndex);
+        if (page && protectedTransparencyPageIndexes &&
+            protectedTransparencyPageIndexes->find(pageIndex) !=
+                    protectedTransparencyPageIndexes->end() &&
+            transparencyPreparedPages.insert(pageIndex).second) {
+            const int removedForms = RemoveRegeneratedDuplicateTransparencyForm(page);
+            LOGE(
+                    "PDF_EDIT_NATIVE transparency workaround page=%d removed duplicate forms=%d",
+                    pageIndex,
+                    removedForms);
+        }
+        if (page && forceRgbPageIndexes &&
+            forceRgbPageIndexes->find(pageIndex) != forceRgbPageIndexes->end() &&
+            rgbNormalizedPages.insert(pageIndex).second) {
+            const int isolatedImages = IsolatePdfiumCmykCompositeBaseImages(page);
+            const int convertedObjects = NormalizePdfiumPageColorsToRgb(page);
+            LOGE(
+                    "PDF_EDIT_NATIVE CMYK color workaround page=%d RGB objects=%d isolated images=%d",
+                    pageIndex,
+                    convertedObjects,
+                    isolatedImages);
+        }
+        const std::string liveSourceMark = "LufickTextEditPreviewSource_" +
+                std::to_string(pageIndex) + "_" + std::to_string(objectIndex);
         const std::string liveStyleMarkPrefix = "LufickTextEditPreviewStyle_" +
                 std::to_string(pageIndex) + "_" + std::to_string(objectIndex) + "_";
         if (page && usesProvidedPage) {
@@ -16600,21 +17046,30 @@ static bool ApplyNativeTextContentEdits(
         }
         const std::vector<FPDF_PAGEOBJECT> editableTextObjects =
                 CollectEditableTextObjects(page);
-        if (!page || objectIndex < 0 ||
-            objectIndex >= static_cast<int>(editableTextObjects.size())) {
+        // Once a live preview exists, resolve the source by its mark before
+        // consulting the ordinal.  This prevents a newly-created preview text
+        // object (or a removed object) from shifting the target to a neighbor.
+        FPDF_PAGEOBJECT textObject = usesProvidedPage
+                ? FindPageObjectWithExactMark(page, liveSourceMark)
+                : nullptr;
+        const bool ordinalInRange = objectIndex >= 0 &&
+                objectIndex < static_cast<int>(editableTextObjects.size());
+        // A final save reopens the PDF, so PDFium may reorder or remove objects
+        // without changing the edit payload's old ordinal.  Keep that payload
+        // eligible for the validated text/bounds recovery below.  Live edits
+        // still require a valid ordinal unless their marked source was found.
+        if (!textObject && (!page || (!ordinalInRange && !validateOriginalText))) {
             if (page && !usesProvidedPage) FPDF_ClosePage(page);
             env->DeleteLocalRef(edit);
             allApplied = false;
             continue;
         }
 
-        FPDF_PAGEOBJECT textObject = editableTextObjects[objectIndex];
-        const std::string liveSourceMark = "LufickTextEditPreviewSource_" +
-                std::to_string(pageIndex) + "_" + std::to_string(objectIndex);
+        if (!textObject && ordinalInRange) textObject = editableTextObjects[objectIndex];
         const bool isRetainedLiveSource = usesProvidedPage &&
                 PageObjectHasExactMark(textObject, liveSourceMark);
         float actualLeft = 0.0f, actualBottom = 0.0f, actualRight = 0.0f, actualTop = 0.0f;
-        const bool isTextObject = textObject && FPDFPageObj_GetType(textObject) == FPDF_PAGEOBJ_TEXT;
+        bool isTextObject = textObject && FPDFPageObj_GetType(textObject) == FPDF_PAGEOBJ_TEXT;
         const bool hasBounds = isTextObject &&
                 FPDFPageObj_GetBounds(textObject, &actualLeft, &actualBottom, &actualRight, &actualTop);
         const float expectedLeft = env->GetFloatField(edit, leftField);
@@ -16676,6 +17131,61 @@ static bool ApplyNativeTextContentEdits(
                 }
                 FPDFText_ClosePage(textPage);
             }
+        }
+
+        // Final saves reopen the PDF and therefore cannot use the live-source
+        // mark.  If PDFium reordered text objects while parsing a previous
+        // save, recover by matching the complete source text and its bounds
+        // instead of rejecting the whole save or editing a neighboring line.
+        if (validateOriginalText && !isRetainedLiveSource && !textMatches &&
+            expectedText && page) {
+            FPDF_TEXTPAGE textPage = FPDFText_LoadPage(page);
+            const jsize expectedLength = env->GetStringLength(expectedText);
+            const jchar* expectedChars = env->GetStringChars(expectedText, nullptr);
+            if (textPage && expectedChars) {
+                for (FPDF_PAGEOBJECT candidate : editableTextObjects) {
+                    if (!candidate || FPDFPageObj_GetType(candidate) != FPDF_PAGEOBJ_TEXT) continue;
+                    float candidateLeft = 0.0f, candidateBottom = 0.0f;
+                    float candidateRight = 0.0f, candidateTop = 0.0f;
+                    if (!FPDFPageObj_GetBounds(
+                            candidate,
+                            &candidateLeft,
+                            &candidateBottom,
+                            &candidateRight,
+                            &candidateTop)) continue;
+                    const bool candidateBoundsMatch =
+                            std::fabs(candidateLeft - expectedLeft) <= boundsTolerance &&
+                            std::fabs(candidateBottom - expectedBottom) <= boundsTolerance &&
+                            std::fabs(candidateRight - expectedRight) <= boundsTolerance &&
+                            std::fabs(candidateTop - expectedTop) <= boundsTolerance;
+                    if (!candidateBoundsMatch) continue;
+                    const unsigned long textBytes = FPDFTextObj_GetText(
+                            candidate, textPage, nullptr, 0);
+                    if (textBytes < sizeof(FPDF_WCHAR)) continue;
+                    const size_t bufferLength = textBytes / sizeof(FPDF_WCHAR);
+                    std::vector<FPDF_WCHAR> buffer(bufferLength);
+                    FPDFTextObj_GetText(candidate, textPage, buffer.data(), textBytes);
+                    const jsize actualLength = static_cast<jsize>(bufferLength - 1);
+                    if (actualLength != expectedLength ||
+                        !std::equal(expectedChars, expectedChars + expectedLength, buffer.begin())) {
+                        continue;
+                    }
+                    textObject = candidate;
+                    actualLeft = candidateLeft;
+                    actualBottom = candidateBottom;
+                    actualRight = candidateRight;
+                    actualTop = candidateTop;
+                    isTextObject = true;
+                    textMatches = true;
+                    LOGE(
+                            "PDF_EDIT_NATIVE recovered text target page=%d object=%d by bounds/text",
+                            pageIndex,
+                            objectIndex);
+                    break;
+                }
+            }
+            if (expectedChars) env->ReleaseStringChars(expectedText, expectedChars);
+            if (textPage) FPDFText_ClosePage(textPage);
         }
 
         // Object index plus complete original text is the stable validation. Character-derived
@@ -16742,9 +17252,42 @@ static bool ApplyNativeTextContentEdits(
                      (forceReplacementFont ||
                       (!sourceFontSupportsReplacement &&
                        TextEditNeedsCompatibleFont(env, expectedText, replacementText)))));
-            const bool hasVisualReflow = (encodedVisualLineEndChars &&
-                    strchr(encodedVisualLineEndChars, ',') != nullptr) ||
-                    (encodedVisualLineYOffsetChars && *encodedVisualLineYOffsetChars);
+            const bool hasMultipleVisualLines = encodedVisualLineEndChars &&
+                    strchr(encodedVisualLineEndChars, ',') != nullptr;
+            auto firstFiniteOffset = [](const char* encoded, float* value) -> bool {
+                if (!encoded || !*encoded || !value) return false;
+                char* end = nullptr;
+                const float parsed = strtof(encoded, &end);
+                if (!end || end == encoded || !std::isfinite(parsed)) return false;
+                *value = parsed;
+                return true;
+            };
+            auto containsNonZeroOffset = [](const char* encoded) -> bool {
+                if (!encoded || !*encoded) return false;
+                std::stringstream stream(encoded);
+                std::string token;
+                while (std::getline(stream, token, ',')) {
+                    char* end = nullptr;
+                    const float value = strtof(token.c_str(), &end);
+                    if (!end || end == token.c_str() || !std::isfinite(value)) return true;
+                    if (fabsf(value) > 0.0001f) return true;
+                }
+                return false;
+            };
+            float sourceLineOffset = 0.0f;
+            float requestedLineOffset = 0.0f;
+            const bool hasSourceLineOffset = firstFiniteOffset(
+                    encodedAdvanceChars,
+                    &sourceLineOffset);
+            const bool hasRequestedLineOffset = firstFiniteOffset(
+                    encodedVisualLineOffsetChars,
+                    &requestedLineOffset);
+            const bool hasHorizontalReflow = hasRequestedLineOffset &&
+                    (!hasSourceLineOffset ||
+                     fabsf(requestedLineOffset - sourceLineOffset) > 0.0001f);
+            const bool hasVisualReflow = hasMultipleVisualLines ||
+                    hasHorizontalReflow ||
+                    containsNonZeroOffset(encodedVisualLineYOffsetChars);
             bool usedCompatibleFontObject = false;
             bool stylesAppliedPerRun = false;
             std::vector<StyledTextEditObject> liveStyleObjects;
@@ -16758,7 +17301,9 @@ static bool ApplyNativeTextContentEdits(
                 pendingMarkedTextRemovals.emplace_back(pageIndex, removalMark);
                 applied = FPDFPage_GenerateContent(page) != 0;
             } else if (hasCharacterStyleChanges || hasVisualReflow) {
-                const std::string runMarkPrefix = "LufickTextEditPreview_" +
+                const std::string runMarkPrefix = (usesProvidedPage
+                        ? "LufickTextEditPreview_"
+                        : "LufickTextEditFinal_") +
                         std::to_string(pageIndex) + "_" + std::to_string(objectIndex) + "_";
                 if (usesProvidedPage) RemoveTextEditPreviewObjects(page, runMarkPrefix);
                 applied = CreateStyledTextEditObjects(
@@ -16952,6 +17497,23 @@ static bool ApplyNativeTextContentEdits(
                     applied = FPDFText_SetText(
                             textObject,
                             reinterpret_cast<FPDF_WIDESTRING>(replacement.data())) != 0;
+                    if (applied && !usesProvidedPage) {
+                        bool positionRestoreAttempted = false;
+                        const bool positionsRestored = RestoreTextEditCharacterPositions(
+                                env,
+                                textObject,
+                                expectedText,
+                                replacementText,
+                                encodedAdvanceChars,
+                                &positionRestoreAttempted);
+                        if (positionRestoreAttempted && !positionsRestored) {
+                            LOGE(
+                                    "PDF_EDIT_NATIVE failed to restore TJ positions page=%d object=%d",
+                                    pageIndex,
+                                    objectIndex);
+                            applied = false;
+                        }
+                    }
                 }
                 if (applied && !usedPositionedPreview) {
                     liveStyleObjects.emplace_back(
@@ -17058,6 +17620,61 @@ static bool ApplyNativeTextContentEdits(
                                 decorationOrdinal++);
                         decorationStart = decorationEnd;
                     }
+                } else if (replacementLength > 0 && !liveStyleObjects.empty()) {
+                    // Final saves do not have the live preview decoration objects to update.
+                    // Create the same underline/strikeout paths alongside the replacement
+                    // text objects so the persisted PDF matches the live editor appearance.
+                    const std::string finalDecorationMarkPrefix =
+                            "LufickTextEditFinalDecoration_" +
+                            std::to_string(pageIndex) + "_" + std::to_string(objectIndex) + "_";
+                    RemoveTextEditPreviewObjects(page, finalDecorationMarkPrefix);
+                    int decorationOrdinal = 0;
+                    size_t decorationStart = 0;
+                    const unsigned int originalDecorationColor =
+                            ((textA & 0xFFu) << 24u) | ((textR & 0xFFu) << 16u) |
+                            ((textG & 0xFFu) << 8u) | (textB & 0xFFu);
+                    auto decorationColorForFinalStyle =
+                            [&](const TextEditCharacterStyle& style) {
+                                return style.hasColor ? style.color : originalDecorationColor;
+                            };
+                    while (decorationStart < liveStyleObjects.size()) {
+                        const TextEditCharacterStyle& style =
+                                liveStyleObjects[decorationStart].style;
+                        if (!style.underline && !style.strikeout) {
+                            ++decorationStart;
+                            continue;
+                        }
+                        const unsigned int decorationColor =
+                                decorationColorForFinalStyle(style);
+                        size_t decorationEnd = decorationStart + 1;
+                        while (decorationEnd < liveStyleObjects.size()) {
+                            const TextEditCharacterStyle& nextStyle =
+                                    liveStyleObjects[decorationEnd].style;
+                            if (nextStyle.underline != style.underline ||
+                                nextStyle.strikeout != style.strikeout ||
+                                decorationColorForFinalStyle(nextStyle) != decorationColor) {
+                                break;
+                            }
+                            ++decorationEnd;
+                        }
+                        std::vector<FPDF_PAGEOBJECT> decorationObjects;
+                        decorationObjects.reserve(decorationEnd - decorationStart);
+                        for (size_t index = decorationStart; index < decorationEnd; ++index) {
+                            decorationObjects.push_back(liveStyleObjects[index].object);
+                        }
+                        AppendTextEditLiveDecoration(
+                                page,
+                                decorationObjects,
+                                style.underline,
+                                style.strikeout,
+                                (decorationColor >> 16u) & 0xFFu,
+                                (decorationColor >> 8u) & 0xFFu,
+                                decorationColor & 0xFFu,
+                                (decorationColor >> 24u) & 0xFFu,
+                                finalDecorationMarkPrefix,
+                                decorationOrdinal++);
+                        decorationStart = decorationEnd;
+                    }
                 }
 
                 if (!usesProvidedPage) {
@@ -17067,7 +17684,32 @@ static bool ApplyNativeTextContentEdits(
         }
 
         if (!applied) {
-            LOGE("PDF_EDIT_NATIVE text edit rejected page=%d object=%d", pageIndex, objectIndex);
+            const jsize expectedLengthForLog = expectedText
+                    ? env->GetStringLength(expectedText) : -1;
+            const jsize replacementLengthForLog = replacementText
+                    ? env->GetStringLength(replacementText) : -1;
+            LOGE(
+                    "PDF_EDIT_NATIVE text edit rejected page=%d object=%d ordinalInRange=%d "
+                    "candidateCount=%d isText=%d textMatches=%d hasBounds=%d "
+                    "expectedLen=%d replacementLen=%d actualBounds=[%.2f,%.2f,%.2f,%.2f] "
+                    "expectedBounds=[%.2f,%.2f,%.2f,%.2f]",
+                    pageIndex,
+                    objectIndex,
+                    ordinalInRange ? 1 : 0,
+                    static_cast<int>(editableTextObjects.size()),
+                    isTextObject ? 1 : 0,
+                    textMatches ? 1 : 0,
+                    hasBounds ? 1 : 0,
+                    expectedLengthForLog,
+                    replacementLengthForLog,
+                    actualLeft,
+                    actualBottom,
+                    actualRight,
+                    actualTop,
+                    expectedLeft,
+                    expectedBottom,
+                    expectedRight,
+                    expectedTop);
             allApplied = false;
         }
         if (expectedText) env->DeleteLocalRef(expectedText);
@@ -17150,9 +17792,107 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeSavePdfEdit
     const char* outputPath = env->GetStringUTFChars(outputPath_, 0);
     LOGE("PDF_EDIT_NATIVE nativeSavePdfEditObjects start input=%s output=%s array=%p", inputPath, outputPath, editObjectsArray);
 
-    FPDF_DOCUMENT doc = FPDF_LoadDocument(inputPath, nullptr);
+    std::set<int> textEditPageIndexes;
+    if (textContentUpdatesArray) {
+        jclass textEditClass = env->FindClass(
+                "com/cv/lufick/compose_editor/data_class/PdfTextEditNative");
+        jfieldID textEditPageField = textEditClass
+                ? env->GetFieldID(textEditClass, "pageIndex", "I")
+                : nullptr;
+        if (textEditClass && textEditPageField) {
+            const jsize textEditCount = env->GetArrayLength(textContentUpdatesArray);
+            for (jsize index = 0; index < textEditCount; ++index) {
+                jobject textEdit = env->GetObjectArrayElement(textContentUpdatesArray, index);
+                if (!textEdit) continue;
+                const int pageIndex = env->GetIntField(textEdit, textEditPageField);
+                if (pageIndex >= 0) textEditPageIndexes.insert(pageIndex);
+                env->DeleteLocalRef(textEdit);
+            }
+        }
+        if (textEditClass) env->DeleteLocalRef(textEditClass);
+        if (env->ExceptionCheck()) {
+            env->ExceptionClear();
+            textEditPageIndexes.clear();
+            LOGE("PDF_EDIT_NATIVE q/Q workaround skipped: unable to inspect text edit pages");
+        }
+    }
+
+    const std::string wrappedInputPath = std::string(outputPath) + ".pdfium_qstate_input.pdf";
+    const std::string normalizedInputPath =
+            std::string(outputPath) + ".pdfium_qstate_normalized.pdf";
+    bool usingWrappedInput = false;
+    std::set<int> forceRgbPageIndexes;
+    std::set<int> protectedTransparencyPageIndexes;
+    const bool reusingWrappedInput = !textEditPageIndexes.empty() &&
+            PdfFileHasPdfiumGraphicsStateWrapperMarker(inputPath);
+    if (reusingWrappedInput) {
+        LOGE("PDF_EDIT_NATIVE q/Q workaround reusing existing wrapped input");
+    } else if (!textEditPageIndexes.empty()) {
+        ::remove(wrappedInputPath.c_str());
+        ::remove(normalizedInputPath.c_str());
+        usingWrappedInput = PreparePdfiumGraphicsStateWrappedInput(
+                inputPath,
+                wrappedInputPath.c_str(),
+                textEditPageIndexes,
+                &forceRgbPageIndexes,
+                &protectedTransparencyPageIndexes);
+        if (!usingWrappedInput &&
+            SavePdfiumUnmodifiedCopy(inputPath, normalizedInputPath.c_str())) {
+            LOGE("PDF_EDIT_NATIVE q/Q workaround retrying with normalized PDFium copy");
+            usingWrappedInput = PreparePdfiumGraphicsStateWrappedInput(
+                    normalizedInputPath.c_str(),
+                    wrappedInputPath.c_str(),
+                    textEditPageIndexes,
+                    &forceRgbPageIndexes,
+                    &protectedTransparencyPageIndexes);
+        }
+        ::remove(normalizedInputPath.c_str());
+        LOGE(
+                "PDF_EDIT_NATIVE q/Q workaround pages=%d applied=%d",
+                static_cast<int>(textEditPageIndexes.size()),
+                usingWrappedInput ? 1 : 0);
+    }
+
+    const char* pdfiumInputPath = usingWrappedInput ? wrappedInputPath.c_str() : inputPath;
+    const std::string rawPatchedInputPath =
+            std::string(outputPath) + ".pdfium_text_stream_input.pdf";
+    bool usingRawPatchedInput = false;
+    std::set<std::pair<int, int>> rawPatchedTextEdits;
+    // Keep the experimental original-stream glyph patcher available for
+    // further work, but do not connect it to production saves. It changes the
+    // page's text-object structure and can break live editing in unrelated PDFs.
+    constexpr bool kEnableOriginalStreamGlyphPatching = false;
+    if (kEnableOriginalStreamGlyphPatching && textContentUpdatesArray) {
+        ::remove(rawPatchedInputPath.c_str());
+        if (CopyFileBinary(pdfiumInputPath, rawPatchedInputPath.c_str())) {
+            rawPatchedTextEdits = PatchEligibleTextEditsInOriginalStreams(
+                    env,
+                    rawPatchedInputPath.c_str(),
+                    textContentUpdatesArray);
+            usingRawPatchedInput = !rawPatchedTextEdits.empty() &&
+                    ValidateOriginalStreamTextPatches(
+                            env,
+                            rawPatchedInputPath.c_str(),
+                            textContentUpdatesArray,
+                            rawPatchedTextEdits);
+            if (usingRawPatchedInput) {
+                pdfiumInputPath = rawPatchedInputPath.c_str();
+            } else {
+                rawPatchedTextEdits.clear();
+                ::remove(rawPatchedInputPath.c_str());
+            }
+        }
+        LOGE(
+                "PDF_EDIT_NATIVE original-stream text patch applied=%d",
+                static_cast<int>(rawPatchedTextEdits.size()));
+    } else if (textContentUpdatesArray) {
+        LOGE("PDF_EDIT_NATIVE original-stream glyph patch disconnected");
+    }
+    FPDF_DOCUMENT doc = FPDF_LoadDocument(pdfiumInputPath, nullptr);
     if (!doc) {
-        LOGE("PDF_EDIT_NATIVE nativeSavePdfEditObjects failed: FPDF_LoadDocument input=%s", inputPath);
+        LOGE("PDF_EDIT_NATIVE nativeSavePdfEditObjects failed: FPDF_LoadDocument input=%s", pdfiumInputPath);
+        if (usingWrappedInput) ::remove(wrappedInputPath.c_str());
+        if (usingRawPatchedInput) ::remove(rawPatchedInputPath.c_str());
         env->ReleaseStringUTFChars(inputPath_, inputPath);
         env->ReleaseStringUTFChars(outputPath_, outputPath);
         return JNI_FALSE;
@@ -17190,8 +17930,20 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeSavePdfEdit
             FPDF_GetPageCount(doc),
             editObjectCount
     );
-    if (!ApplyNativeTextContentEdits(env, doc, textContentUpdatesArray, nullptr, -1, true)) {
+    if (!ApplyNativeTextContentEdits(
+            env,
+            doc,
+            textContentUpdatesArray,
+            nullptr,
+            -1,
+            true,
+            false,
+            &forceRgbPageIndexes,
+            &protectedTransparencyPageIndexes,
+            &rawPatchedTextEdits)) {
         FPDF_CloseDocument(doc);
+        if (usingWrappedInput) ::remove(wrappedInputPath.c_str());
+        if (usingRawPatchedInput) ::remove(rawPatchedInputPath.c_str());
         env->ReleaseStringUTFChars(inputPath_, inputPath);
         env->ReleaseStringUTFChars(outputPath_, outputPath);
         return JNI_FALSE;
@@ -17201,6 +17953,7 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeSavePdfEdit
 
     FPDF_PAGE currentPage = nullptr;
     int lastPageIndex = -1;
+    bool needsShapeDictionaryPatch = false;
 
     for (int i = 0; i < editObjectCount; i++) {
         jobject obj = env->GetObjectArrayElement(editObjectsArray, i);
@@ -17391,6 +18144,7 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeSavePdfEdit
                  i, pageIndex, savedImageContent ? 1 : 0, FPDFPage_CountObjects(currentPage));
         } else if (IsPdfShapeNativeType(typeInt)) {
             const bool savedShapeContent = processPdfShapeContent(env, obj, currentPage, rect, typeInt, dataPropsField, r, g, b, alpha, jsonClass, jsonInit);
+            needsShapeDictionaryPatch = needsShapeDictionaryPatch || savedShapeContent;
             LOGE("PDF_EDIT_NATIVE nativeSavePdfEditObjects processPdfShapeContent index=%d page=%d type=%d success=%d afterObjects=%d",
                  i, pageIndex, typeInt, savedShapeContent ? 1 : 0, FPDFPage_CountObjects(currentPage));
         } else {
@@ -17436,21 +18190,50 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeSavePdfEdit
     }
 
     FILE* file = fopen(outputPath, "wb");
+    const auto nativeSaveStart = std::chrono::steady_clock::now();
     LOGE("PDF_EDIT_NATIVE nativeSavePdfEditObjects open output file success=%d output=%s", file ? 1 : 0, outputPath);
     PdfFileWriter writer{ {1, WriteBlock}, file };
     int success = (file) ? FPDF_SaveAsCopy(doc, (FPDF_FILEWRITE*)&writer, FPDF_NO_INCREMENTAL) : JNI_FALSE;
     if (file) fclose(file);
-    LOGE("PDF_EDIT_NATIVE nativeSavePdfEditObjects FPDF_SaveAsCopy success=%d", success);
-    if (success && !PatchSavedPdfShapeNativeDictionaries(outputPath)) {
+    LOGE(
+            "PDF_EDIT_NATIVE nativeSavePdfEditObjects FPDF_SaveAsCopy success=%d elapsedMs=%lld",
+            success,
+            static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - nativeSaveStart).count()));
+    const auto postProcessStart = std::chrono::steady_clock::now();
+    if (success && needsShapeDictionaryPatch &&
+        !PatchSavedPdfShapeNativeDictionaries(outputPath)) {
         LOGE("PDF_EDIT_NATIVE nativeSavePdfEditObjects PatchSavedPdfShapeNativeDictionaries failed");
         success = JNI_FALSE;
     }
-    if (success && !AppendPdfEditContentMarker(outputPath)) {
-        LOGE("PDF_EDIT_NATIVE nativeSavePdfEditObjects AppendPdfEditContentMarker failed");
+    const auto shapePatchEnd = std::chrono::steady_clock::now();
+    LOGE(
+            "PDF_EDIT_NATIVE nativeSavePdfEditObjects shape post-process required=%d elapsedMs=%lld",
+            needsShapeDictionaryPatch ? 1 : 0,
+            static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                    shapePatchEnd - postProcessStart).count()));
+    if (success && !AppendPdfEditSaveMarkers(
+            outputPath,
+            usingWrappedInput || reusingWrappedInput)) {
+        LOGE("PDF_EDIT_NATIVE nativeSavePdfEditObjects marker append failed");
         success = JNI_FALSE;
     }
+    const auto markerEnd = std::chrono::steady_clock::now();
+    LOGE(
+            "PDF_EDIT_NATIVE nativeSavePdfEditObjects marker post-process elapsedMs=%lld",
+            static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                    markerEnd - shapePatchEnd).count()));
 
     FPDF_CloseDocument(doc);
+    const auto closeDocumentEnd = std::chrono::steady_clock::now();
+    LOGE(
+            "PDF_EDIT_NATIVE nativeSavePdfEditObjects close document elapsedMs=%lld totalPostMs=%lld",
+            static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                    closeDocumentEnd - markerEnd).count()),
+            static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                    closeDocumentEnd - postProcessStart).count()));
+    if (usingWrappedInput) ::remove(wrappedInputPath.c_str());
+    if (usingRawPatchedInput) ::remove(rawPatchedInputPath.c_str());
     env->ReleaseStringUTFChars(inputPath_, inputPath);
     env->ReleaseStringUTFChars(outputPath_, outputPath);
     LOGE("PDF_EDIT_NATIVE nativeSavePdfEditObjects finish success=%d", success ? 1 : 0);
@@ -17777,6 +18560,855 @@ static bool NativeWrapPageContentsWithMatrix(
     );
     *outBody = std::move(body);
     return true;
+}
+
+static bool NativeCollectColorSpaceRefsFromResources(
+        const std::string& resourcesBody,
+        const std::vector<PdfObjectInfo>& objects,
+        std::set<std::pair<int, int>>* refs,
+        std::map<std::pair<int, int>, std::set<std::string>>* namesByRef
+) {
+    if (!refs || !namesByRef) return false;
+    size_t dictStart = 0;
+    size_t dictEnd = 0;
+    if (!FindTopLevelPdfDictionary(resourcesBody, &dictStart, &dictEnd)) return false;
+
+    auto collectNamedRefs = [&](size_t start, size_t end) {
+        NativeCollectIndirectRefsInRange(resourcesBody, start, end, refs);
+        size_t cursor = start;
+        while (cursor < end) {
+            const size_t slash = resourcesBody.find('/', cursor);
+            if (slash == std::string::npos || slash >= end) break;
+            size_t nameEnd = slash + 1;
+            while (nameEnd < end) {
+                const unsigned char ch = static_cast<unsigned char>(resourcesBody[nameEnd]);
+                if (std::isspace(ch) || strchr("()<>[]{}/%", ch)) break;
+                ++nameEnd;
+            }
+            if (nameEnd == slash + 1) {
+                cursor = slash + 1;
+                continue;
+            }
+            size_t valueStart = nameEnd;
+            while (valueStart < end &&
+                   std::isspace(static_cast<unsigned char>(resourcesBody[valueStart]))) {
+                ++valueStart;
+            }
+            int objectNumber = 0;
+            int generation = 0;
+            size_t valueEnd = valueStart;
+            if (ParseIndirectReferenceAt(
+                    resourcesBody,
+                    valueStart,
+                    end,
+                    &objectNumber,
+                    &generation,
+                    &valueEnd)) {
+                (*namesByRef)[{objectNumber, generation}].insert(
+                        resourcesBody.substr(slash + 1, nameEnd - slash - 1));
+            }
+            cursor = nameEnd;
+        }
+    };
+
+    size_t colorSpaceStart = 0;
+    size_t colorSpaceEnd = 0;
+    if (FindDirectDictionaryValue(
+            resourcesBody,
+            dictStart,
+            dictEnd,
+            "ColorSpace",
+            &colorSpaceStart,
+            &colorSpaceEnd)) {
+        collectNamedRefs(colorSpaceStart, colorSpaceEnd);
+        return true;
+    }
+
+    int colorSpaceObjectNumber = 0;
+    int colorSpaceGeneration = 0;
+    size_t valueStart = 0;
+    size_t valueEnd = 0;
+    if (!FindIndirectReferenceValue(
+            resourcesBody,
+            dictStart,
+            dictEnd,
+            "ColorSpace",
+            &colorSpaceObjectNumber,
+            &colorSpaceGeneration,
+            &valueStart,
+            &valueEnd)) {
+        return true;
+    }
+    const PdfObjectInfo* colorSpaceDictionary = FindPdfObjectInfoByRef(
+            objects, colorSpaceObjectNumber, colorSpaceGeneration);
+    if (!colorSpaceDictionary) return false;
+    size_t colorDictStart = 0;
+    size_t colorDictEnd = 0;
+    if (!FindTopLevelPdfDictionary(
+            colorSpaceDictionary->body, &colorDictStart, &colorDictEnd)) {
+        return false;
+    }
+    NativeCollectIndirectRefsInRange(
+            colorSpaceDictionary->body, colorDictStart, colorDictEnd, refs);
+    size_t cursor = colorDictStart;
+    while (cursor < colorDictEnd) {
+        const size_t slash = colorSpaceDictionary->body.find('/', cursor);
+        if (slash == std::string::npos || slash >= colorDictEnd) break;
+        size_t nameEnd = slash + 1;
+        while (nameEnd < colorDictEnd) {
+            const unsigned char ch = static_cast<unsigned char>(
+                    colorSpaceDictionary->body[nameEnd]);
+            if (std::isspace(ch) || strchr("()<>[]{}/%", ch)) break;
+            ++nameEnd;
+        }
+        size_t valueStart = nameEnd;
+        while (valueStart < colorDictEnd &&
+               std::isspace(static_cast<unsigned char>(
+                       colorSpaceDictionary->body[valueStart]))) {
+            ++valueStart;
+        }
+        int objectNumber = 0;
+        int generation = 0;
+        size_t referenceEnd = valueStart;
+        if (nameEnd > slash + 1 && ParseIndirectReferenceAt(
+                colorSpaceDictionary->body,
+                valueStart,
+                colorDictEnd,
+                &objectNumber,
+                &generation,
+                &referenceEnd)) {
+            (*namesByRef)[{objectNumber, generation}].insert(
+                    colorSpaceDictionary->body.substr(
+                            slash + 1, nameEnd - slash - 1));
+        }
+        cursor = std::max(nameEnd, slash + 1);
+    }
+    return true;
+}
+
+static bool NativeCollectPageColorSpaceRefs(
+        const std::string& pageBody,
+        const std::vector<PdfObjectInfo>& objects,
+        std::set<std::pair<int, int>>* refs,
+        std::map<std::pair<int, int>, std::set<std::string>>* namesByRef,
+        int depth = 0
+) {
+    if (!refs || !namesByRef || depth > 32) return false;
+    size_t dictStart = 0;
+    size_t dictEnd = 0;
+    if (!FindTopLevelPdfDictionary(pageBody, &dictStart, &dictEnd)) return false;
+
+    size_t resourcesStart = 0;
+    size_t resourcesEnd = 0;
+    if (FindDirectDictionaryValue(
+            pageBody, dictStart, dictEnd, "Resources", &resourcesStart, &resourcesEnd)) {
+        return NativeCollectColorSpaceRefsFromResources(
+                pageBody.substr(resourcesStart, resourcesEnd - resourcesStart),
+                objects,
+                refs,
+                namesByRef);
+    }
+
+    int resourcesObjectNumber = 0;
+    int resourcesGeneration = 0;
+    size_t valueStart = 0;
+    size_t valueEnd = 0;
+    if (FindIndirectReferenceValue(
+            pageBody,
+            dictStart,
+            dictEnd,
+            "Resources",
+            &resourcesObjectNumber,
+            &resourcesGeneration,
+            &valueStart,
+            &valueEnd)) {
+        const PdfObjectInfo* resourcesObject = FindPdfObjectInfoByRef(
+                objects, resourcesObjectNumber, resourcesGeneration);
+        return resourcesObject && NativeCollectColorSpaceRefsFromResources(
+                resourcesObject->body, objects, refs, namesByRef);
+    }
+
+    int parentObjectNumber = 0;
+    int parentGeneration = 0;
+    if (!FindIndirectReferenceValue(
+            pageBody,
+            dictStart,
+            dictEnd,
+            "Parent",
+            &parentObjectNumber,
+            &parentGeneration,
+            &valueStart,
+            &valueEnd)) {
+        return true;
+    }
+    const PdfObjectInfo* parentObject = FindPdfObjectInfoByRef(
+            objects, parentObjectNumber, parentGeneration);
+    return parentObject && NativeCollectPageColorSpaceRefs(
+            parentObject->body, objects, refs, namesByRef, depth + 1);
+}
+
+static bool NativeIsThreeChannelIccBasedColorSpace(
+        const PdfObjectInfo& colorSpaceObject,
+        const std::vector<PdfObjectInfo>& objects
+) {
+    const size_t iccBased = colorSpaceObject.body.find("/ICCBased");
+    if (iccBased == std::string::npos) return false;
+    size_t referenceStart = iccBased + strlen("/ICCBased");
+    while (referenceStart < colorSpaceObject.body.size() &&
+           std::isspace(static_cast<unsigned char>(colorSpaceObject.body[referenceStart]))) {
+        ++referenceStart;
+    }
+    int profileObjectNumber = 0;
+    int profileGeneration = 0;
+    size_t referenceEnd = referenceStart;
+    if (!ParseIndirectReferenceAt(
+            colorSpaceObject.body,
+            referenceStart,
+            colorSpaceObject.body.size(),
+            &profileObjectNumber,
+            &profileGeneration,
+            &referenceEnd)) {
+        return false;
+    }
+    const PdfObjectInfo* profileObject = FindPdfObjectInfoByRef(
+            objects, profileObjectNumber, profileGeneration);
+    if (!profileObject) return false;
+    size_t profileDictStart = 0;
+    size_t profileDictEnd = 0;
+    size_t componentsStart = 0;
+    size_t componentsEnd = 0;
+    if (!FindTopLevelPdfDictionary(
+            profileObject->body, &profileDictStart, &profileDictEnd) ||
+        !FindPdfDictionaryRawValueSegment(
+            profileObject->body,
+            profileDictStart,
+            profileDictEnd,
+            "N",
+            &componentsStart,
+            &componentsEnd)) {
+        return false;
+    }
+    const std::string components = profileObject->body.substr(
+            componentsStart, componentsEnd - componentsStart);
+    char* end = nullptr;
+    return std::strtol(components.c_str(), &end, 10) == 3 && end != components.c_str();
+}
+
+static bool NativeIsDeviceRgbColorSpace(const PdfObjectInfo& colorSpaceObject) {
+    size_t start = 0;
+    size_t end = colorSpaceObject.body.size();
+    while (start < end &&
+           std::isspace(static_cast<unsigned char>(colorSpaceObject.body[start]))) {
+        ++start;
+    }
+    while (end > start &&
+           std::isspace(static_cast<unsigned char>(colorSpaceObject.body[end - 1]))) {
+        --end;
+    }
+    return colorSpaceObject.body.compare(start, end - start, "/DeviceRGB") == 0;
+}
+
+static bool NativeResolvePageResourcesBody(
+        const std::string& pageBody,
+        const std::vector<PdfObjectInfo>& objects,
+        std::string* outResourcesBody,
+        int depth = 0) {
+    if (!outResourcesBody || depth > 32) return false;
+    size_t dictStart = 0;
+    size_t dictEnd = 0;
+    if (!FindTopLevelPdfDictionary(pageBody, &dictStart, &dictEnd)) return false;
+
+    size_t resourcesStart = 0;
+    size_t resourcesEnd = 0;
+    if (FindDirectDictionaryValue(
+            pageBody, dictStart, dictEnd, "Resources", &resourcesStart, &resourcesEnd)) {
+        *outResourcesBody = pageBody.substr(
+                resourcesStart, resourcesEnd - resourcesStart);
+        return true;
+    }
+
+    int resourcesObjectNumber = 0;
+    int resourcesGeneration = 0;
+    size_t valueStart = 0;
+    size_t valueEnd = 0;
+    if (FindIndirectReferenceValue(
+            pageBody,
+            dictStart,
+            dictEnd,
+            "Resources",
+            &resourcesObjectNumber,
+            &resourcesGeneration,
+            &valueStart,
+            &valueEnd)) {
+        const PdfObjectInfo* resourcesObject = FindPdfObjectInfoByRef(
+                objects, resourcesObjectNumber, resourcesGeneration);
+        if (!resourcesObject) return false;
+        *outResourcesBody = resourcesObject->body;
+        return true;
+    }
+
+    int parentObjectNumber = 0;
+    int parentGeneration = 0;
+    if (!FindIndirectReferenceValue(
+            pageBody,
+            dictStart,
+            dictEnd,
+            "Parent",
+            &parentObjectNumber,
+            &parentGeneration,
+            &valueStart,
+            &valueEnd)) {
+        return false;
+    }
+    const PdfObjectInfo* parentObject = FindPdfObjectInfoByRef(
+            objects, parentObjectNumber, parentGeneration);
+    return parentObject && NativeResolvePageResourcesBody(
+            parentObject->body, objects, outResourcesBody, depth + 1);
+}
+
+static bool NativeCollectNamedResourceReferences(
+        const std::string& resourcesBody,
+        const std::vector<PdfObjectInfo>& objects,
+        const char* category,
+        std::map<std::string, std::pair<int, int>>* outReferences) {
+    if (!category || !outReferences) return false;
+    outReferences->clear();
+    size_t resourcesStart = 0;
+    size_t resourcesEnd = 0;
+    if (!FindTopLevelPdfDictionary(
+            resourcesBody, &resourcesStart, &resourcesEnd)) return false;
+
+    std::string categoryBody;
+    size_t categoryStart = 0;
+    size_t categoryEnd = 0;
+    if (FindDirectDictionaryValue(
+            resourcesBody,
+            resourcesStart,
+            resourcesEnd,
+            category,
+            &categoryStart,
+            &categoryEnd)) {
+        categoryBody = resourcesBody.substr(categoryStart, categoryEnd - categoryStart);
+    } else {
+        int categoryObjectNumber = 0;
+        int categoryGeneration = 0;
+        size_t valueStart = 0;
+        size_t valueEnd = 0;
+        if (!FindIndirectReferenceValue(
+                resourcesBody,
+                resourcesStart,
+                resourcesEnd,
+                category,
+                &categoryObjectNumber,
+                &categoryGeneration,
+                &valueStart,
+                &valueEnd)) {
+            return true;
+        }
+        const PdfObjectInfo* categoryObject = FindPdfObjectInfoByRef(
+                objects, categoryObjectNumber, categoryGeneration);
+        if (!categoryObject) return false;
+        categoryBody = categoryObject->body;
+    }
+
+    size_t dictionaryStart = 0;
+    size_t dictionaryEnd = 0;
+    if (!FindTopLevelPdfDictionary(
+            categoryBody, &dictionaryStart, &dictionaryEnd)) return false;
+    size_t cursor = dictionaryStart;
+    while (cursor < dictionaryEnd) {
+        const size_t slash = categoryBody.find('/', cursor);
+        if (slash == std::string::npos || slash >= dictionaryEnd) break;
+        size_t nameEnd = slash + 1;
+        while (nameEnd < dictionaryEnd) {
+            const unsigned char ch = static_cast<unsigned char>(categoryBody[nameEnd]);
+            if (std::isspace(ch) || strchr("()<>[]{}/%", ch)) break;
+            ++nameEnd;
+        }
+        size_t referenceStart = nameEnd;
+        while (referenceStart < dictionaryEnd &&
+               std::isspace(static_cast<unsigned char>(categoryBody[referenceStart]))) {
+            ++referenceStart;
+        }
+        int objectNumber = 0;
+        int generation = 0;
+        size_t referenceEnd = referenceStart;
+        if (nameEnd > slash + 1 && ParseIndirectReferenceAt(
+                categoryBody,
+                referenceStart,
+                dictionaryEnd,
+                &objectNumber,
+                &generation,
+                &referenceEnd)) {
+            (*outReferences)[categoryBody.substr(slash + 1, nameEnd - slash - 1)] =
+                    {objectNumber, generation};
+            cursor = referenceEnd;
+        } else {
+            cursor = std::max(nameEnd, slash + 1);
+        }
+    }
+    return true;
+}
+
+static bool NativeFindSingleSoftMaskGraphicsStateName(
+        const std::string& resourcesBody,
+        const std::vector<PdfObjectInfo>& objects,
+        std::string* outGraphicsStateName) {
+    if (!outGraphicsStateName) return false;
+    outGraphicsStateName->clear();
+    size_t resourcesStart = 0;
+    size_t resourcesEnd = 0;
+    if (!FindTopLevelPdfDictionary(
+            resourcesBody, &resourcesStart, &resourcesEnd)) return false;
+
+    std::string statesBody;
+    size_t statesStart = 0;
+    size_t statesEnd = 0;
+    if (FindDirectDictionaryValue(
+            resourcesBody,
+            resourcesStart,
+            resourcesEnd,
+            "ExtGState",
+            &statesStart,
+            &statesEnd)) {
+        statesBody = resourcesBody.substr(statesStart, statesEnd - statesStart);
+    } else {
+        int statesObjectNumber = 0;
+        int statesGeneration = 0;
+        size_t valueStart = 0;
+        size_t valueEnd = 0;
+        if (!FindIndirectReferenceValue(
+                resourcesBody,
+                resourcesStart,
+                resourcesEnd,
+                "ExtGState",
+                &statesObjectNumber,
+                &statesGeneration,
+                &valueStart,
+                &valueEnd)) {
+            return false;
+        }
+        const PdfObjectInfo* statesObject = FindPdfObjectInfoByRef(
+                objects, statesObjectNumber, statesGeneration);
+        if (!statesObject) return false;
+        statesBody = statesObject->body;
+    }
+
+    size_t dictionaryStart = 0;
+    size_t dictionaryEnd = 0;
+    if (!FindTopLevelPdfDictionary(
+            statesBody, &dictionaryStart, &dictionaryEnd)) return false;
+    std::vector<std::string> softMaskNames;
+    size_t cursor = dictionaryStart + 2;
+    while (cursor < dictionaryEnd) {
+        const size_t slash = statesBody.find('/', cursor);
+        if (slash == std::string::npos || slash >= dictionaryEnd) break;
+        size_t nameEnd = slash + 1;
+        while (nameEnd < dictionaryEnd) {
+            const unsigned char ch = static_cast<unsigned char>(statesBody[nameEnd]);
+            if (std::isspace(ch) || strchr("()<>[]{}/%", ch)) break;
+            ++nameEnd;
+        }
+        if (nameEnd == slash + 1) {
+            cursor = slash + 1;
+            continue;
+        }
+        const std::string stateName = statesBody.substr(
+                slash + 1, nameEnd - slash - 1);
+        size_t valueStart = nameEnd;
+        while (valueStart < dictionaryEnd &&
+               std::isspace(static_cast<unsigned char>(statesBody[valueStart]))) {
+            ++valueStart;
+        }
+
+        std::string stateBody;
+        size_t valueEnd = valueStart;
+        if (valueStart + 1 < dictionaryEnd &&
+            statesBody[valueStart] == '<' && statesBody[valueStart + 1] == '<') {
+            size_t directStart = 0;
+            if (!FindBalancedPdfDictionary(
+                    statesBody,
+                    valueStart,
+                    dictionaryEnd,
+                    &directStart,
+                    &valueEnd)) {
+                return false;
+            }
+            stateBody = statesBody.substr(directStart, valueEnd - directStart);
+        } else {
+            int objectNumber = 0;
+            int generation = 0;
+            if (!ParseIndirectReferenceAt(
+                    statesBody,
+                    valueStart,
+                    dictionaryEnd,
+                    &objectNumber,
+                    &generation,
+                    &valueEnd)) {
+                cursor = nameEnd;
+                continue;
+            }
+            const PdfObjectInfo* stateObject = FindPdfObjectInfoByRef(
+                    objects, objectNumber, generation);
+            if (!stateObject) {
+                cursor = valueEnd;
+                continue;
+            }
+            stateBody = stateObject->body;
+        }
+
+        std::string softMask;
+        if (ExtractPdfDictionaryRawValue(stateBody, "SMask", &softMask)) {
+            size_t softMaskStart = 0;
+            while (softMaskStart < softMask.size() &&
+                   std::isspace(static_cast<unsigned char>(softMask[softMaskStart]))) {
+                ++softMaskStart;
+            }
+            if (softMask.compare(softMaskStart, strlen("/None"), "/None") != 0) {
+                softMaskNames.push_back(stateName);
+            }
+        }
+        cursor = std::max(valueEnd, nameEnd);
+    }
+
+    if (softMaskNames.size() != 1) return false;
+    *outGraphicsStateName = softMaskNames.front();
+    return true;
+}
+
+static bool NativeFindSingleSoftMaskedTransparencyForm(
+        const std::string& pageBody,
+        const std::vector<PdfObjectInfo>& objects,
+        std::string* outFormName,
+        std::string* outGraphicsStateName) {
+    if (!outFormName || !outGraphicsStateName) return false;
+    outFormName->clear();
+    outGraphicsStateName->clear();
+
+    std::string resourcesBody;
+    if (!NativeResolvePageResourcesBody(pageBody, objects, &resourcesBody)) {
+        LOGE("PDF_EDIT_NATIVE transparency workaround: unable to resolve page resources");
+        return false;
+    }
+    std::map<std::string, std::pair<int, int>> xObjects;
+    if (!NativeCollectNamedResourceReferences(
+            resourcesBody, objects, "XObject", &xObjects)) {
+        LOGE("PDF_EDIT_NATIVE transparency workaround: unable to inspect XObjects");
+        return false;
+    }
+
+    std::vector<std::string> formXObjects;
+    for (const auto& namedObject : xObjects) {
+        const PdfObjectInfo* object = FindPdfObjectInfoByRef(
+                objects, namedObject.second.first, namedObject.second.second);
+        if (object && ContainsPdfNameValue(object->body, "Subtype", "Form")) {
+            formXObjects.push_back(namedObject.first);
+        }
+    }
+
+    std::string softMaskStateName;
+    const bool foundSoftMask = NativeFindSingleSoftMaskGraphicsStateName(
+            resourcesBody, objects, &softMaskStateName);
+    LOGE(
+            "PDF_EDIT_NATIVE transparency workaround candidates xobjects=%d forms=%d softMask=%d",
+            static_cast<int>(xObjects.size()),
+            static_cast<int>(formXObjects.size()),
+            foundSoftMask ? 1 : 0);
+    // The normalized resource dictionary may move the Form's /Group dictionary to another
+    // indirect object, so requiring the literal /Transparency token in the Form body is too
+    // strict. A unique Form paired with a unique soft-mask ExtGState is unambiguous.
+    if (formXObjects.size() != 1 || !foundSoftMask) return false;
+    *outFormName = formXObjects.front();
+    *outGraphicsStateName = softMaskStateName;
+    return true;
+}
+
+static bool NativePageHasSingleContentStream(
+        const std::string& pageBody,
+        const std::vector<PdfObjectInfo>& objects
+) {
+    size_t dictStart = 0;
+    size_t dictEnd = 0;
+    size_t valueStart = 0;
+    size_t valueEnd = 0;
+    if (!FindTopLevelPdfDictionary(pageBody, &dictStart, &dictEnd) ||
+        !FindPdfDictionaryRawValueSegment(
+                pageBody, dictStart, dictEnd, "Contents", &valueStart, &valueEnd)) {
+        return false;
+    }
+    if (pageBody[valueStart] == '[') {
+        std::set<std::pair<int, int>> contentRefs;
+        NativeCollectIndirectRefsInRange(pageBody, valueStart, valueEnd, &contentRefs);
+        return contentRefs.size() == 1;
+    }
+
+    int objectNumber = 0;
+    int generation = 0;
+    size_t referenceEnd = valueStart;
+    if (!ParseIndirectReferenceAt(
+            pageBody,
+            valueStart,
+            valueEnd,
+            &objectNumber,
+            &generation,
+            &referenceEnd)) {
+        return false;
+    }
+    const PdfObjectInfo* contentsObject = FindPdfObjectInfoByRef(
+            objects, objectNumber, generation);
+    if (!contentsObject) return false;
+    size_t bodyStart = 0;
+    while (bodyStart < contentsObject->body.size() &&
+           std::isspace(static_cast<unsigned char>(contentsObject->body[bodyStart]))) {
+        ++bodyStart;
+    }
+    if (bodyStart < contentsObject->body.size() &&
+        contentsObject->body[bodyStart] == '[') {
+        std::set<std::pair<int, int>> contentRefs;
+        NativeCollectIndirectRefsInRange(
+                contentsObject->body,
+                bodyStart,
+                contentsObject->body.size(),
+                &contentRefs);
+        return contentRefs.size() == 1;
+    }
+    return contentsObject->body.find("stream") != std::string::npos;
+}
+
+static bool PreparePdfiumGraphicsStateWrappedInput(
+        const char* inputPath,
+        const char* wrappedInputPath,
+        const std::set<int>& pageIndexes,
+        std::set<int>* forceRgbPageIndexes,
+        std::set<int>* protectedTransparencyPageIndexes
+) {
+    if (!inputPath || !wrappedInputPath || pageIndexes.empty()) return false;
+    if (forceRgbPageIndexes) forceRgbPageIndexes->clear();
+    if (protectedTransparencyPageIndexes) protectedTransparencyPageIndexes->clear();
+
+    std::string data;
+    if (!ReadFileToString(inputPath, &data)) {
+        LOGE("PDF_EDIT_NATIVE q/Q workaround failed: unable to read input");
+        return false;
+    }
+
+    // Appending plain incremental objects to an encrypted file would require applying the
+    // document's encryption handler to the new streams. Keep the original PDFium path for it.
+    std::string trailer;
+    std::string encryptedReference;
+    if (!ExtractLastTrailerDictionary(data, &trailer) ||
+        ExtractPdfDictionaryRawValue(trailer, "Encrypt", &encryptedReference)) {
+        LOGE("PDF_EDIT_NATIVE q/Q workaround skipped: unsupported or encrypted trailer");
+        return false;
+    }
+
+    const std::vector<PdfObjectInfo> objects = ScanPdfObjects(data);
+    const std::vector<PdfObjectInfo> latestObjects = BuildLatestPdfObjectsByRef(objects);
+    std::vector<PdfObjectInfo> pages = BuildPdfPageObjectsFromCatalog(data, latestObjects);
+    if (pages.empty()) pages = BuildLatestPdfPageObjects(objects, latestObjects);
+    if (pages.empty()) {
+        LOGE("PDF_EDIT_NATIVE q/Q workaround failed: no page dictionaries");
+        return false;
+    }
+
+    int nextObjectNumber = GetMaxPdfObjectNumber(objects) + 1;
+    std::vector<PdfObjectReplacement> replacements;
+    std::set<std::pair<int, int>> colorSpaceRefs;
+    std::set<std::pair<int, int>> convertedColorSpaceRefs;
+    for (int pageIndex : pageIndexes) {
+        if (pageIndex < 0 || static_cast<size_t>(pageIndex) >= pages.size()) {
+            LOGE("PDF_EDIT_NATIVE q/Q workaround failed: invalid page=%d", pageIndex);
+            return false;
+        }
+
+        const int prefixObjectNumber = nextObjectNumber++;
+        const int suffixObjectNumber = nextObjectNumber++;
+        std::string pageBody = GetCurrentPdfObjectBody(pages[pageIndex], &replacements);
+        std::set<std::pair<int, int>> pageColorSpaceRefs;
+        std::map<std::pair<int, int>, std::set<std::string>> pageColorSpaceNames;
+        if (!NativeCollectPageColorSpaceRefs(
+                pageBody,
+                latestObjects,
+                &pageColorSpaceRefs,
+                &pageColorSpaceNames)) {
+            LOGE("PDF_EDIT_NATIVE color workaround failed: cannot inspect page=%d", pageIndex);
+            return false;
+        }
+        colorSpaceRefs.insert(pageColorSpaceRefs.begin(), pageColorSpaceRefs.end());
+        const bool hasSingleContentStream =
+                NativePageHasSingleContentStream(pageBody, latestObjects);
+        if (forceRgbPageIndexes && pageColorSpaceRefs.empty() &&
+            hasSingleContentStream) {
+            forceRgbPageIndexes->insert(pageIndex);
+        }
+
+        std::set<std::string> rgbColorSpaceNames;
+        for (const auto& colorSpaceRef : pageColorSpaceRefs) {
+            const PdfObjectInfo* colorSpaceObject = FindPdfObjectInfoByRef(
+                    latestObjects, colorSpaceRef.first, colorSpaceRef.second);
+            if (!colorSpaceObject) {
+                continue;
+            }
+            const bool isIccRgb = NativeIsThreeChannelIccBasedColorSpace(
+                    *colorSpaceObject, latestObjects);
+            if (!isIccRgb && !NativeIsDeviceRgbColorSpace(*colorSpaceObject)) {
+                continue;
+            }
+            if (isIccRgb) {
+                if (!UpsertPdfObjectReplacement(
+                        &replacements,
+                        colorSpaceObject->objectNumber,
+                        colorSpaceObject->generation,
+                        "/DeviceRGB")) {
+                    return false;
+                }
+                convertedColorSpaceRefs.insert(colorSpaceRef);
+            }
+            const auto names = pageColorSpaceNames.find(colorSpaceRef);
+            if (names != pageColorSpaceNames.end()) {
+                rgbColorSpaceNames.insert(names->second.begin(), names->second.end());
+            }
+        }
+        if (hasSingleContentStream) {
+            std::string transparencyFormName;
+            std::string softMaskGraphicsStateName;
+            const bool preserveTransparency =
+                    NativeFindSingleSoftMaskedTransparencyForm(
+                            pageBody,
+                            latestObjects,
+                            &transparencyFormName,
+                            &softMaskGraphicsStateName);
+            if (!preserveTransparency) {
+                // A single stream cannot leak state into a sibling stream. Avoid adding q/Q
+                // unless an object with a soft-mask dependency must be protected.
+                LOGE("PDF_EDIT_NATIVE q/Q workaround skipped for single-stream page=%d", pageIndex);
+            } else {
+                if (!NativeWrapPageContentsWithMatrix(
+                        pageBody,
+                        latestObjects,
+                        &replacements,
+                        prefixObjectNumber,
+                        suffixObjectNumber,
+                        &pageBody)) {
+                    LOGE(
+                            "PDF_EDIT_NATIVE transparency workaround failed: cannot split page=%d",
+                            pageIndex);
+                    return false;
+                }
+                // Paint the protected soft-masked Form before the original stream. The fold
+                // face and label already occur after the original Form invocation, so they
+                // naturally remain above the shadow when the flattened duplicate is removed.
+                // The final q/Q pair still isolates the original stream's graphics state.
+                const std::string prefixStream =
+                        "q\n/" + softMaskGraphicsStateName + " gs\n/" +
+                        transparencyFormName + " Do\nQ\nq\n";
+                const std::string suffixStream = "Q\n";
+                replacements.push_back({
+                        prefixObjectNumber,
+                        0,
+                        "<< /Length " + std::to_string(prefixStream.size()) +
+                        " >>\nstream\n" + prefixStream + "endstream"
+                });
+                replacements.push_back({
+                        suffixObjectNumber,
+                        0,
+                        "<< /Length " + std::to_string(suffixStream.size()) +
+                        " >>\nstream\n" + suffixStream + "endstream"
+                });
+                if (protectedTransparencyPageIndexes) {
+                    protectedTransparencyPageIndexes->insert(pageIndex);
+                }
+                LOGE(
+                        "PDF_EDIT_NATIVE transparency workaround protected page=%d form=/%s state=/%s",
+                        pageIndex,
+                        transparencyFormName.c_str(),
+                        softMaskGraphicsStateName.c_str());
+            }
+        } else {
+            if (!NativeWrapPageContentsWithMatrix(
+                    pageBody,
+                    latestObjects,
+                    &replacements,
+                    prefixObjectNumber,
+                    suffixObjectNumber,
+                    &pageBody)) {
+                LOGE("PDF_EDIT_NATIVE q/Q workaround failed: cannot wrap page=%d", pageIndex);
+                return false;
+            }
+
+            std::string prefixStream;
+            // Original streams frequently select an ICC color space once and then rely on it
+            // across later stream boundaries. Regenerating the edited stream localizes that
+            // selection inside PDFium's q/Q, so later `scn`/`SCN` operators are interpreted as
+            // DeviceGray. Select RGB before saving the protective graphics state: continuation
+            // `Q` operators then restore to RGB instead of discarding the selection.
+            for (const std::string& colorSpaceName : rgbColorSpaceNames) {
+                prefixStream += "/" + colorSpaceName + " cs /" +
+                        colorSpaceName + " CS\n";
+            }
+            prefixStream += "q\n";
+            LOGE(
+                    "PDF_EDIT_NATIVE color workaround inherited RGB names=%d page=%d",
+                    static_cast<int>(rgbColorSpaceNames.size()),
+                    pageIndex);
+            replacements.push_back({
+                    prefixObjectNumber,
+                    0,
+                    "<< /Length " + std::to_string(prefixStream.size()) +
+                    " >>\nstream\n" + prefixStream + "endstream"
+            });
+            replacements.push_back({
+                    suffixObjectNumber,
+                    0,
+                    "<< /Length 2 >>\nstream\nQ\nendstream"
+            });
+        }
+        if (!UpsertPdfObjectReplacement(
+                &replacements,
+                pages[pageIndex].objectNumber,
+                pages[pageIndex].generation,
+                pageBody)) {
+            LOGE("PDF_EDIT_NATIVE q/Q workaround failed: cannot update page=%d", pageIndex);
+            return false;
+        }
+    }
+
+    LOGE(
+            "PDF_EDIT_NATIVE color workaround ICCBased-RGB converted=%d candidates=%d",
+            static_cast<int>(convertedColorSpaceRefs.size()),
+            static_cast<int>(colorSpaceRefs.size()));
+
+    if (!AppendIncrementalPdfObjectUpdates(&data, &replacements) ||
+        !WriteStringToFile(wrappedInputPath, data)) {
+        LOGE("PDF_EDIT_NATIVE q/Q workaround failed: cannot write wrapped input");
+        ::remove(wrappedInputPath);
+        return false;
+    }
+    return true;
+}
+
+static bool SavePdfiumUnmodifiedCopy(const char* inputPath, const char* outputPath) {
+    if (!inputPath || !outputPath) return false;
+    FPDF_DOCUMENT document = FPDF_LoadDocument(inputPath, nullptr);
+    if (!document) {
+        LOGE("PDF_EDIT_NATIVE q/Q normalization failed: cannot load input");
+        return false;
+    }
+
+    FILE* file = fopen(outputPath, "wb");
+    PdfFileWriter writer{{1, WriteBlock}, file};
+    const bool saved = file &&
+            FPDF_SaveAsCopy(
+                    document,
+                    reinterpret_cast<FPDF_FILEWRITE*>(&writer),
+                    FPDF_NO_INCREMENTAL) != 0;
+    if (file) fclose(file);
+    FPDF_CloseDocument(document);
+    if (!saved) {
+        ::remove(outputPath);
+        LOGE("PDF_EDIT_NATIVE q/Q normalization failed: cannot save copy");
+    }
+    return saved;
 }
 
 static void NativeCollectIndirectRefsInRange(
