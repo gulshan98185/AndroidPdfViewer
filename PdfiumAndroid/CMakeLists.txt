@@ -69,5 +69,6 @@ target_link_libraries(
         -ljnigraphics
         android
         GLESv2
+        z  # zlib for pdfium test glyph patching
         ${log-lib}
 )
