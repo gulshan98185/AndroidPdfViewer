@@ -37,6 +37,8 @@ public class PdfiumCore {
 
     private native void nativeCloseDocument(long docPtr);
 
+    private native boolean nativeSaveDocumentWithoutSecurity(long docPtr, int fd);
+
     private native int nativeGetPageCount(long docPtr);
 
     private native long nativeLoadPage(long docPtr, int pageIndex);
@@ -288,6 +290,23 @@ public class PdfiumCore {
         }
 
         return document;
+    }
+
+    /**
+     * Save a copy of the document without PDF security settings.
+     * The destination descriptor remains owned by the caller.
+     */
+    public boolean saveDocumentWithoutSecurity(PdfDocument document, ParcelFileDescriptor destinationFd) {
+        if (document == null || destinationFd == null || document.mNativeDocPtr == 0) {
+            return false;
+        }
+        int fd = getNumFd(destinationFd);
+        if (fd < 0) {
+            return false;
+        }
+        synchronized (lock) {
+            return nativeSaveDocumentWithoutSecurity(document.mNativeDocPtr, fd);
+        }
     }
 
     /**

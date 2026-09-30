@@ -1628,6 +1628,43 @@ int WriteBlock(FPDF_FILEWRITE* pThis,
     return fwrite(data, 1, size, writer->file) == size;
 }
 
+JNI_FUNC(jboolean, PdfiumCore, nativeSaveDocumentWithoutSecurity)(JNI_ARGS,
+                                                                  jlong documentPtr,
+                                                                  jint outputFd) {
+    if (documentPtr == 0 || outputFd < 0) {
+        return JNI_FALSE;
+    }
+
+    const int duplicatedFd = dup(outputFd);
+    if (duplicatedFd < 0) {
+        return JNI_FALSE;
+    }
+
+    FILE* outputFile = fdopen(duplicatedFd, "wb");
+    if (!outputFile) {
+        close(duplicatedFd);
+        return JNI_FALSE;
+    }
+
+    DocumentFile* documentFile = reinterpret_cast<DocumentFile*>(documentPtr);
+    if (!documentFile->pdfDocument) {
+        fclose(outputFile);
+        return JNI_FALSE;
+    }
+    PdfFileWriter writer{{1, WriteBlock}, outputFile};
+    FPDF_BOOL saved = FPDF_SaveAsCopy(
+            documentFile->pdfDocument,
+            reinterpret_cast<FPDF_FILEWRITE*>(&writer),
+            FPDF_NO_INCREMENTAL | FPDF_REMOVE_SECURITY);
+    if (fflush(outputFile) != 0 || ferror(outputFile)) {
+        saved = false;
+    }
+    if (fclose(outputFile) != 0) {
+        saved = false;
+    }
+    return saved ? JNI_TRUE : JNI_FALSE;
+}
+
 // to convert the canvas coordinates top-left (pixels) into pdf coordinates bottom-left (points)
 JNIEXPORT jfloatArray JNICALL
 Java_com_shockwave_pdfium_PdfiumCore_nativeDeviceRectToPageRect(
