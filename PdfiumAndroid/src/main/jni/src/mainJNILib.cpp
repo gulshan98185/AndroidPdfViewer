@@ -13615,6 +13615,8 @@ static bool ApplyNativeAnnotationEditActions(
         float right;
         float bottom;
         float rotation;
+        float sourceRotation;
+        float sourceDisplayRotation;
         float baseWidth;
         float baseHeight;
         bool stretchToBounds;
@@ -13803,6 +13805,8 @@ static bool ApplyNativeAnnotationEditActions(
             const float objectRight = env->GetFloatField(obj, rightField);
             const float objectBottom = env->GetFloatField(obj, bottomField);
             float rotation = 0.0f;
+            float sourceRotation = NAN;
+            float sourceDisplayRotation = NAN;
             float baseWidth = fabsf(objectRight - objectLeft);
             float baseHeight = fabsf(objectTop - objectBottom);
             bool stretchToBounds = true;
@@ -13815,6 +13819,8 @@ static bool ApplyNativeAnnotationEditActions(
                 jobject imageJson = env->NewObject(jsonClass, jsonInit, imageProps);
                 if (imageJson) {
                     jstring rotationKey = env->NewStringUTF("rotation");
+                    jstring sourceRotationKey = env->NewStringUTF("sourceRotation");
+                    jstring sourceDisplayRotationKey = env->NewStringUTF("sourceDisplayRotation");
                     jstring baseWidthKey = env->NewStringUTF("baseWidth");
                     jstring baseHeightKey = env->NewStringUTF("baseHeight");
                     jstring stretchKey = env->NewStringUTF("stretchToBounds");
@@ -13823,6 +13829,10 @@ static bool ApplyNativeAnnotationEditActions(
                     jstring assetFormatKey = env->NewStringUTF("assetFormat");
                     rotation = static_cast<float>(env->CallDoubleMethod(
                             imageJson, jsonOptDouble, rotationKey, 0.0));
+                    sourceRotation = static_cast<float>(env->CallDoubleMethod(
+                            imageJson, jsonOptDouble, sourceRotationKey, NAN));
+                    sourceDisplayRotation = static_cast<float>(env->CallDoubleMethod(
+                            imageJson, jsonOptDouble, sourceDisplayRotationKey, NAN));
                     baseWidth = static_cast<float>(env->CallDoubleMethod(
                             imageJson, jsonOptDouble, baseWidthKey, static_cast<double>(baseWidth)));
                     baseHeight = static_cast<float>(env->CallDoubleMethod(
@@ -13870,6 +13880,8 @@ static bool ApplyNativeAnnotationEditActions(
                     env->DeleteLocalRef(stretchKey);
                     env->DeleteLocalRef(baseHeightKey);
                     env->DeleteLocalRef(baseWidthKey);
+                    env->DeleteLocalRef(sourceDisplayRotationKey);
+                    env->DeleteLocalRef(sourceRotationKey);
                     env->DeleteLocalRef(rotationKey);
                     env->DeleteLocalRef(imageJson);
                 }
@@ -13882,6 +13894,8 @@ static bool ApplyNativeAnnotationEditActions(
                 objectRight,
                 objectBottom,
                 rotation,
+                sourceRotation,
+                sourceDisplayRotation,
                 baseWidth,
                 baseHeight,
                 stretchToBounds,
@@ -14247,11 +14261,40 @@ static bool ApplyNativeAnnotationEditActions(
                         const float right = fmax(update.left, update.right);
                         const float bottom = fmin(update.top, update.bottom);
                         const float top = fmax(update.top, update.bottom);
-                        const double angleRadians = update.rotation * M_PI / 180.0;
+                        // Image rotation/base dimensions arrive in displayed-page coordinates.
+                        // Convert them back to PDF page coordinates before rebuilding the image
+                        // matrix. On pages with /Rotate 90 or 270, the page-space axes (and thus
+                        // the image's base dimensions) are swapped.
+                        const int pageRotation = FPDFPage_GetRotation(page);
+                        const bool swapsPageAxes = pageRotation == 1 || pageRotation == 3;
+                        double pageSpaceRotation;
+                        if (std::isfinite(update.sourceRotation) &&
+                            std::isfinite(update.sourceDisplayRotation)) {
+                            double rotationDelta =
+                                    static_cast<double>(update.rotation) -
+                                    static_cast<double>(update.sourceDisplayRotation);
+                            while (rotationDelta > 180.0) rotationDelta -= 360.0;
+                            while (rotationDelta < -180.0) rotationDelta += 360.0;
+                            pageSpaceRotation =
+                                    static_cast<double>(update.sourceRotation) + rotationDelta;
+                        } else {
+                            pageSpaceRotation =
+                                    static_cast<double>(update.rotation) +
+                                    (static_cast<double>(pageRotation) * 90.0);
+                        }
+                        const double angleRadians = pageSpaceRotation * M_PI / 180.0;
                         const double cosAngle = cos(angleRadians);
                         const double sinAngle = sin(angleRadians);
-                        const double safeBaseWidth = std::max(static_cast<double>(update.baseWidth), 1.0);
-                        const double safeBaseHeight = std::max(static_cast<double>(update.baseHeight), 1.0);
+                        const double safeBaseWidth = std::max(
+                                static_cast<double>(swapsPageAxes
+                                                    ? update.baseHeight
+                                                    : update.baseWidth),
+                                1.0);
+                        const double safeBaseHeight = std::max(
+                                static_cast<double>(swapsPageAxes
+                                                    ? update.baseWidth
+                                                    : update.baseHeight),
+                                1.0);
                         const double expandedWidth = safeBaseWidth * fabs(cosAngle) +
                                                      safeBaseHeight * fabs(sinAngle);
                         const double expandedHeight = safeBaseWidth * fabs(sinAngle) +
@@ -20792,6 +20835,63 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeReadFileAtt
     return result;
 }
 
+JNIEXPORT jbyteArray JNICALL
+Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeGetContentImageEncodedData(
+        JNIEnv* env,
+        jobject thiz,
+        jlong pagePtr,
+        jint objectIndex) {
+    FPDF_PAGE page = reinterpret_cast<FPDF_PAGE>(pagePtr);
+    if (!page || objectIndex < 0 || objectIndex >= FPDFPage_CountObjects(page)) return nullptr;
+
+    FPDF_PAGEOBJECT pageObject = FPDFPage_GetObject(page, objectIndex);
+    if (!pageObject || FPDFPageObj_GetType(pageObject) != FPDF_PAGEOBJ_IMAGE) return nullptr;
+
+    // Raw bytes are directly usable only for self-contained compressed image streams.
+    // Other PDF filters still use the existing rendered-bitmap fallback.
+    if (FPDFImageObj_GetImageFilterCount(pageObject) != 1) return nullptr;
+    const unsigned long filterLength = FPDFImageObj_GetImageFilter(pageObject, 0, nullptr, 0);
+    if (filterLength <= 1 || filterLength > 64) return nullptr;
+    std::vector<char> filter(filterLength, '\0');
+    FPDFImageObj_GetImageFilter(pageObject, 0, filter.data(), filterLength);
+    const std::string filterName(filter.data());
+    if (filterName != "DCTDecode") return nullptr;
+
+    const unsigned long dataLength = FPDFImageObj_GetImageDataRaw(pageObject, nullptr, 0);
+    constexpr unsigned long maxEncodedImageBytes = 64UL * 1024UL * 1024UL;
+    if (dataLength == 0 || dataLength > maxEncodedImageBytes ||
+        dataLength > static_cast<unsigned long>(INT_MAX)) {
+        return nullptr;
+    }
+    std::vector<uint8_t> data(dataLength);
+    const unsigned long actualLength =
+            FPDFImageObj_GetImageDataRaw(pageObject, data.data(), dataLength);
+    if (actualLength == 0 || actualLength > dataLength) return nullptr;
+
+    jbyteArray result = env->NewByteArray(static_cast<jsize>(actualLength));
+    if (!result) return nullptr;
+    env->SetByteArrayRegion(
+            result,
+            0,
+            static_cast<jsize>(actualLength),
+            reinterpret_cast<const jbyte*>(data.data()));
+    if (env->ExceptionCheck()) {
+        env->ExceptionClear();
+        env->DeleteLocalRef(result);
+        return nullptr;
+    }
+    return result;
+}
+
+JNIEXPORT jint JNICALL
+Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeGetPageRotationDegrees(
+        JNIEnv*,
+        jobject,
+        jlong pagePtr) {
+    FPDF_PAGE page = reinterpret_cast<FPDF_PAGE>(pagePtr);
+    return page ? FPDFPage_GetRotation(page) * 90 : 0;
+}
+
 JNIEXPORT jobjectArray JNICALL //todo main get annotation method
 Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeGetAnnotationsForPage(
         JNIEnv* env,
@@ -20802,15 +20902,16 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeGetAnnotati
         jint viewWidth,
         jint viewHeight,
         jboolean includeEditContent,
-        jboolean includeImageBitmaps) {
+        jboolean includeImageBitmaps,
+        jint targetImageSourceId) {
 
     FPDF_DOCUMENT doc = (FPDF_DOCUMENT) docPtr;
     FPDF_PAGE page = (FPDF_PAGE) pagePtr;
     if (!doc || !page) return nullptr;
 
-    FPDF_TEXTPAGE textPage = FPDFText_LoadPage(page);
+    FPDF_TEXTPAGE textPage = includeEditContent ? nullptr : FPDFText_LoadPage(page);
     int annotCount = FPDFPage_GetAnnotCount(page);
-    int charCount = FPDFText_CountChars(textPage);
+    int charCount = textPage ? FPDFText_CountChars(textPage) : 0;
 
     jclass annotClass = env->FindClass("com/cv/lufick/compose_editor/data_class/PdfAnnotationNative");
     jmethodID constructor = env->GetMethodID(
@@ -21449,6 +21550,7 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeGetAnnotati
     const float pageWidth = FPDF_GetPageWidthF(page);
     const float pageHeight = FPDF_GetPageHeightF(page);
     int objectCount = FPDFPage_CountObjects(page);
+    int imageOrdinal = 0;
     int formOrdinal = 0;
     int pathOrdinal = 0;
     for (int i = 0; includeEditContent && i < objectCount; i++) {
@@ -21482,7 +21584,12 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeGetAnnotati
 
             unsigned int r = 0, g = 0, b = 0, a = 255;
             FPDFPageObj_GetFillColor(pageObj, &r, &g, &b, &a);
-            unsigned long textLength = FPDFTextObj_GetText(pageObj, textPage, nullptr, 0);
+            if (!textPage) {
+                textPage = FPDFText_LoadPage(page);
+            }
+            unsigned long textLength = textPage
+                                       ? FPDFTextObj_GetText(pageObj, textPage, nullptr, 0)
+                                       : 0;
             std::string textValue;
             if (textLength > 0) {
                 std::vector<FPDF_WCHAR> textBuffer(textLength);
@@ -21545,6 +21652,7 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeGetAnnotati
         }
 
         if (pageObjectType == FPDF_PAGEOBJ_IMAGE) {
+            const int currentImageOrdinal = imageOrdinal++;
             float left = 0.0f, bottom = 0.0f, right = 0.0f, top = 0.0f;
             if (!FPDFPageObj_GetBounds(pageObj, &left, &bottom, &right, &top)) continue;
 
@@ -21586,23 +21694,31 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeGetAnnotati
             const bool hasImageMetadata = FPDFImageObj_GetImageMetadata(pageObj, page, &imageMetadata);
             const bool canExtractBitmap = !hasImageMetadata ||
                     static_cast<uint64_t>(imageMetadata.width) * static_cast<uint64_t>(imageMetadata.height) <= 16000000ULL;
-            FPDF_BITMAP imageBitmap = includeImageBitmaps && canExtractBitmap
-                                       ? FPDFImageObj_GetRenderedBitmap(doc, page, pageObj)
-                                       : nullptr;
-            if (!imageBitmap && includeImageBitmaps && canExtractBitmap) {
-                imageBitmap = FPDFImageObj_GetBitmap(pageObj);
+            const bool shouldExtractBitmap =
+                    includeImageBitmaps &&
+                    (targetImageSourceId >= 0
+                     ? targetImageSourceId == i
+                     : !includeEditContent);
+            FPDF_BITMAP imageBitmap = nullptr;
+            if (shouldExtractBitmap && canExtractBitmap) {
+                imageBitmap = FPDFImageObj_GetRenderedBitmap(doc, page, pageObj);
+                if (!imageBitmap) {
+                    imageBitmap = FPDFImageObj_GetBitmap(pageObj);
+                }
             }
             jobject androidBitmap = ConvertFPDFBitmapToAndroidBitmap(env, imageBitmap);
             if (imageBitmap) FPDFBitmap_Destroy(imageBitmap);
 
             double imageRotation = 0.0;
+            double imageSourceRotation = 0.0;
             double imageBaseWidth = deviceRight - deviceLeft;
             double imageBaseHeight = deviceBottom - deviceTop;
             unsigned int imageR = 255, imageG = 255, imageB = 255, imageAlpha = 255;
             FPDFPageObj_GetFillColor(pageObj, &imageR, &imageG, &imageB, &imageAlpha);
-            FS_MATRIX imageMatrix{};
-            if (FPDFPageObj_GetMatrix(pageObj, &imageMatrix)) {
-                imageRotation = atan2(
+            FS_MATRIX imageMatrix{1.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f};
+            const bool hasImageMatrix = FPDFPageObj_GetMatrix(pageObj, &imageMatrix);
+            if (hasImageMatrix) {
+                imageSourceRotation = atan2(
                         static_cast<double>(imageMatrix.b),
                         static_cast<double>(imageMatrix.a)
                 ) * 180.0 / M_PI;
@@ -21622,6 +21738,20 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeGetAnnotati
                         imageMatrix.e + imageMatrix.c,
                         imageMatrix.f + imageMatrix.d,
                         &heightX, &heightY);
+                // Derive rotation from the displayed width axis. FPDF_PageToDevice already
+                // accounts for the page's /Rotate value, while the raw object matrix does not.
+                // Store the inverse screen angle because the Kotlin overlay converts PDF's
+                // bottom-up rotation into Android's top-down coordinate system.
+                const double deviceWidthX = static_cast<double>(widthX - originX);
+                const double deviceWidthY = static_cast<double>(widthY - originY);
+                if (hypot(deviceWidthX, deviceWidthY) >= 0.5) {
+                    imageRotation = -atan2(deviceWidthY, deviceWidthX) * 180.0 / M_PI;
+                } else {
+                    imageRotation = atan2(
+                            static_cast<double>(imageMatrix.b),
+                            static_cast<double>(imageMatrix.a)
+                    ) * 180.0 / M_PI;
+                }
                 imageBaseWidth = std::max(
                         hypot(static_cast<double>(widthX - originX),
                               static_cast<double>(widthY - originY)),
@@ -21651,7 +21781,23 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeGetAnnotati
                        << "\"opacity\":" << (static_cast<double>(imageAlpha) / 255.0) << ","
                        << "\"baseWidth\":" << imageBaseWidth << ","
                        << "\"baseHeight\":" << imageBaseHeight << ","
-                       << "\"rotation\":" << imageRotation << "}";
+                       << "\"rotation\":" << imageRotation << ","
+                       << "\"sourceRotation\":" << imageSourceRotation << ","
+                       << "\"sourceDisplayRotation\":" << imageRotation << ","
+                       << "\"imageOrdinal\":" << currentImageOrdinal << ","
+                       << "\"sourceLeft\":" << std::min(left, right) << ","
+                       << "\"sourceBottom\":" << std::min(bottom, top) << ","
+                       << "\"sourceRight\":" << std::max(left, right) << ","
+                       << "\"sourceTop\":" << std::max(bottom, top);
+            if (hasImageMatrix) {
+                imageProps << ",\"matrixA\":" << imageMatrix.a
+                           << ",\"matrixB\":" << imageMatrix.b
+                           << ",\"matrixC\":" << imageMatrix.c
+                           << ",\"matrixD\":" << imageMatrix.d
+                           << ",\"matrixE\":" << imageMatrix.e
+                           << ",\"matrixF\":" << imageMatrix.f;
+            }
+            imageProps << "}";
             jstring jImageProps = env->NewStringUTF(imageProps.str().c_str());
             jstring jSimplePdfStampProps = nullptr;
             if (contentMetadata.kind == "preset_stamp" && contentMetadata.subtype == "pdf") {
@@ -22023,7 +22169,7 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeGetAnnotati
         env->DeleteLocalRef(tempCollector[i]);
     }
 
-    FPDFText_ClosePage(textPage);
+    if (textPage) FPDFText_ClosePage(textPage);
     return resultArray;
 }
 
