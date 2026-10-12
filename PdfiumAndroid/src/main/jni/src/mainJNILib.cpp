@@ -78,16 +78,22 @@ struct rgb {
     uint8_t blue;
 };
 
-class DocumentFile {
-private:
-    int fileFd;
 
+class DocumentFile {
 public:
+    int fileFd;
+    std::vector<unsigned char> sourceBytes;
+    std::map<std::pair<int, int>, std::vector<uint32_t>> sourceTextCharcodes;
+    std::map<std::pair<int, int>, std::vector<size_t>> sourceTextGlyphBoundaries;
+    std::map<std::pair<int, int>, FS_MATRIX> sourceIndicCompanionMatrices;
+    // Content marks may be shared by sibling source owners. Pointer identity is
+    // scoped to the open page, not to a mark appended to that shared list.
+    std::map<FPDF_PAGE, std::vector<FPDF_PAGEOBJECT>> liveIndicSourceOwners;
     FPDF_DOCUMENT pdfDocument = NULL;
     FPDF_FORMHANDLE gForm = nullptr;
     size_t fileSize;
 
-    DocumentFile() { initLibraryIfNeed(); }
+    DocumentFile() : fileFd(-1) { initLibraryIfNeed(); }
 
     ~DocumentFile();
 };
@@ -99,6 +105,7 @@ DocumentFile::~DocumentFile() {
         clearTextEditFontCache(pdfDocument);
         FPDF_CloseDocument(pdfDocument);
     }
+    if (fileFd >= 0) close(fileFd);
 
     destroyLibraryIfNeed();
 }
@@ -671,6 +678,8 @@ JNI_FUNC(jlong, PdfiumCore, nativeOpenDocument)(JNI_ARGS, jint fd, jstring passw
     }
 
     DocumentFile *docFile = new DocumentFile();
+    docFile->fileFd = dup(fd);
+    docFile->fileSize = fileLength;
 
     FPDF_FILEACCESS loader;
     loader.m_FileLen = fileLength;
@@ -724,6 +733,10 @@ JNI_FUNC(jlong, PdfiumCore, nativeOpenMemDocument)(JNI_ARGS, jbyteArray data, js
     int size = (int) env->GetArrayLength(data);
     jbyte *cDataCopy = new jbyte[size];
     memcpy(cDataCopy, cData, size);
+    docFile->sourceBytes.assign(
+            reinterpret_cast<unsigned char*>(cDataCopy),
+            reinterpret_cast<unsigned char*>(cDataCopy) + size);
+    docFile->fileSize = static_cast<size_t>(size);
     FPDF_DOCUMENT document = FPDF_LoadMemDocument(reinterpret_cast<const void *>(cDataCopy),
                                                   size, cpassword);
     env->ReleaseByteArrayElements(data, cData, JNI_ABORT);
@@ -775,6 +788,9 @@ static jlong loadPageInternal(JNIEnv *env, DocumentFile *doc, int pageIndex) {
             if (page == NULL) {
                 throw "Loaded page is null";
             }
+            // A reopened page must not reuse identities from an unloaded page
+            // that happened to receive the same native address.
+            doc->liveIndicSourceOwners.erase(page);
             return reinterpret_cast<jlong>(page);
         } else {
             throw "Get page pdf document null";
@@ -3746,6 +3762,13 @@ static bool ValidateOriginalStreamTextPatches(
         const char* pdfPath,
         jobjectArray textEditsArray,
         const std::set<std::pair<int, int>>& patchedEdits);
+static bool NativeLoadOriginalTextCharcodes(
+        DocumentFile* documentFile,
+        int pageIndex,
+        int textOrdinal,
+        const std::u16string& originalText,
+        std::vector<uint32_t>* outCharcodes,
+        std::vector<size_t>* outGlyphBoundaries);
 static bool PatchSavedPdfTextActualTextMarks(
         JNIEnv* env,
         const char* pdfPath,
@@ -15171,6 +15194,20 @@ static bool PageObjectHasMarkPrefix(
 // Live text previews keep the original PDFium text object and mark it with a
 // stable logical identity.  The editable-object ordinal is only a lookup hint:
 // adding/removing preview objects can change that ordinal between keystrokes.
+static FPDF_PAGEOBJECT FindObjectWithExactMark(
+        FPDF_PAGEOBJECT object, const std::string& expectedMarkName, int depth = 0) {
+    if (!object || depth > 32) return nullptr;
+    if (PageObjectHasExactMark(object, expectedMarkName)) return object;
+    if (FPDFPageObj_GetType(object) != FPDF_PAGEOBJ_FORM) return nullptr;
+    for (int i = 0; i < FPDFFormObj_CountObjects(object); ++i) {
+        FPDF_PAGEOBJECT match = FindObjectWithExactMark(
+                FPDFFormObj_GetObject(object, static_cast<unsigned long>(i)),
+                expectedMarkName, depth + 1);
+        if (match) return match;
+    }
+    return nullptr;
+}
+
 static FPDF_PAGEOBJECT FindPageObjectWithExactMark(
         FPDF_PAGE page,
         const std::string& expectedMarkName) {
@@ -15178,15 +15215,8 @@ static FPDF_PAGEOBJECT FindPageObjectWithExactMark(
     const int objectCount = FPDFPage_CountObjects(page);
     for (int objectIndex = 0; objectIndex < objectCount; ++objectIndex) {
         FPDF_PAGEOBJECT object = FPDFPage_GetObject(page, objectIndex);
-        if (!object) continue;
-        if (PageObjectHasExactMark(object, expectedMarkName)) return object;
-        if (FPDFPageObj_GetType(object) != FPDF_PAGEOBJ_FORM) continue;
-        const int childCount = FPDFFormObj_CountObjects(object);
-        for (int childIndex = 0; childIndex < childCount; ++childIndex) {
-            FPDF_PAGEOBJECT child = FPDFFormObj_GetObject(
-                    object, static_cast<unsigned long>(childIndex));
-            if (PageObjectHasExactMark(child, expectedMarkName)) return child;
-        }
+        FPDF_PAGEOBJECT match = FindObjectWithExactMark(object, expectedMarkName);
+        if (match) return match;
     }
     return nullptr;
 }
@@ -15716,6 +15746,59 @@ static bool RestoreTextEditCharacterPositions(
             characterPositions.size()) != 0;
 }
 
+// Keep deletion in the source font's encoded glyph space. SetPositions writes
+// the retained source advances as TJ spacing; SetText would instead re-encode
+// Hindi Unicode through a subset font and lose conjunct/matra glyphs.
+static bool ApplySourceGlyphDeletion(
+        FPDF_PAGEOBJECT object,
+        const std::u16string& original,
+        const std::u16string& replacement,
+        const std::vector<uint32_t>& codes,
+        const std::vector<size_t>& sourceBoundaries,
+        const char* encodedAdvances) {
+    if (!object || original.empty() || replacement.empty() ||
+        replacement.size() > original.size() || codes.empty() || !encodedAdvances) return false;
+    size_t prefix = 0;
+    while (prefix < replacement.size() && original[prefix] == replacement[prefix]) ++prefix;
+    const size_t removed = original.size() - replacement.size();
+    if (original.substr(prefix + removed) != replacement.substr(prefix)) return false;
+    std::vector<float> advances;
+    std::stringstream stream(encodedAdvances);
+    std::string token;
+    while (std::getline(stream, token, ',')) {
+        char* end = nullptr;
+        const float value = strtof(token.c_str(), &end);
+        if (end == token.c_str() || *end != '\0' || !std::isfinite(value)) return false;
+        advances.push_back(value);
+    }
+    if (advances.size() != original.size() + 1) return false;
+    // Generated spaces have no encoded glyph. Zero advance is not evidence
+    // of that: real matras can also have zero/negative advances.
+    const std::vector<size_t>& boundaries = sourceBoundaries;
+    if (boundaries.size() != original.size() + 1 || boundaries.back() != codes.size())
+        return false;
+    const size_t glyphStart = boundaries[prefix];
+    const size_t glyphEnd = boundaries[prefix + removed];
+    if (glyphStart > glyphEnd || glyphEnd > codes.size()) return false;
+    std::vector<uint32_t> retained;
+    std::vector<float> origins;
+    const float removedAdvance = advances[prefix + removed] - advances[prefix];
+    for (size_t i = 0; i < original.size(); ++i) {
+        for (size_t glyph = boundaries[i]; glyph < boundaries[i + 1]; ++glyph) {
+            if (glyph >= glyphStart && glyph < glyphEnd) continue;
+            retained.push_back(codes[glyph]);
+            origins.push_back(advances[i] - advances.front() -
+                (glyph >= glyphEnd ? removedAdvance : 0.0f));
+        }
+    }
+    if (retained.empty()) return false;
+    const float first = origins.front();
+    for (float& origin : origins) origin -= first;
+    if (!FPDFText_SetCharcodes(object, retained.data(), retained.size())) return false;
+    return retained.size() == 1 ||
+        FPDFText_SetPositions(object, origins.data() + 1, origins.size() - 1) != 0;
+}
+
 static FPDF_FONT LoadTextEditFallbackFont(
         FPDF_DOCUMENT doc,
         const char* fontPath,
@@ -15769,7 +15852,9 @@ static FPDF_PAGEOBJECT CreateTextEditRunObject(
         bool requestedItalic,
         float* outWidth,
         float fontSizeScale = 1.0f,
-        bool exactSourceFont = false) {
+        bool exactSourceFont = false,
+        const uint32_t* sourceCharcodes = nullptr,
+        size_t sourceCharcodeCount = 0) {
     if (!doc || !sourceObject || !font || text.empty()) return nullptr;
     float sourceFontSize = 12.0f;
     FPDFTextObj_GetFontSize(sourceObject, &sourceFontSize);
@@ -15779,9 +15864,20 @@ static FPDF_PAGEOBJECT CreateTextEditRunObject(
              : 1.0f);
     FPDF_PAGEOBJECT runObject = FPDFPageObj_CreateTextObj(doc, font, runFontSize);
     if (!runObject) return nullptr;
-    std::vector<unsigned short> utf16(text.begin(), text.end());
-    utf16.push_back(0);
-    if (!FPDFText_SetText(runObject, reinterpret_cast<FPDF_WIDESTRING>(utf16.data()))) {
+    bool textApplied = false;
+    if (sourceCharcodes && sourceCharcodeCount > 0) {
+        textApplied = FPDFText_SetCharcodes(
+                runObject,
+                sourceCharcodes,
+                sourceCharcodeCount) != 0;
+    } else {
+        std::vector<unsigned short> utf16(text.begin(), text.end());
+        utf16.push_back(0);
+        textApplied = FPDFText_SetText(
+                runObject,
+                reinterpret_cast<FPDF_WIDESTRING>(utf16.data())) != 0;
+    }
+    if (!textApplied) {
         FPDFPageObj_Destroy(runObject);
         return nullptr;
     }
@@ -16167,6 +16263,72 @@ static std::vector<FPDF_PAGEOBJECT> CollectEditableTextObjects(FPDF_PAGE page) {
     return textObjects;
 }
 
+// ActualText can describe several painted owners while PDFium assigns all its
+// Unicode to the first one. Keep the unextractable glyph owners in that SAME
+// contiguous marked span attached to its geometry, without re-encoding any CID.
+static bool TransformIndicActualTextCompanions(
+        DocumentFile* documentFile, FPDF_PAGE page, int pageIndex,
+        FPDF_PAGEOBJECT owner, const FS_MATRIX& sourceMatrix) {
+    if (!documentFile || !page || !owner) return false;
+    auto actualText = [](FPDF_PAGEOBJECT object) {
+        std::string value;
+        const int count = FPDFPageObj_CountMarks(object);
+        for (int i = 0; i < count; ++i) {
+            value = ReadPageObjectMarkUtf8(FPDFPageObj_GetMark(object, i), "ActualText");
+            if (!value.empty()) break;
+        }
+        return value;
+    };
+    const std::string span = actualText(owner);
+    if (span.empty()) return true;
+    const auto objects = CollectEditableTextObjects(page);
+    const auto found = std::find(objects.begin(), objects.end(), owner);
+    if (found == objects.end()) return false;
+    const size_t ownerIndex = static_cast<size_t>(found - objects.begin());
+    size_t start = ownerIndex, end = ownerIndex + 1;
+    while (start > 0 && actualText(objects[start - 1]) == span) --start;
+    while (end < objects.size() && actualText(objects[end]) == span) ++end;
+    if (end - start == 1) return true;
+    FS_MATRIX current{};
+    if (!FPDFPageObj_GetMatrix(owner, &current)) return false;
+    const double determinant = static_cast<double>(sourceMatrix.a) * sourceMatrix.d -
+            static_cast<double>(sourceMatrix.b) * sourceMatrix.c;
+    if (std::fabs(determinant) <= 1e-12) return false;
+    const double a = (current.a * sourceMatrix.d - current.c * sourceMatrix.b) / determinant;
+    const double b = (current.b * sourceMatrix.d - current.d * sourceMatrix.b) / determinant;
+    const double c = (current.c * sourceMatrix.a - current.a * sourceMatrix.c) / determinant;
+    const double d = (current.d * sourceMatrix.a - current.b * sourceMatrix.c) / determinant;
+    const double e = current.e - a * sourceMatrix.e - c * sourceMatrix.f;
+    const double f = current.f - b * sourceMatrix.e - d * sourceMatrix.f;
+    FPDF_TEXTPAGE textPage = FPDFText_LoadPage(page);
+    if (!textPage) return false;
+    bool applied = true;
+    for (size_t i = start; i < end; ++i) {
+        if (i == ownerIndex) continue;
+        // Extractable neighbours already have their own edit payload. Only
+        // transform the glyph-only companion, so no owner is moved twice.
+        if (FPDFTextObj_GetText(objects[i], textPage, nullptr, 0) > sizeof(FPDF_WCHAR)) continue;
+        const auto key = std::make_pair(pageIndex, static_cast<int>(i));
+        auto cached = documentFile->sourceIndicCompanionMatrices.find(key);
+        if (cached == documentFile->sourceIndicCompanionMatrices.end()) {
+            FS_MATRIX original{};
+            if (!FPDFPageObj_GetMatrix(objects[i], &original)) { applied = false; break; }
+            cached = documentFile->sourceIndicCompanionMatrices.emplace(key, original).first;
+        }
+        const FS_MATRIX& original = cached->second;
+        FS_MATRIX transformed = {
+                static_cast<float>(a * original.a + c * original.b),
+                static_cast<float>(b * original.a + d * original.b),
+                static_cast<float>(a * original.c + c * original.d),
+                static_cast<float>(b * original.c + d * original.d),
+                static_cast<float>(a * original.e + c * original.f + e),
+                static_cast<float>(b * original.e + d * original.f + f)};
+        if (!FPDFPageObj_SetMatrix(objects[i], &transformed)) { applied = false; break; }
+    }
+    FPDFText_ClosePage(textPage);
+    return applied;
+}
+
 static std::string TextEditFontName(FPDF_FONT font) {
     if (!font) return "";
     const size_t length = FPDFFont_GetBaseFontName(font, nullptr, 0);
@@ -16364,6 +16526,7 @@ static bool CreateStyledTextEditObjects(
         const char* encodedStyles,
         const char* encodedFontRuns,
         const char* encodedAdvances,
+        const std::vector<uint32_t>* originalCharcodes,
         bool emitOriginalStreamGlyphMarks,
         const std::string& markPrefix,
         std::vector<StyledTextEditObject>* outObjects) {
@@ -16376,6 +16539,13 @@ static bool CreateStyledTextEditObjects(
     }
     const jsize originalLength = originalText ? env->GetStringLength(originalText) : 0;
     const jchar* originalChars = originalText ? env->GetStringChars(originalText, nullptr) : nullptr;
+    const bool hasIndicText = std::any_of(
+            replacementChars,
+            replacementChars + replacementLength,
+            [](jchar value) {
+                return (value >= 0x0900 && value <= 0x0DFF) ||
+                       (value >= 0xA8E0 && value <= 0xA8FF);
+            });
     size_t prefixLength = 0;
     while (originalChars && prefixLength < static_cast<size_t>(originalLength) &&
            prefixLength < static_cast<size_t>(replacementLength) &&
@@ -16488,6 +16658,33 @@ static bool CreateStyledTextEditObjects(
         env->ReleaseStringChars(replacementText, replacementChars);
         return false;
     }
+    // InDesign and similar producers can expose several Unicode code units through one
+    // encoded glyph by using /ActualText.  The extracted cursor advances repeat inside such
+    // a cluster, so use advance transitions to map safe Unicode boundaries back to the exact
+    // source-charcode boundaries.  This lets resize/reflow split at word/grapheme boundaries
+    // without assuming one encoded glyph per UTF-16 unit.
+    std::vector<size_t> originalGlyphBoundaries;
+    const bool unchangedSourceText = originalLength == replacementLength &&
+            std::equal(originalChars, originalChars + originalLength, replacementChars);
+    if (originalCharcodes && unchangedSourceText && !originalCharcodes->empty()) {
+        originalGlyphBoundaries.resize(static_cast<size_t>(originalLength) + 1, 0);
+        if (originalCharcodes->size() == static_cast<size_t>(originalLength)) {
+            for (size_t index = 0; index < originalGlyphBoundaries.size(); ++index) {
+                originalGlyphBoundaries[index] = index;
+            }
+        } else {
+            size_t glyphBoundary = 0;
+            for (size_t index = 1; index < originalGlyphBoundaries.size(); ++index) {
+                if (std::fabs(positions[index] - positions[index - 1]) > 0.0001f) {
+                    ++glyphBoundary;
+                }
+                originalGlyphBoundaries[index] = glyphBoundary;
+            }
+            if (glyphBoundary != originalCharcodes->size()) {
+                originalGlyphBoundaries.clear();
+            }
+        }
+    }
     const size_t originalSuffixStart = static_cast<size_t>(originalLength) - suffixLength;
     const size_t changedEnd = static_cast<size_t>(replacementLength) - suffixLength;
     const float baseAdvance = positions.front();
@@ -16529,6 +16726,18 @@ static bool CreateStyledTextEditObjects(
                 reinterpret_cast<const char16_t*>(replacementChars + runStart),
                 runEnd - runStart);
         float runWidth = 0.0f;
+        const bool canReuseOriginalCharcodes = originalCharcodes &&
+                !originalGlyphBoundaries.empty() &&
+                originalLength == replacementLength &&
+                font == originalFont &&
+                runEnd < originalGlyphBoundaries.size();
+        const size_t sourceGlyphStart = canReuseOriginalCharcodes
+                ? originalGlyphBoundaries[runStart] : 0;
+        const size_t sourceGlyphEnd = canReuseOriginalCharcodes
+                ? originalGlyphBoundaries[runEnd] : 0;
+        if (canReuseOriginalCharcodes && sourceGlyphEnd <= sourceGlyphStart) {
+            return -1.0f;
+        }
         FPDF_PAGEOBJECT runObject = CreateTextEditRunObject(
                 doc,
                 sourceObject,
@@ -16539,13 +16748,19 @@ static bool CreateStyledTextEditObjects(
                 runStyle.italic,
                 &runWidth,
                 runStyle.sizeScale,
-                isSourceFamilyFont(font));
+                isSourceFamilyFont(font),
+                canReuseOriginalCharcodes
+                        ? originalCharcodes->data() + sourceGlyphStart : nullptr,
+                canReuseOriginalCharcodes ? sourceGlyphEnd - sourceGlyphStart : 0);
         if (!runObject) {
             for (const StyledTextEditObject& created : *outObjects) {
                 if (FPDFPage_RemoveObject(page, created.object)) FPDFPageObj_Destroy(created.object);
             }
             outObjects->clear();
             return -1.0f;
+        }
+        if (canReuseOriginalCharcodes && runEnd < positions.size()) {
+            runWidth = (positions[runEnd] - positions[runStart]) * runStyle.sizeScale;
         }
         if (runStyle.hasColor) {
             const unsigned int runR = (runStyle.color >> 16u) & 0xFFu;
@@ -16654,7 +16869,9 @@ static bool CreateStyledTextEditObjects(
     bool success = true;
     const bool textChanged = originalLength != replacementLength ||
             !std::equal(originalChars, originalChars + originalLength, replacementChars);
-    if (visualLineEnds.size() > 1 || (encodedVisualLineYOffsets && *encodedVisualLineYOffsets)) {
+    if (visualLineEnds.size() > 1 ||
+        (encodedVisualLineYOffsets && *encodedVisualLineYOffsets) ||
+        (preserveOriginalGlyphAdvances && hasIndicText && !visualLineEnds.empty())) {
         std::vector<float> lineOffsets;
         std::vector<float> lineYOffsets;
         if (encodedVisualLineYOffsets && *encodedVisualLineYOffsets) {
@@ -17115,6 +17332,7 @@ static int RemoveRegeneratedDuplicateTransparencyForm(FPDF_PAGE page) {
 static bool ApplyNativeTextContentEdits(
         JNIEnv* env,
         FPDF_DOCUMENT doc,
+        DocumentFile* sourceDocumentFile,
         jobjectArray textEditsArray,
         FPDF_PAGE providedPage,
         int providedPageIndex,
@@ -17130,6 +17348,7 @@ static bool ApplyNativeTextContentEdits(
     if (!editClass) return false;
     jfieldID pageField = env->GetFieldID(editClass, "pageIndex", "I");
     jfieldID objectField = env->GetFieldID(editClass, "objectIndex", "I");
+    jfieldID ordinalField = env->GetFieldID(editClass, "textObjectOrdinal", "I");
     jfieldID originalTextField = env->GetFieldID(editClass, "originalText", "Ljava/lang/String;");
     jfieldID leftField = env->GetFieldID(editClass, "left", "F");
     jfieldID bottomField = env->GetFieldID(editClass, "bottom", "F");
@@ -17248,16 +17467,44 @@ static bool ApplyNativeTextContentEdits(
         // Once a live preview exists, resolve the source by its mark before
         // consulting the ordinal.  This prevents a newly-created preview text
         // object (or a removed object) from shifting the target to a neighbor.
-        FPDF_PAGEOBJECT textObject = usesProvidedPage
-                ? FindPageObjectWithExactMark(page, liveSourceMark)
-                : nullptr;
+        bool useIndicSourceIdentity = false;
+        if (usesProvidedPage && sourceDocumentFile) {
+            jstring original = static_cast<jstring>(env->GetObjectField(edit, originalTextField));
+            if (original) {
+                const jchar* chars = env->GetStringChars(original, nullptr);
+                if (chars) {
+                    const jsize length = env->GetStringLength(original);
+                    useIndicSourceIdentity = std::any_of(chars, chars + length, [](jchar c) {
+                        return (c >= 0x0900 && c <= 0x0DFF) || (c >= 0xA8E0 && c <= 0xA8FF);
+                    });
+                    env->ReleaseStringChars(original, chars);
+                }
+                env->DeleteLocalRef(original);
+            }
+        }
+        FPDF_PAGEOBJECT textObject = nullptr;
+        if (useIndicSourceIdentity) {
+            auto cached = sourceDocumentFile->liveIndicSourceOwners.find(page);
+            if (cached == sourceDocumentFile->liveIndicSourceOwners.end()) {
+                cached = sourceDocumentFile->liveIndicSourceOwners.emplace(page, editableTextObjects).first;
+            }
+            if (objectIndex >= 0 && static_cast<size_t>(objectIndex) < cached->second.size()) {
+                const auto candidate = cached->second[static_cast<size_t>(objectIndex)];
+                // Never dereference a removed owner; fail instead of selecting
+                // another glyph by its shared mark or a shifted ordinal.
+                if (std::find(editableTextObjects.begin(), editableTextObjects.end(), candidate) !=
+                    editableTextObjects.end()) textObject = candidate;
+            }
+        } else if (usesProvidedPage) {
+            textObject = FindPageObjectWithExactMark(page, liveSourceMark);
+        }
         const bool ordinalInRange = objectIndex >= 0 &&
                 objectIndex < static_cast<int>(editableTextObjects.size());
         // A final save reopens the PDF, so PDFium may reorder or remove objects
         // without changing the edit payload's old ordinal.  Keep that payload
         // eligible for the validated text/bounds recovery below.  Live edits
         // still require a valid ordinal unless their marked source was found.
-        if (!textObject && (!page || (!ordinalInRange && !validateOriginalText))) {
+        if (!textObject && (useIndicSourceIdentity || !page || (!ordinalInRange && !validateOriginalText))) {
             if (page && !usesProvidedPage) FPDF_ClosePage(page);
             env->DeleteLocalRef(edit);
             allApplied = false;
@@ -17415,6 +17662,72 @@ static bool ApplyNativeTextContentEdits(
             const bool hasCharacterStyleChanges = env->GetBooleanField(
                     edit,
                     styleChangedField) == JNI_TRUE;
+            std::vector<uint32_t> originalCharcodes;
+            std::vector<size_t> originalGlyphBoundaries;
+            bool unchangedText = false;
+            bool hasIndicText = false;
+            std::u16string expectedUtf16;
+            std::u16string replacementUtf16;
+            if (expectedText && replacementText) {
+                const jsize expectedLength = env->GetStringLength(expectedText);
+                const jsize newLength = env->GetStringLength(replacementText);
+                const jchar* expectedChars = env->GetStringChars(expectedText, nullptr);
+                const jchar* newChars = env->GetStringChars(replacementText, nullptr);
+                if (expectedChars && newChars) {
+                    expectedUtf16.assign(
+                            reinterpret_cast<const char16_t*>(expectedChars),
+                            reinterpret_cast<const char16_t*>(expectedChars) + expectedLength);
+                    replacementUtf16.assign(
+                            reinterpret_cast<const char16_t*>(newChars),
+                            reinterpret_cast<const char16_t*>(newChars) + newLength);
+                    unchangedText = expectedLength == newLength &&
+                            std::equal(expectedChars, expectedChars + expectedLength, newChars);
+                    hasIndicText = std::any_of(
+                            expectedChars,
+                            expectedChars + expectedLength,
+                            [](jchar value) {
+                                return (value >= 0x0900 && value <= 0x0DFF) ||
+                                       (value >= 0xA8E0 && value <= 0xA8FF);
+                            });
+                }
+                if (expectedChars) env->ReleaseStringChars(expectedText, expectedChars);
+                if (newChars) env->ReleaseStringChars(replacementText, newChars);
+            }
+            std::vector<FPDF_PAGEOBJECT> priorIndicPreviewObjects;
+            if (usesProvidedPage && hasIndicText && unchangedText && !hasCharacterStyleChanges) {
+                const std::string prefix = "LufickTextEditPreview_" +
+                        std::to_string(pageIndex) + "_" + std::to_string(objectIndex) + "_";
+                FindTextEditPreviewObject(page, prefix, prefix + "none", &priorIndicPreviewObjects);
+            }
+            unsigned int ownerPaintR = 0, ownerPaintG = 0, ownerPaintB = 0, ownerPaintA = 0;
+            const bool ownerPaintVisible = FPDFPageObj_GetFillColor(
+                    textObject, &ownerPaintR, &ownerPaintG, &ownerPaintB, &ownerPaintA) && ownerPaintA > 0;
+            const bool pureIndicGeometry = usesProvidedPage && hasIndicText && unchangedText &&
+                    ownerPaintVisible &&
+                    !hasCharacterStyleChanges &&
+                    std::fabs(env->GetFloatField(edit, scaleXField) - 1.0f) <= 0.0001f &&
+                    env->GetBooleanField(edit, forceReplacementFontField) != JNI_TRUE &&
+                    (!encodedFontRunChars || !*encodedFontRunChars) &&
+                    (!encodedVisualLineEndChars || !*encodedVisualLineEndChars) &&
+                    (!encodedVisualLineOffsetChars || !*encodedVisualLineOffsetChars) &&
+                    (!encodedVisualLineYOffsetChars || !*encodedVisualLineYOffsetChars) &&
+                    priorIndicPreviewObjects.empty() &&
+                    !PageObjectHasExactMark(textObject, "LufickSourceGlyphDeletion");
+            // Translation and its identity/undo state do not need a Unicode-to-CID
+            // mapping. In particular, ActualText and generated whitespace need not
+            // have a one-to-one relationship with the source Tj/TJ glyphs.
+            const bool shouldLoadOriginalCharcodes = usesProvidedPage && !pureIndicGeometry &&
+                    (unchangedText || hasIndicText);
+            const bool needsPreciseIndicGlyphs = shouldLoadOriginalCharcodes && hasIndicText;
+            const bool hasOriginalSourceCharcodes = shouldLoadOriginalCharcodes &&
+                    NativeLoadOriginalTextCharcodes(
+                            sourceDocumentFile,
+                            pageIndex,
+                            env->GetIntField(edit, ordinalField),
+                            expectedUtf16,
+                            &originalCharcodes, &originalGlyphBoundaries);
+            const bool hasOneToOneIndicCharcodes = hasOriginalSourceCharcodes &&
+                    originalCharcodes.size() == expectedUtf16.size();
             const float requestedFontSize = env->GetFloatField(edit, fontSizeField);
             const int sourceFontWeight = env->GetIntField(edit, fontWeightField);
             const float sourceItalicAngle = env->GetFloatField(edit, italicAngleField);
@@ -17422,7 +17735,7 @@ static bool ApplyNativeTextContentEdits(
             const unsigned int textG = static_cast<unsigned int>(env->GetIntField(edit, greenField));
             const unsigned int textB = static_cast<unsigned int>(env->GetIntField(edit, blueField));
             const unsigned int textA = static_cast<unsigned int>(env->GetIntField(edit, alphaField));
-            if (resetAppearance) {
+            if (resetAppearance && !pureIndicGeometry) {
                 FS_MATRIX originalMatrix = {
                         env->GetFloatField(edit, matrixAField),
                         env->GetFloatField(edit, matrixBField),
@@ -17446,11 +17759,16 @@ static bool ApplyNativeTextContentEdits(
             const bool hasDefaultReplacementFont = replacementFontPathChars &&
                     strlen(replacementFontPathChars) > 0;
             const bool hasScriptFontRuns = encodedFontRunChars && *encodedFontRunChars;
+            // Geometry-only previews must retain the source font and its encoded glyphs.
+            // Complex-script detection is relevant only when text is actually replaced;
+            // applying it to unchanged Hindi text incorrectly routed a box move through the
+            // fallback-font/rebuild path, where ActualText clusters have fewer glyphs than
+            // UTF-16 units and some owners were rejected while their neighbours moved.
             const bool useCompatibleFont = replacementLength > 0 &&
-                    (hasScriptFontRuns || (hasDefaultReplacementFont &&
-                     (forceReplacementFont ||
-                      (!sourceFontSupportsReplacement &&
-                       TextEditNeedsCompatibleFont(env, expectedText, replacementText)))));
+                    (hasScriptFontRuns || forceReplacementFont ||
+                     (!unchangedText && hasDefaultReplacementFont &&
+                      !sourceFontSupportsReplacement &&
+                      TextEditNeedsCompatibleFont(env, expectedText, replacementText)));
             const bool hasMultipleVisualLines = encodedVisualLineEndChars &&
                     strchr(encodedVisualLineEndChars, ',') != nullptr;
             auto firstFiniteOffset = [](const char* encoded, float* value) -> bool {
@@ -17487,8 +17805,13 @@ static bool ApplyNativeTextContentEdits(
             const bool hasVisualReflow = hasMultipleVisualLines ||
                     hasHorizontalReflow ||
                     containsNonZeroOffset(encodedVisualLineYOffsetChars);
+            // PDFium reports zero alpha for some inherited/default text paints even though
+            // the source glyphs render normally. For a live page, treat that missing alpha as
+            // opaque so a preview hide can always be undone visibly; final-save payloads keep
+            // the original alpha value unchanged.
+            const unsigned int liveTextA = usesProvidedPage && textA == 0 ? 255u : textA;
             const uint32_t sourceStyleColor =
-                    ((textA & 0xFFu) << 24u) | ((textR & 0xFFu) << 16u) |
+                    ((liveTextA & 0xFFu) << 24u) | ((textR & 0xFFu) << 16u) |
                     ((textG & 0xFFu) << 8u) | (textB & 0xFFu);
             const TextEditCharacterStyle sourcePayloadStyle(
                     isBold,
@@ -17512,22 +17835,175 @@ static bool ApplyNativeTextContentEdits(
                             });
             const bool sourceIsBold = sourceFontWeight >= 600;
             const bool sourceIsItalic = fabsf(sourceItalicAngle) > 0.1f;
+            const float requestedScaleX = env->GetFloatField(edit, scaleXField);
+            const float requestedTranslateX = env->GetFloatField(edit, translateXField);
+            const float requestedTranslateY = env->GetFloatField(edit, translateYField);
+            const bool hasOuterGeometryTransform =
+                    std::fabs(requestedScaleX - 1.0f) > 0.0001f ||
+                    std::fabs(requestedTranslateX) > 0.0001f ||
+                    std::fabs(requestedTranslateY) > 0.0001f;
+            // A box drag carries the source line metadata unchanged plus one outer transform.
+            // It is not paragraph reflow and must never rebuild the source Tj/TJ owners.
+            const bool isLiveMoveOnly = usesProvidedPage && unchangedText &&
+                    !hasCharacterStyleChanges && !useCompatibleFont &&
+                    hasOuterGeometryTransform;
             const uint32_t uniformRequestedColor = hasUniformRequestedStyle &&
                     requestedStyles.front().hasColor
                     ? requestedStyles.front().color : sourceStyleColor;
+            const bool canApplyPreciseIndicStyleInPlace = needsPreciseIndicGlyphs &&
+                    hasCharacterStyleChanges && !hasVisualReflow && !useCompatibleFont &&
+                    hasUniformRequestedStyle;
             const bool canApplyUniformStyleInPlace = hasCharacterStyleChanges &&
                     !hasVisualReflow && !useCompatibleFont &&
                     hasUniformRequestedStyle &&
-                    std::fabs(requestedStyles.front().sizeScale - 1.0f) <= 0.0001f &&
+                    (std::fabs(requestedStyles.front().sizeScale - 1.0f) <= 0.0001f ||
+                     canApplyPreciseIndicStyleInPlace) &&
                     ((uniformRequestedColor >> 24u) & 0xFFu) == 0xFFu &&
                     // Removing a native bold/italic font face needs a different font object.
                     // Adding either style can be simulated on the retained source object.
                     (!sourceIsBold || requestedStyles.front().bold) &&
                     (!sourceIsItalic || requestedStyles.front().italic);
+            const bool isLiveIdentityRestore = usesProvidedPage && unchangedText &&
+                    !hasCharacterStyleChanges && !useCompatibleFont &&
+                    !hasOuterGeometryTransform && !hasVisualReflow;
+            const bool canRetainLiveGeometryOwner = usesProvidedPage && unchangedText &&
+                    !hasCharacterStyleChanges && !useCompatibleFont &&
+                    (isLiveIdentityRestore || isLiveMoveOnly ||
+                     (needsPreciseIndicGlyphs && hasOriginalSourceCharcodes &&
+                      !hasMultipleVisualLines));
+            const bool canReflowPreciseIndicGlyphs = usesProvidedPage && unchangedText &&
+                    needsPreciseIndicGlyphs && hasOriginalSourceCharcodes &&
+                    hasVisualReflow && !useCompatibleFont;
+            // An explicitly selected replacement font cannot reuse the source CID bytes, but
+            // it is still a valid edit: CreateStyledTextEditObjects will emit the complete
+            // owner with the requested font runs. Do not reject that owner merely because its
+            // original /ActualText cluster has fewer encoded glyphs than UTF-16 units.
+            const bool canUseExplicitIndicReplacementFont = hasCharacterStyleChanges &&
+                    useCompatibleFont && (forceReplacementFont || hasScriptFontRuns);
+            const bool sourceIndicDeletion = usesProvidedPage && hasIndicText && !unchangedText &&
+                    !hasCharacterStyleChanges && !forceReplacementFont &&
+                    replacementLength < static_cast<jsize>(expectedUtf16.size());
+            if (isLiveIdentityRestore) {
+                // A prior font/style preview may have hidden this source owner and inserted
+                // marked styled runs. Restoring the original state must remove those runs for
+                // every script, including non-Indic owners that do not enter the precise
+                // Indic geometry branch below.
+                RemoveTextEditPreviewObjects(
+                        page,
+                        "LufickTextEditPreview_" + std::to_string(pageIndex) + "_" +
+                                std::to_string(objectIndex) + "_");
+            }
+            if (needsPreciseIndicGlyphs && !hasOneToOneIndicCharcodes &&
+                !canApplyPreciseIndicStyleInPlace && !canRetainLiveGeometryOwner &&
+                !canReflowPreciseIndicGlyphs && !canUseExplicitIndicReplacementFont &&
+                !sourceIndicDeletion) {
+                LOGE(
+                        "PDF_EDIT_NATIVE precise live Tj/TJ glyph mapping unavailable page=%d object=%d",
+                        pageIndex,
+                        objectIndex);
+                applied = false;
+            }
             bool usedCompatibleFontObject = false;
             bool stylesAppliedPerRun = false;
             std::vector<StyledTextEditObject> liveStyleObjects;
-            if (replacementLength == 0 && !usesProvidedPage) {
+            if (!applied) {
+                // Never rebuild an Indic source owner from Unicode when its original Tj/TJ
+                // charcodes could not be resolved. Leaving it unchanged is the safe failure.
+            } else if (pureIndicGeometry) {
+                // Apply one absolute translation from the immutable source matrix.
+                // Do not reset/reflow/repaint the text or compose an incremental
+                // transform onto the matrix left by the previous drag attempt.
+                FS_MATRIX beforeMatrix{};
+                const bool hasBeforeMatrix = FPDFPageObj_GetMatrix(textObject, &beforeMatrix) != 0;
+                float beforeLeft = 0, beforeBottom = 0, beforeRight = 0, beforeTop = 0;
+                const bool hasBeforeBounds = FPDFPageObj_GetBounds(
+                        textObject, &beforeLeft, &beforeBottom, &beforeRight, &beforeTop) != 0;
+                FS_MATRIX translated = {
+                        env->GetFloatField(edit, matrixAField),
+                        env->GetFloatField(edit, matrixBField),
+                        env->GetFloatField(edit, matrixCField),
+                        env->GetFloatField(edit, matrixDField),
+                        env->GetFloatField(edit, matrixEField) + requestedTranslateX,
+                        env->GetFloatField(edit, matrixFField) + requestedTranslateY};
+                applied = FPDFPageObj_SetMatrix(textObject, &translated) != 0;
+                FS_MATRIX readback{};
+                const bool hasReadback = FPDFPageObj_GetMatrix(textObject, &readback) != 0;
+                float afterLeft = 0, afterBottom = 0, afterRight = 0, afterTop = 0;
+                const bool hasAfterBounds = FPDFPageObj_GetBounds(
+                        textObject, &afterLeft, &afterBottom, &afterRight, &afterTop) != 0;
+                if (hasBeforeMatrix && hasReadback && hasBeforeBounds && hasAfterBounds) {
+                    const float dx = translated.e - beforeMatrix.e;
+                    const float dy = translated.f - beforeMatrix.f;
+                    LOGE("PDF_EDIT_NATIVE Hindi move geometry readback page=%d owner=%d matrix=[%.4f,%.4f,%.4f,%.4f,%.4f,%.4f] before=[%.4f,%.4f,%.4f,%.4f] after=[%.4f,%.4f,%.4f,%.4f] boundsResidual=[%.4f,%.4f,%.4f,%.4f]",
+                         pageIndex, objectIndex, readback.a, readback.b, readback.c, readback.d,
+                         readback.e, readback.f, beforeLeft, beforeBottom, beforeRight, beforeTop,
+                         afterLeft, afterBottom, afterRight, afterTop,
+                         afterLeft - beforeLeft - dx, afterBottom - beforeBottom - dy,
+                         afterRight - beforeRight - dx, afterTop - beforeTop - dy);
+                } else {
+                    LOGE("PDF_EDIT_NATIVE Hindi move geometry readback unavailable page=%d owner=%d beforeMatrix=%d afterMatrix=%d beforeBounds=%d afterBounds=%d",
+                         pageIndex, objectIndex, hasBeforeMatrix, hasReadback, hasBeforeBounds, hasAfterBounds);
+                }
+                stylesAppliedPerRun = true;
+                liveStyleObjects.emplace_back(textObject, sourcePayloadStyle);
+                LOGE("PDF_EDIT_NATIVE Hindi matrix-only move page=%d owner=%d source=[%.4f,%.4f] delta=[%.4f,%.4f] result=[%.4f,%.4f] applied=%d",
+                     pageIndex, objectIndex, env->GetFloatField(edit, matrixEField),
+                     env->GetFloatField(edit, matrixFField), requestedTranslateX, requestedTranslateY,
+                     translated.e, translated.f, applied ? 1 : 0);
+            } else if (sourceIndicDeletion) {
+                RemoveTextEditPreviewObjects(page,
+                        "LufickTextEditPreview_" + std::to_string(pageIndex) + "_" +
+                        std::to_string(objectIndex) + "_");
+                bool singleBaseline = !hasMultipleVisualLines;
+                if (encodedVisualLineYOffsetChars && *encodedVisualLineYOffsetChars) {
+                    std::stringstream offsets(encodedVisualLineYOffsetChars);
+                    std::string token;
+                    float firstY = 0;
+                    bool firstOffset = true;
+                    singleBaseline = true;
+                    while (std::getline(offsets, token, ',')) {
+                        char* end = nullptr;
+                        const float y = strtof(token.c_str(), &end);
+                        if (end == token.c_str() || *end != '\0' || !std::isfinite(y) ||
+                            (!firstOffset && std::fabs(y - firstY) > 0.0001f)) {
+                            singleBaseline = false;
+                            break;
+                        }
+                        firstY = y;
+                        firstOffset = false;
+                    }
+                }
+                applied = replacementLength == 0 || (hasOriginalSourceCharcodes &&
+                    singleBaseline && ApplySourceGlyphDeletion(textObject,
+                        expectedUtf16, replacementUtf16, originalCharcodes,
+                        originalGlyphBoundaries, encodedAdvanceChars));
+                if (applied) {
+                    if (replacementLength > 0 &&
+                        !PageObjectHasExactMark(textObject, "LufickSourceGlyphDeletion"))
+                        FPDFPageObj_AddMark(textObject, "LufickSourceGlyphDeletion");
+                    const unsigned int alpha = replacementLength == 0 ? 0u : liveTextA;
+                    applied = FPDFPageObj_SetFillColor(textObject, textR, textG, textB, alpha) != 0;
+                    if (applied) FPDFPageObj_SetStrokeColor(textObject, textR, textG, textB, alpha);
+                    // Apply the single source line's reflow origin without rebuilding its glyphs.
+                    if (applied && hasVisualReflow) {
+                        float y = 0;
+                        firstFiniteOffset(encodedVisualLineYOffsetChars, &y);
+                        FS_MATRIX matrix{};
+                        applied = FPDFPageObj_GetMatrix(textObject, &matrix) != 0;
+                        if (applied) {
+                            const float x = hasRequestedLineOffset ? requestedLineOffset -
+                                (hasSourceLineOffset ? sourceLineOffset : 0.0f) : 0.0f;
+                            matrix.e += matrix.a * x - matrix.c * y;
+                            matrix.f += matrix.b * x - matrix.d * y;
+                            applied = FPDFPageObj_SetMatrix(textObject, &matrix) != 0;
+                        }
+                    }
+                    stylesAppliedPerRun = true;
+                    liveStyleObjects.emplace_back(textObject, sourcePayloadStyle);
+                }
+                LOGE("PDF_EDIT_NATIVE precise Hindi deletion page=%d object=%d applied=%d",
+                     pageIndex, objectIndex, applied ? 1 : 0);
+            } else if (replacementLength == 0 && !usesProvidedPage) {
                 // FPDFText_SetText() traps for an empty string in this Pdfium build. Final save
                 // removes the object after all indexed replacements have been applied, so an
                 // earlier removal cannot shift the object indices of later edits.
@@ -17537,11 +18013,26 @@ static bool ApplyNativeTextContentEdits(
                 pendingMarkedTextRemovals.push_back({pageIndex, removalMark, std::string()});
                 applied = FPDFPage_GenerateContent(page) != 0;
             } else if (canApplyUniformStyleInPlace) {
+                if (usesProvidedPage) {
+                    RemoveTextEditPreviewObjects(
+                            page,
+                            "LufickTextEditPreview_" + std::to_string(pageIndex) + "_" +
+                                    std::to_string(objectIndex) + "_");
+                }
                 const jchar* replacementChars = env->GetStringChars(replacementText, nullptr);
                 std::vector<unsigned short> replacement(
                         static_cast<size_t>(replacementLength) + 1,
                         0);
-                if (replacementChars) {
+                if (needsPreciseIndicGlyphs && unchangedText) {
+                    if (replacementChars) {
+                        env->ReleaseStringChars(replacementText, replacementChars);
+                    }
+                    applied = !isRetainedLiveSource || !hasOriginalSourceCharcodes ||
+                            FPDFText_SetCharcodes(
+                                    textObject,
+                                    originalCharcodes.data(),
+                                    originalCharcodes.size()) != 0;
+                } else if (replacementChars) {
                     for (jsize index = 0; index < replacementLength; ++index) {
                         replacement[static_cast<size_t>(index)] =
                                 static_cast<unsigned short>(replacementChars[index]);
@@ -17563,6 +18054,22 @@ static bool ApplyNativeTextContentEdits(
                             encodedAdvanceChars,
                             &positionRestoreAttempted);
                     if (positionRestoreAttempted && !positionsRestored) applied = false;
+                }
+                if (applied) {
+                    const TextEditCharacterStyle& style = requestedStyles.front();
+                    if (canApplyPreciseIndicStyleInPlace &&
+                        std::fabs(style.sizeScale - 1.0f) > 0.0001f) {
+                        FS_MATRIX preciseMatrix = {1, 0, 0, 1, 0, 0};
+                        if (FPDFPageObj_GetMatrix(textObject, &preciseMatrix)) {
+                            preciseMatrix.a *= style.sizeScale;
+                            preciseMatrix.b *= style.sizeScale;
+                            preciseMatrix.c *= style.sizeScale;
+                            preciseMatrix.d *= style.sizeScale;
+                            applied = FPDFPageObj_SetMatrix(textObject, &preciseMatrix) != 0;
+                        } else {
+                            applied = false;
+                        }
+                    }
                 }
                 if (applied) {
                     const TextEditCharacterStyle& style = requestedStyles.front();
@@ -17588,7 +18095,62 @@ static bool ApplyNativeTextContentEdits(
                     liveStyleObjects.emplace_back(textObject, style);
                     stylesAppliedPerRun = true;
                     LOGE(
-                            "PDF_EDIT_NATIVE retained source text object for uniform style page=%d object=%d",
+                            "PDF_EDIT_NATIVE retained precise source text owner for uniform style page=%d object=%d",
+                            pageIndex,
+                            objectIndex);
+                }
+            } else if (canRetainLiveGeometryOwner) {
+                RemoveTextEditPreviewObjects(
+                        page,
+                        "LufickTextEditPreview_" + std::to_string(pageIndex) + "_" +
+                                std::to_string(objectIndex) + "_");
+                // A source identity mark does not mean its glyphs were modified.
+                // SetCharcodes clears the original TJ spacing; never do that for
+                // a move/resize of untouched text (including ActualText owners).
+                if (PageObjectHasExactMark(textObject, "LufickSourceGlyphDeletion") &&
+                    hasOriginalSourceCharcodes) {
+                    applied = ApplySourceGlyphDeletion(textObject, expectedUtf16, expectedUtf16,
+                            originalCharcodes, originalGlyphBoundaries, encodedAdvanceChars);
+                }
+                if (applied && !pureIndicGeometry) {
+                    // Font/geometry previews hide the marked source owner instead of changing
+                    // its text. Restore the original appearance after removing the styled runs
+                    // for both cancel/undo and a move-only restore.
+                    FPDFPageObj_SetFillColor(
+                            textObject,
+                            (sourceStyleColor >> 16u) & 0xFFu,
+                            (sourceStyleColor >> 8u) & 0xFFu,
+                            sourceStyleColor & 0xFFu,
+                            (sourceStyleColor >> 24u) & 0xFFu);
+                    FPDFPageObj_SetStrokeColor(
+                            textObject,
+                            (sourceStyleColor >> 16u) & 0xFFu,
+                            (sourceStyleColor >> 8u) & 0xFFu,
+                            sourceStyleColor & 0xFFu,
+                            (sourceStyleColor >> 24u) & 0xFFu);
+                }
+                if (applied && hasVisualReflow && !isLiveMoveOnly) {
+                    float requestedYOffset = 0.0f;
+                    firstFiniteOffset(encodedVisualLineYOffsetChars, &requestedYOffset);
+                    FS_MATRIX preciseMatrix = {1, 0, 0, 1, 0, 0};
+                    if (FPDFPageObj_GetMatrix(textObject, &preciseMatrix)) {
+                        const float advanceDelta = hasRequestedLineOffset
+                                ? requestedLineOffset - (hasSourceLineOffset ? sourceLineOffset : 0.0f)
+                                : 0.0f;
+                        preciseMatrix.e += preciseMatrix.a * advanceDelta -
+                                preciseMatrix.c * requestedYOffset;
+                        preciseMatrix.f += preciseMatrix.b * advanceDelta -
+                                preciseMatrix.d * requestedYOffset;
+                        applied = FPDFPageObj_SetMatrix(textObject, &preciseMatrix) != 0;
+                    } else {
+                        applied = false;
+                    }
+                }
+                if (applied) {
+                    liveStyleObjects.emplace_back(textObject, sourcePayloadStyle);
+                    stylesAppliedPerRun = true;
+                    LOGE(
+                            "PDF_EDIT_NATIVE retained precise source text owner for geometry page=%d object=%d",
                             pageIndex,
                             objectIndex);
                 }
@@ -17619,6 +18181,7 @@ static bool ApplyNativeTextContentEdits(
                         encodedStyleRunChars,
                         encodedFontRunChars,
                         encodedAdvanceChars,
+                        originalCharcodes.empty() ? nullptr : &originalCharcodes,
                         enableOriginalStreamGlyphPatching,
                         runMarkPrefix,
                         &liveStyleObjects);
@@ -17640,12 +18203,24 @@ static bool ApplyNativeTextContentEdits(
                     usedCompatibleFontObject = true;
                     stylesAppliedPerRun = true;
                     if (usesProvidedPage) {
-                        const unsigned short previewPlaceholder[2] = {
-                                static_cast<unsigned short>(' '), 0
-                        };
-                        applied = FPDFText_SetText(
+                        // Keep the source Tj/TJ owner and its encoded glyph bytes intact while
+                        // the styled replacement objects are shown. Replacing it with a space
+                        // made cancel/undo destructive when an ActualText owner could not be
+                        // reloaded by ordinal.
+                        applied = FPDFPageObj_SetFillColor(
                                 textObject,
-                                reinterpret_cast<FPDF_WIDESTRING>(previewPlaceholder)) != 0;
+                                (sourceStyleColor >> 16u) & 0xFFu,
+                                (sourceStyleColor >> 8u) & 0xFFu,
+                                sourceStyleColor & 0xFFu,
+                                0) != 0;
+                        if (applied) {
+                            applied = FPDFPageObj_SetStrokeColor(
+                                    textObject,
+                                    (sourceStyleColor >> 16u) & 0xFFu,
+                                    (sourceStyleColor >> 8u) & 0xFFu,
+                                    sourceStyleColor & 0xFFu,
+                                    0) != 0;
+                        }
                     } else {
                         const std::string removalMark = "LufickTextEditOriginal_" +
                                 std::to_string(pageIndex) + "_" + std::to_string(objectIndex);
@@ -17681,6 +18256,7 @@ static bool ApplyNativeTextContentEdits(
                         encodedStyleRunChars,
                         encodedFontRunChars,
                         encodedAdvanceChars,
+                        originalCharcodes.empty() ? nullptr : &originalCharcodes,
                         enableOriginalStreamGlyphPatching,
                         runMarkPrefix,
                         &liveStyleObjects);
@@ -17703,12 +18279,23 @@ static bool ApplyNativeTextContentEdits(
                     usedCompatibleFontObject = true;
                     stylesAppliedPerRun = true;
                     if (usesProvidedPage) {
-                        const unsigned short previewPlaceholder[2] = {
-                                static_cast<unsigned short>(' '), 0
-                        };
-                        applied = FPDFText_SetText(
+                        // Keep the source Tj/TJ owner untouched during a live fallback-font
+                        // preview as well. A placeholder space destroys the original glyph
+                        // owner and makes cancel/undo unable to restore complex scripts.
+                        applied = FPDFPageObj_SetFillColor(
                                 textObject,
-                                reinterpret_cast<FPDF_WIDESTRING>(previewPlaceholder)) != 0;
+                                (sourceStyleColor >> 16u) & 0xFFu,
+                                (sourceStyleColor >> 8u) & 0xFFu,
+                                sourceStyleColor & 0xFFu,
+                                0) != 0;
+                        if (applied) {
+                            applied = FPDFPageObj_SetStrokeColor(
+                                    textObject,
+                                    (sourceStyleColor >> 16u) & 0xFFu,
+                                    (sourceStyleColor >> 8u) & 0xFFu,
+                                    sourceStyleColor & 0xFFu,
+                                    0) != 0;
+                        }
                     } else {
                         const std::string removalMark = "LufickTextEditOriginal_" +
                                 std::to_string(pageIndex) + "_" + std::to_string(objectIndex);
@@ -17763,12 +18350,23 @@ static bool ApplyNativeTextContentEdits(
                                             isUnderline,
                                             isStrikeout));
                         }
-                        const unsigned short previewPlaceholder[2] = {
-                                static_cast<unsigned short>(' '), 0
-                        };
-                        applied = FPDFText_SetText(
+                        // Keep the original source owner intact while its positioned preview
+                        // is displayed. Replacing it with a space loses the source glyphs when
+                        // the edit is later cancelled for a complex-script owner.
+                        applied = FPDFPageObj_SetFillColor(
                                 textObject,
-                                reinterpret_cast<FPDF_WIDESTRING>(previewPlaceholder)) != 0;
+                                (sourceStyleColor >> 16u) & 0xFFu,
+                                (sourceStyleColor >> 8u) & 0xFFu,
+                                sourceStyleColor & 0xFFu,
+                                0) != 0;
+                        if (applied) {
+                            applied = FPDFPageObj_SetStrokeColor(
+                                    textObject,
+                                    (sourceStyleColor >> 16u) & 0xFFu,
+                                    (sourceStyleColor >> 8u) & 0xFFu,
+                                    sourceStyleColor & 0xFFu,
+                                    0) != 0;
+                        }
                         usedCompatibleFontObject = applied;
                     }
                 }
@@ -17828,13 +18426,26 @@ static bool ApplyNativeTextContentEdits(
                 if (usesProvidedPage && !isRetainedLiveSource) {
                     FPDFPageObj_AddMark(textObject, liveSourceMark.c_str());
                 }
-                if (!usedCompatibleFontObject && (replacementLength > 0 || usesProvidedPage)) {
+                if (!pureIndicGeometry && !usedCompatibleFontObject && (replacementLength > 0 || usesProvidedPage)) {
                     const float scaleX = env->GetFloatField(edit, scaleXField);
                     const float translateX = env->GetFloatField(edit, translateXField);
                     const float translateY = env->GetFloatField(edit, translateYField);
                     if (scaleX != 1.0f || translateX != 0.0f || translateY != 0.0f) {
                         FPDFPageObj_Transform(textObject, scaleX, 0, 0, 1, translateX, translateY);
                     }
+                }
+                if (hasIndicText && unchangedText && canRetainLiveGeometryOwner) {
+                    const FS_MATRIX sourceMatrix = {
+                            env->GetFloatField(edit, matrixAField),
+                            env->GetFloatField(edit, matrixBField),
+                            env->GetFloatField(edit, matrixCField),
+                            env->GetFloatField(edit, matrixDField),
+                            env->GetFloatField(edit, matrixEField),
+                            env->GetFloatField(edit, matrixFField)};
+                    applied = TransformIndicActualTextCompanions(
+                            sourceDocumentFile, page, pageIndex, textObject, sourceMatrix);
+                    if (!applied) LOGE("PDF_EDIT_NATIVE Hindi ActualText companion transform failed page=%d owner=%d",
+                                       pageIndex, objectIndex);
                 }
                 if (usesProvidedPage) {
                     std::vector<FPDF_PAGEOBJECT> currentTextObjects;
@@ -18308,6 +18919,7 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeSavePdfEdit
     if (!ApplyNativeTextContentEdits(
             env,
             doc,
+            nullptr,
             textContentUpdatesArray,
             nullptr,
             -1,
@@ -22173,6 +22785,13 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeApplyAnnota
 }
 
 JNIEXPORT jboolean JNICALL
+Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeGenerateTextPreviewPage(
+        JNIEnv* env, jobject thiz, jlong pagePtr) {
+    FPDF_PAGE page = reinterpret_cast<FPDF_PAGE>(pagePtr);
+    return page && FPDFPage_GenerateContent(page) ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT jboolean JNICALL
 Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeApplyTextEdits(
         JNIEnv* env,
         jobject thiz,
@@ -22189,6 +22808,7 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeApplyTextEd
     return ApplyNativeTextContentEdits(
             env,
             docFile->pdfDocument,
+            docFile,
             textEditsArray,
             page,
             pageIndex,
@@ -22635,6 +23255,72 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeGetTextObje
         textObjectOrdinals[object] = static_cast<int>(ordinal);
     }
     std::map<FPDF_PAGEOBJECT, int> ownerOffsets;
+    std::map<FPDF_PAGEOBJECT, FS_MATRIX> textPageMatrices;
+    std::function<void(FPDF_PAGEOBJECT, const FS_MATRIX&, int)> collectTextMatrices;
+    collectTextMatrices = [&](FPDF_PAGEOBJECT object, const FS_MATRIX& parent, int depth) {
+        if (!object || depth > 32) return;
+        FS_MATRIX local = {1, 0, 0, 1, 0, 0};
+        if (!FPDFPageObj_GetMatrix(object, &local)) return;
+        const FS_MATRIX effective = {
+            parent.a * local.a + parent.c * local.b,
+            parent.b * local.a + parent.d * local.b,
+            parent.a * local.c + parent.c * local.d,
+            parent.b * local.c + parent.d * local.d,
+            parent.a * local.e + parent.c * local.f + parent.e,
+            parent.b * local.e + parent.d * local.f + parent.f};
+        if (FPDFPageObj_GetType(object) == FPDF_PAGEOBJ_TEXT) textPageMatrices[object] = effective;
+        else if (FPDFPageObj_GetType(object) == FPDF_PAGEOBJ_FORM)
+            for (int child = 0; child < FPDFFormObj_CountObjects(object); ++child)
+                collectTextMatrices(FPDFFormObj_GetObject(object, child), effective, depth + 1);
+    };
+    const FS_MATRIX identity = {1, 0, 0, 1, 0, 0};
+    for (int index = 0; index < FPDFPage_CountObjects(page); ++index)
+        collectTextMatrices(FPDFPage_GetObject(page, index), identity, 0);
+    std::map<FPDF_PAGEOBJECT, bool> ownerUsesLegacyIndicEncoding;
+    std::set<FPDF_PAGEOBJECT> mappedLegacyHindiOwners;
+    std::set<FPDF_PAGEOBJECT> unicodeHindiOwners;
+    std::map<FPDF_PAGEOBJECT, std::vector<jchar>> mappedLegacyOwnerText;
+    auto isIndicUnicode = [](unsigned int codePoint) {
+        return (codePoint >= 0x0900 && codePoint <= 0x0DFF) ||
+               (codePoint >= 0x1CD0 && codePoint <= 0x1CFF) ||
+               (codePoint >= 0xA8E0 && codePoint <= 0xA8FF) ||
+               (codePoint >= 0x11B00 && codePoint <= 0x11B5F) ||
+               codePoint == 0x200C || codePoint == 0x200D;
+    };
+    auto usesLegacyIndicEncoding = [&](FPDF_PAGEOBJECT object) {
+        const auto cached = ownerUsesLegacyIndicEncoding.find(object);
+        if (cached != ownerUsesLegacyIndicEncoding.end()) return cached->second;
+        std::string name;
+        FPDF_FONT objectFont = FPDFTextObj_GetFont(object);
+        if (objectFont) {
+            const size_t nameLength = FPDFFont_GetBaseFontName(objectFont, nullptr, 0);
+            if (nameLength > 0) {
+                std::vector<char> nameBuffer(nameLength);
+                if (FPDFFont_GetBaseFontName(objectFont, nameBuffer.data(), nameLength) > 0)
+                    name.assign(nameBuffer.data());
+            }
+        }
+        std::transform(name.begin(), name.end(), name.begin(), [](unsigned char value) {
+            return static_cast<char>(std::tolower(value));
+        });
+        std::string encodingName;
+        for (unsigned char value : name) if (std::isalnum(value)) encodingName.push_back(value);
+        // Kokila's InDesign output positions vowel signs as separate owners.
+        // PDFium's inferred spaces between those owners are selection metadata,
+        // not source characters ("त" + "ू" must remain "तू").
+        if (encodingName.find("kokila") != std::string::npos)
+            unicodeHindiOwners.insert(object);
+        if (encodingName.find("devlys010") != std::string::npos ||
+            encodingName.find("krutidev010") != std::string::npos ||
+            encodingName.find("krutidev011") != std::string::npos)
+            mappedLegacyHindiOwners.insert(object);
+        const bool legacy = name.find("devlys") != std::string::npos ||
+                name.find("kruti") != std::string::npos ||
+                name.find("chanakya") != std::string::npos ||
+                name.find("shusha") != std::string::npos;
+        ownerUsesLegacyIndicEncoding[object] = legacy;
+        return legacy;
+    };
     struct TextDecorationPathBounds {
         float left;
         float bottom;
@@ -22661,6 +23347,7 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeGetTextObje
     int segmentEnd = 0;
     double segmentLeft = 0, segmentBottom = 0, segmentRight = 0, segmentTop = 0;
     double previousRight = 0, previousCenterY = 0, previousHeight = 0;
+    unsigned int previousUnicode = 0;
     std::vector<jchar> segmentText;
     std::vector<double> segmentCursorAdvances;
 
@@ -22673,6 +23360,12 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeGetTextObje
         if (ownerTextBytes >= sizeof(FPDF_WCHAR)) {
             FPDFTextObj_GetText(segmentOwner, textPage, ownerTextBuffer.data(), ownerTextBytes);
             ownerCharCount = static_cast<int>(ownerTextBuffer.size()) - 1;
+        }
+        if (mappedLegacyHindiOwners.count(segmentOwner) || unicodeHindiOwners.count(segmentOwner)) {
+            const auto& source = mappedLegacyOwnerText.at(segmentOwner);
+            ownerTextBuffer.assign(source.begin(), source.end());
+            ownerTextBuffer.push_back(0);
+            ownerCharCount = static_cast<int>(source.size());
         }
         std::string fontName;
         FPDF_FONT font = FPDFTextObj_GetFont(segmentOwner);
@@ -22768,6 +23461,8 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeGetTextObje
         }
         FS_MATRIX matrix = {1, 0, 0, 1, 0, 0};
         FPDFPageObj_GetMatrix(segmentOwner, &matrix);
+        if (unicodeHindiOwners.count(segmentOwner) && textPageMatrices.count(segmentOwner))
+            matrix = textPageMatrices.at(segmentOwner);
 
         appendValue(std::to_string(objectIndex));
         values.push_back(env->NewString(segmentText.data(), static_cast<jsize>(segmentText.size())));
@@ -22810,9 +23505,29 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeGetTextObje
     };
 
     const int charCount = FPDFText_CountChars(textPage);
+    // Generated selection spaces are not encoded DevLys glyphs. Including them
+    // changes words and detaches pre-base matras during Unicode conversion.
+    for (int index = 0; index < charCount; ++index) {
+        FPDF_PAGEOBJECT owner = FPDFText_GetTextObject(textPage, index);
+        if (!owner || objectIndices.find(owner) == objectIndices.end()) continue;
+        usesLegacyIndicEncoding(owner);
+        const unsigned int unicode = FPDFText_GetUnicode(textPage, index);
+        // Saved precise slices carry Unicode ActualText over retained DevLys
+        // glyphs. They must not be decoded/filtered as legacy Latin a second time.
+        if (mappedLegacyHindiOwners.count(owner) && isIndicUnicode(unicode)) {
+            mappedLegacyHindiOwners.erase(owner);
+            mappedLegacyOwnerText.erase(owner);
+        }
+        if ((!mappedLegacyHindiOwners.count(owner) && !unicodeHindiOwners.count(owner)) ||
+                FPDFText_IsGenerated(textPage, index) == 1) continue;
+        if (unicode && unicode <= 0xffff && unicode != '\r' && unicode != '\n')
+            mappedLegacyOwnerText[owner].push_back(static_cast<jchar>(unicode));
+    }
     for (int charIndex = 0; charIndex < charCount; ++charIndex) {
         FPDF_PAGEOBJECT owner = FPDFText_GetTextObject(textPage, charIndex);
         if (!owner || objectIndices.find(owner) == objectIndices.end()) continue;
+        if ((mappedLegacyHindiOwners.count(owner) || unicodeHindiOwners.count(owner)) &&
+                FPDFText_IsGenerated(textPage, charIndex) == 1) continue;
         const unsigned int unicode = FPDFText_GetUnicode(textPage, charIndex);
         const int utf16Units = unicode > 0xFFFF ? 2 : (unicode == 0 ? 0 : 1);
         const int ownerOffset = ownerOffsets[owner];
@@ -22822,18 +23537,32 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeGetTextObje
             !FPDFText_GetCharBox(textPage, charIndex, &left, &right, &bottom, &top)) {
             appendSegment();
             segmentOwner = nullptr;
+            previousUnicode = 0;
             continue;
         }
         const double centerY = (top + bottom) * 0.5;
         const double height = std::fabs(top - bottom);
+        const bool allowShapedGlyphBacktrack = owner == segmentOwner &&
+                (isIndicUnicode(unicode) || isIndicUnicode(previousUnicode) ||
+                 usesLegacyIndicEncoding(owner));
+        const double lineTolerance = std::max(height, previousHeight);
+        const bool verticalLineShift =
+                std::fabs(centerY - previousCenterY) > lineTolerance * 0.55;
+        const bool shapedLineReset = left < previousRight - lineTolerance * 2.0 &&
+                left <= segmentLeft + lineTolerance * 1.5;
         const bool newVisualLine = segmentOwner &&
                 (owner != segmentOwner ||
-                 std::fabs(centerY - previousCenterY) > std::max(height, previousHeight) * 0.55 ||
-                 left < previousRight - std::max(height, previousHeight) * 0.25 ||
-                 left - previousRight > std::max(height, previousHeight) * 2.0);
+                 (verticalLineShift &&
+                  (!allowShapedGlyphBacktrack || shapedLineReset)) ||
+                 (!allowShapedGlyphBacktrack &&
+                  left < previousRight - lineTolerance * 0.25) ||
+                 (!mappedLegacyHindiOwners.count(owner) &&
+                  left - previousRight > lineTolerance * 2.0));
         if (newVisualLine) appendSegment();
         FS_MATRIX ownerMatrix = {1, 0, 0, 1, 0, 0};
         FPDFPageObj_GetMatrix(owner, &ownerMatrix);
+        if (unicodeHindiOwners.count(owner) && textPageMatrices.count(owner))
+            ownerMatrix = textPageMatrices.at(owner);
         const double baselineLengthSquared =
                 static_cast<double>(ownerMatrix.a) * ownerMatrix.a +
                 static_cast<double>(ownerMatrix.b) * ownerMatrix.b;
@@ -22891,6 +23620,7 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeGetTextObje
         previousRight = right;
         previousCenterY = centerY;
         previousHeight = height;
+        previousUnicode = unicode;
     }
     appendSegment();
     FPDFText_ClosePage(textPage);
@@ -22946,6 +23676,9 @@ struct NativeRawPdfStringSpan {
 };
 
 struct NativeRawTextShow {
+    size_t ownerRun = 0;
+    std::string fontResource;
+    size_t codeWidth = 0;
     std::vector<NativeRawPdfStringSpan> strings;
     std::vector<std::pair<size_t, std::string>> adjustments;
     // Text exposed by our preservation wrapper.  Keeping this alongside the
@@ -23074,6 +23807,9 @@ static std::vector<NativeRawTextShow> NativeFindRawTextShows(const std::string& 
     size_t activeActualTextStart = std::string::npos;
     int activeActualTextShowIndex = -1;
     int activeActualTextShowCount = 0;
+    size_t ownerRun = 0;
+    std::string lastName;
+    std::string fontResource;
     size_t cursor = 0;
     while (cursor < content.size()) {
         const unsigned char ch = static_cast<unsigned char>(content[cursor]);
@@ -23140,6 +23876,7 @@ static std::vector<NativeRawTextShow> NativeFindRawTextShows(const std::string& 
                 ++cursor;
             }
             const std::string name = content.substr(nameStart, cursor - nameStart);
+            lastName = name;
             if (name == "Span") pendingSpanStart = slashStart;
             if (name == "ActualText") expectActualText = true;
             hasLastString = false;
@@ -23159,6 +23896,16 @@ static std::vector<NativeRawTextShow> NativeFindRawTextShows(const std::string& 
             continue;
         }
         const std::string token = content.substr(tokenStart, cursor - tokenStart);
+        // PDFium coalesces adjacent shows without a text/graphics-state change.
+        // The editable ordinal is an owner ordinal, not an operator ordinal.
+        if (token == "BT" || token == "ET" || token == "Tm" || token == "Td" ||
+            token == "TD" || token == "T*" || token == "Tf" || token == "Tc" ||
+            token == "Tw" || token == "Tz" || token == "TL" || token == "Tr" ||
+            token == "Ts" || token == "gs" || token == "cm" || token == "q" ||
+            token == "Q" || token == "BDC" || token == "BMC" || token == "EMC" ||
+            token == "g" || token == "rg" || token == "k" || token == "Do" ||
+            token == "'" || token == "\"") ++ownerRun;
+        if (token == "Tf") fontResource = lastName;
         if (token == "BDC" && !pendingActualText.empty() &&
             pendingSpanStart != std::string::npos) {
             activeActualTextStart = pendingSpanStart;
@@ -23176,6 +23923,8 @@ static std::vector<NativeRawTextShow> NativeFindRawTextShows(const std::string& 
             activeActualTextShowCount = 0;
         } else if ((token == "Tj" || token == "'" || token == "\"") && hasLastString) {
             NativeRawTextShow show;
+            show.ownerRun = ownerRun;
+            show.fontResource = fontResource;
             show.strings = {lastString};
             show.operandStart = lastString.start;
             show.operatorStart = tokenStart;
@@ -23193,6 +23942,8 @@ static std::vector<NativeRawTextShow> NativeFindRawTextShows(const std::string& 
             numericOperands.clear();
         } else if (token == "TJ" && hasCompletedArray && !arrayStrings.empty()) {
             NativeRawTextShow show;
+            show.ownerRun = ownerRun;
+            show.fontResource = fontResource;
             show.strings = arrayStrings;
             show.adjustments = arrayAdjustments;
             show.operandStart = arrayStart;
@@ -23952,6 +24703,343 @@ static bool NativePdfiumPatchCandidateMatches(
     if (page) FPDF_ClosePage(page);
     FPDF_CloseDocument(document);
     return matched;
+}
+
+struct NativeRawFormInvocation {
+    size_t operatorStart = 0;
+    std::string name;
+};
+
+static std::vector<NativeRawFormInvocation> NativeFindRawFormInvocations(
+        const std::string& decoded) {
+    std::vector<NativeRawFormInvocation> invocations;
+    std::string lastName;
+    size_t cursor = 0;
+    auto isDelimiter = [](unsigned char value) {
+        return std::isspace(value) || strchr("()<>[]{}/%", value) != nullptr;
+    };
+    while (cursor < decoded.size()) {
+        const unsigned char value = static_cast<unsigned char>(decoded[cursor]);
+        if (std::isspace(value)) {
+            ++cursor;
+            continue;
+        }
+        if (value == '%') {
+            const size_t end = decoded.find_first_of("\r\n", cursor + 1);
+            cursor = end == std::string::npos ? decoded.size() : end + 1;
+            continue;
+        }
+        if (value == '(') {
+            int depth = 1;
+            bool escaped = false;
+            ++cursor;
+            while (cursor < decoded.size() && depth > 0) {
+                const char ch = decoded[cursor++];
+                if (escaped) {
+                    escaped = false;
+                } else if (ch == '\\') {
+                    escaped = true;
+                } else if (ch == '(') {
+                    ++depth;
+                } else if (ch == ')') {
+                    --depth;
+                }
+            }
+            continue;
+        }
+        if (value == '<' && cursor + 1 < decoded.size() && decoded[cursor + 1] != '<') {
+            const size_t end = decoded.find('>', cursor + 1);
+            cursor = end == std::string::npos ? decoded.size() : end + 1;
+            continue;
+        }
+        if (value == '/') {
+            const size_t start = ++cursor;
+            while (cursor < decoded.size() &&
+                   !isDelimiter(static_cast<unsigned char>(decoded[cursor]))) {
+                ++cursor;
+            }
+            lastName = decoded.substr(start, cursor - start);
+            continue;
+        }
+        const size_t tokenStart = cursor;
+        while (cursor < decoded.size() &&
+               !isDelimiter(static_cast<unsigned char>(decoded[cursor]))) {
+            ++cursor;
+        }
+        if (cursor == tokenStart) {
+            ++cursor;
+            continue;
+        }
+        const std::string token = decoded.substr(tokenStart, cursor - tokenStart);
+        if (token == "Do" && !lastName.empty()) {
+            invocations.push_back({tokenStart, lastName});
+            lastName.clear();
+        }
+    }
+    return invocations;
+}
+
+static bool NativeCollectRawTextShowsInPaintOrder(
+        const std::string& decoded,
+        const std::string& resourcesBody,
+        const std::vector<PdfObjectInfo>& objects,
+        std::set<std::pair<int, int>>* activeForms,
+        std::vector<NativeRawTextShow>* outShows,
+        int depth = 0) {
+    if (!activeForms || !outShows || depth > 32) return false;
+    const std::vector<NativeRawTextShow> directShows = NativeFindRawTextShows(decoded);
+    const std::vector<NativeRawFormInvocation> formInvocations =
+            NativeFindRawFormInvocations(decoded);
+    std::map<std::string, std::pair<int, int>> xObjects;
+    if (!NativeCollectNamedResourceReferences(
+            resourcesBody, objects, "XObject", &xObjects)) {
+        return false;
+    }
+    std::map<std::string, std::pair<int, int>> fonts;
+    if (!NativeCollectNamedResourceReferences(resourcesBody, objects, "Font", &fonts))
+        return false;
+
+    size_t showIndex = 0;
+    size_t formIndex = 0;
+    while (showIndex < directShows.size() || formIndex < formInvocations.size()) {
+        const bool takeShow = formIndex >= formInvocations.size() ||
+                (showIndex < directShows.size() &&
+                 directShows[showIndex].operatorStart < formInvocations[formIndex].operatorStart);
+        if (takeShow) {
+            NativeRawTextShow show = directShows[showIndex++];
+            const auto fontRef = fonts.find(show.fontResource);
+            if (fontRef != fonts.end()) {
+                const PdfObjectInfo* font = FindPdfObjectInfoByRef(
+                        objects, fontRef->second.first, fontRef->second.second);
+                if (font) {
+                    if (ContainsPdfNameValue(font->body, "Subtype", "Type0") &&
+                        (ContainsPdfNameValue(font->body, "Encoding", "Identity-H") ||
+                         ContainsPdfNameValue(font->body, "Encoding", "Identity-V"))) show.codeWidth = 2;
+                    else if (!ContainsPdfNameValue(font->body, "Subtype", "Type0")) show.codeWidth = 1;
+                }
+            }
+            while (showIndex < directShows.size() &&
+                   directShows[showIndex].ownerRun == show.ownerRun &&
+                   directShows[showIndex].actualText.empty() && show.actualText.empty() &&
+                   (formIndex >= formInvocations.size() ||
+                    directShows[showIndex].operatorStart < formInvocations[formIndex].operatorStart)) {
+                const NativeRawTextShow& next = directShows[showIndex++];
+                show.strings.insert(show.strings.end(), next.strings.begin(), next.strings.end());
+            }
+            outShows->push_back(std::move(show));
+            continue;
+        }
+
+        const NativeRawFormInvocation& invocation = formInvocations[formIndex++];
+        const auto reference = xObjects.find(invocation.name);
+        if (reference == xObjects.end()) continue;
+        const PdfObjectInfo* formObject = FindPdfObjectInfoByRef(
+                objects, reference->second.first, reference->second.second);
+        if (!formObject || !ContainsPdfNameValue(formObject->body, "Subtype", "Form")) continue;
+        if (!activeForms->insert(reference->second).second) return false;
+
+        std::string formDecoded;
+        std::string formDictionary;
+        bool formFlateEncoded = false;
+        bool success = NativeDecodeContentStreamBody(
+                formObject->body, &formDecoded, &formFlateEncoded, &formDictionary);
+        std::string formResources = resourcesBody;
+        std::string ownResources;
+        if (success && NativeResolvePageResourcesBody(
+                formObject->body, objects, &ownResources)) {
+            formResources = std::move(ownResources);
+        }
+        if (success) {
+            success = NativeCollectRawTextShowsInPaintOrder(
+                    formDecoded,
+                    formResources,
+                    objects,
+                    activeForms,
+                    outShows,
+                    depth + 1);
+        }
+        activeForms->erase(reference->second);
+        if (!success) return false;
+    }
+    return true;
+}
+
+static bool NativeLoadOriginalTextCharcodes(
+        DocumentFile* documentFile,
+        int pageIndex,
+        int textOrdinal,
+        const std::u16string& originalText,
+        std::vector<uint32_t>* outCharcodes,
+        std::vector<size_t>* outGlyphBoundaries) {
+    if (!documentFile || !outCharcodes || pageIndex < 0 || textOrdinal < 0 ||
+        originalText.empty()) {
+        return false;
+    }
+    outCharcodes->clear();
+    if (!outGlyphBoundaries) return false;
+    outGlyphBoundaries->clear();
+    const std::pair<int, int> cacheKey = {pageIndex, textOrdinal};
+    const auto cached = documentFile->sourceTextCharcodes.find(cacheKey);
+    if (cached != documentFile->sourceTextCharcodes.end() && !cached->second.empty()) {
+        *outCharcodes = cached->second;
+        const auto mapping = documentFile->sourceTextGlyphBoundaries.find(cacheKey);
+        if (mapping != documentFile->sourceTextGlyphBoundaries.end())
+            *outGlyphBoundaries = mapping->second;
+        return true;
+    }
+
+    std::string data;
+    if (!documentFile->sourceBytes.empty()) {
+        data.assign(
+                reinterpret_cast<const char*>(documentFile->sourceBytes.data()),
+                documentFile->sourceBytes.size());
+    } else if (documentFile->fileFd >= 0 && documentFile->fileSize > 0) {
+        data.resize(documentFile->fileSize);
+        size_t offset = 0;
+        while (offset < data.size()) {
+            const ssize_t count = pread(
+                    documentFile->fileFd,
+                    data.data() + offset,
+                    data.size() - offset,
+                    static_cast<off_t>(offset));
+            if (count <= 0) return false;
+            offset += static_cast<size_t>(count);
+        }
+    } else {
+        return false;
+    }
+
+    const std::vector<PdfObjectInfo> scannedObjects = ScanPdfObjects(data);
+    const std::vector<PdfObjectInfo> objects = BuildLatestPdfObjectsByRef(scannedObjects);
+    std::vector<PdfObjectInfo> pages = BuildPdfPageObjectsFromCatalog(data, objects);
+    if (pages.empty()) pages = BuildLatestPdfPageObjects(scannedObjects, objects);
+    if (static_cast<size_t>(pageIndex) >= pages.size()) return false;
+
+    std::vector<std::pair<int, int>> contentRefs;
+    if (!NativeReadPageContentRefs(pages[pageIndex].body, objects, &contentRefs)) return false;
+    std::string pageResources;
+    if (!NativeResolvePageResourcesBody(
+            pages[pageIndex].body, objects, &pageResources)) return false;
+    std::vector<NativeRawTextShow> orderedShows;
+    std::set<std::pair<int, int>> activeForms;
+    for (const auto& ref : contentRefs) {
+        const PdfObjectInfo* object = FindPdfObjectInfoByRef(
+                objects,
+                ref.first,
+                ref.second);
+        if (!object) return false;
+        std::string decoded;
+        std::string dictionary;
+        bool flateEncoded = false;
+        if (!NativeDecodeContentStreamBody(
+                object->body,
+                &decoded,
+                &flateEncoded,
+                &dictionary)) {
+            return false;
+        }
+        if (!NativeCollectRawTextShowsInPaintOrder(
+                decoded,
+                pageResources,
+                objects,
+                &activeForms,
+                &orderedShows)) {
+            return false;
+        }
+    }
+    if (static_cast<size_t>(textOrdinal) >= orderedShows.size()) return false;
+    const NativeRawTextShow& show = orderedShows[static_cast<size_t>(textOrdinal)];
+            std::vector<unsigned char> encoded;
+            for (const NativeRawPdfStringSpan& span : show.strings) {
+                encoded.insert(encoded.end(), span.bytes.begin(), span.bytes.end());
+            }
+            if (encoded.empty()) return false;
+            size_t codeWidth = show.codeWidth;
+            if (codeWidth == 0 && encoded.size() % originalText.size() == 0) {
+                const size_t candidateWidth = encoded.size() / originalText.size();
+                if (candidateWidth == 1 || candidateWidth == 2) codeWidth = candidateWidth;
+            }
+            // InDesign commonly wraps one encoded glyph in /ActualText containing several
+            // Unicode code units. Those owners must remain atomic, but their original glyph
+            // codes are still valid for restoring/transforming the owner without reshaping.
+            if (codeWidth == 0) codeWidth = (encoded.size() % 2u == 0u) ? 2u : 1u;
+            if (encoded.size() % codeWidth != 0) return false;
+            const size_t charcodeCount = encoded.size() / codeWidth;
+            outCharcodes->reserve(charcodeCount);
+            for (size_t index = 0; index < charcodeCount; ++index) {
+                const size_t byteIndex = index * codeWidth;
+                const uint32_t charcode = codeWidth == 1
+                        ? encoded[byteIndex]
+                        : (static_cast<uint32_t>(encoded[byteIndex]) << 8u) |
+                          static_cast<uint32_t>(encoded[byteIndex + 1]);
+                outCharcodes->push_back(charcode);
+            }
+            LOGE(
+                    "PDF_EDIT_NATIVE precise live Tj/TJ glyph mapping page=%d ordinal=%d glyphs=%d unicode=%d width=%d",
+                    pageIndex,
+                    textOrdinal,
+                    static_cast<int>(outCharcodes->size()),
+                    static_cast<int>(originalText.size()),
+                    static_cast<int>(codeWidth));
+            documentFile->sourceTextCharcodes[cacheKey] = *outCharcodes;
+            // Read the pristine source text page. Generated spacing contributes
+            // Unicode/cursor positions, but must not consume an encoded CID.
+            FPDF_DOCUMENT source = FPDF_LoadMemDocument64(data.data(), data.size(), nullptr);
+            FPDF_PAGE sourcePage = source ? FPDF_LoadPage(source, pageIndex) : nullptr;
+            FPDF_TEXTPAGE sourceText = sourcePage ? FPDFText_LoadPage(sourcePage) : nullptr;
+            if (sourceText) {
+                const auto owners = CollectEditableTextObjects(sourcePage);
+                if (static_cast<size_t>(textOrdinal) < owners.size()) {
+                    const auto owner = owners[static_cast<size_t>(textOrdinal)];
+                    std::u16string decodedText;
+                    std::vector<size_t> mapping{0};
+                    size_t glyph = 0;
+                    for (int i = 0; i < FPDFText_CountChars(sourceText); ++i) {
+                        if (FPDFText_GetTextObject(sourceText, i) != owner) continue;
+                        const unsigned int unicode = FPDFText_GetUnicode(sourceText, i);
+                        if (unicode == 0) continue;
+                        const bool generated = FPDFText_IsGenerated(sourceText, i) == 1;
+                        if (unicode > 0xffff) {
+                            decodedText.push_back(static_cast<char16_t>(0xd800 + ((unicode - 0x10000) >> 10)));
+                            mapping.push_back(glyph);
+                            decodedText.push_back(static_cast<char16_t>(0xdc00 + ((unicode - 0x10000) & 0x3ff)));
+                        } else decodedText.push_back(static_cast<char16_t>(unicode));
+                        if (!generated) ++glyph;
+                        mapping.push_back(glyph);
+                    }
+                    // GetTextObj can omit trailing generated whitespace. Only
+                    // trim that suffix when it contains no encoded glyphs.
+                    while (decodedText.size() > originalText.size() &&
+                           mapping.back() == mapping[mapping.size() - 2]) {
+                        decodedText.pop_back(); mapping.pop_back();
+                    }
+                    // GetTextObj may include a trailing generated word gap whose
+                    // GetTextObject is null. It has no source CID, but still has a
+                    // UTF-16 boundary in the editing payload (e.g. "लो ").
+                    if (glyph == outCharcodes->size() && decodedText.size() < originalText.size() &&
+                        originalText.compare(0, decodedText.size(), decodedText) == 0 &&
+                        std::all_of(originalText.begin() + decodedText.size(), originalText.end(),
+                                    [](char16_t c) { return c == u' ' || c == u'\r' || c == u'\n'; })) {
+                        while (decodedText.size() < originalText.size()) {
+                            decodedText.push_back(originalText[decodedText.size()]);
+                            mapping.push_back(glyph);
+                        }
+                    }
+                    if (decodedText == originalText && glyph == outCharcodes->size()) {
+                        *outGlyphBoundaries = mapping;
+                        documentFile->sourceTextGlyphBoundaries[cacheKey] = std::move(mapping);
+                    } else {
+                        LOGE("PDF_EDIT_NATIVE source glyph boundary mismatch page=%d owner=%d glyphs=%d encoded=%d units=%d expected=%d",
+                             pageIndex, textOrdinal, static_cast<int>(glyph),
+                             static_cast<int>(outCharcodes->size()), static_cast<int>(decodedText.size()),
+                             static_cast<int>(originalText.size()));
+                    }
+                }
+            }
+            if (sourceText) FPDFText_ClosePage(sourceText);
+            if (sourcePage) FPDF_ClosePage(sourcePage);
+            if (source) FPDF_CloseDocument(source);
+            return true;
 }
 
 static std::set<std::pair<int, int>> PatchEligibleTextEditsInOriginalStreams(
