@@ -2273,6 +2273,18 @@ static bool AppendPdfShapeAppearanceObject(
         float sweepAngle = 360.0f,
         bool isSpike = false,
         int spikeCount = 12,
+        bool isCustomPolygon = false,
+        int polygonSideCount = 6,
+        bool isStar = false,
+        int starArmCount = 5,
+        float starInnerRadiusRatio = 0.45f,
+        bool isSpeechBubble = false,
+        float speechPointerTipXRatio = 0.22f,
+        float speechPointerTipYRatio = 1.28f,
+        float speechPointerBaseCenterXRatio = 0.28f,
+        float speechPointerBaseCenterYRatio = 1.0f,
+        float speechPointerWidthRatio = 0.18f,
+        int strokeLineCap = FPDF_LINECAP_ROUND,
         FPDF_PAGE contentPage = nullptr
 ) {
     if (!annot && !contentPage) return false;
@@ -2286,7 +2298,7 @@ static bool AppendPdfShapeAppearanceObject(
         if (!styledPath) return false;
         FPDFPageObj_SetStrokeWidth(styledPath, effectiveStrokeWidth);
         FPDFPageObj_SetLineJoin(styledPath, FPDF_LINEJOIN_ROUND);
-        FPDFPageObj_SetLineCap(styledPath, FPDF_LINECAP_ROUND);
+        FPDFPageObj_SetLineCap(styledPath, strokeLineCap);
         FPDFPageObj_SetStrokeColor(styledPath, strokeR, strokeG, strokeB, strokeA);
         FPDFPageObj_SetFillColor(styledPath, fillR, fillG, fillB, fillA);
         if (stroke && dashWidth > 0.0f && dashGap > 0.0f) {
@@ -2401,6 +2413,125 @@ static bool AppendPdfShapeAppearanceObject(
                 FPDFPath_LineTo(path, point.x, point.y);
             }
         }
+        FPDFPath_Close(path);
+    } else if (isCustomPolygon || isStar) {
+        const float left = fmin(baseRect.left, baseRect.right);
+        const float right = fmax(baseRect.left, baseRect.right);
+        const float bottom = fmin(baseRect.bottom, baseRect.top);
+        const float top = fmax(baseRect.bottom, baseRect.top);
+        const float width = fmax(right - left, 0.1f);
+        const float height = fmax(top - bottom, 0.1f);
+        const float radius = fmax(0.1f,
+                fmin(width, height) * 0.5f - effectiveStrokeWidth * 0.5f);
+        const int pointCount = isStar
+                ? std::max(3, std::min(starArmCount, 20)) * 2
+                : std::max(3, std::min(polygonSideCount, 20));
+        const float innerRatio = fmax(0.15f, fmin(starInnerRadiusRatio, 0.85f));
+        for (int index = 0; index < pointCount; index++) {
+            const double angle = -M_PI / 2.0 + (2.0 * M_PI * index / pointCount);
+            const float pointRadius = isStar && index % 2 == 1
+                    ? radius * innerRatio
+                    : radius;
+            const float fractionX = 0.5f + static_cast<float>(cos(angle) * pointRadius / width);
+            const float fractionY = 0.5f + static_cast<float>(sin(angle) * pointRadius / height);
+            const PdfShapePoint point = PdfShapePointFromFraction(
+                    baseRect, fractionX, fractionY, rotationDegrees);
+            if (index == 0) {
+                path = FPDFPageObj_CreateNewPath(point.x, point.y);
+            } else {
+                FPDFPath_LineTo(path, point.x, point.y);
+            }
+        }
+        if (!path) return false;
+        FPDFPath_Close(path);
+    } else if (isSpeechBubble) {
+        const float left = fmin(baseRect.left, baseRect.right);
+        const float right = fmax(baseRect.left, baseRect.right);
+        const float bottom = fmin(baseRect.bottom, baseRect.top);
+        const float top = fmax(baseRect.bottom, baseRect.top);
+        const float width = fmax(right - left, 0.1f);
+        const float height = fmax(top - bottom, 0.1f);
+        const float bodyBottom = 0.74f;
+        const float bodyHeight = height * bodyBottom;
+        const float radius = fmin(width, bodyHeight) * 0.18f;
+        const float radiusX = radius / width;
+        const float radiusY = radius / height;
+        const float baseX = fmax(0.0f, fmin(speechPointerBaseCenterXRatio, 1.0f));
+        const float baseY = fmax(0.0f, fmin(speechPointerBaseCenterYRatio, 1.0f));
+        const float tipX = speechPointerTipXRatio;
+        const float tipY = speechPointerTipYRatio * bodyBottom;
+        const float halfWidth = fmax(0.03f, fmin(speechPointerWidthRatio, 0.45f)) *
+                fmin(width, bodyHeight) * 0.5f;
+        const float halfWidthX = halfWidth / width;
+        const float halfWidthY = halfWidth / height;
+        const float topDistance = baseY;
+        const float rightDistance = 1.0f - baseX;
+        const float bottomDistance = 1.0f - baseY;
+        const float leftDistance = baseX;
+        const float nearestEdge = fmin(fmin(topDistance, rightDistance),
+                                       fmin(bottomDistance, leftDistance));
+        const bool pointerOnTop = nearestEdge == topDistance;
+        const bool pointerOnRight = !pointerOnTop && nearestEdge == rightDistance;
+        const bool pointerOnBottom = !pointerOnTop && !pointerOnRight && nearestEdge == bottomDistance;
+        const bool pointerOnLeft = !pointerOnTop && !pointerOnRight && !pointerOnBottom;
+
+        auto shapePoint = [&](float fractionX, float fractionY) {
+            return PdfShapePointFromFraction(baseRect, fractionX, fractionY, rotationDegrees);
+        };
+        auto lineToFraction = [&](float fractionX, float fractionY) {
+            const PdfShapePoint point = shapePoint(fractionX, fractionY);
+            FPDFPath_LineTo(path, point.x, point.y);
+        };
+        auto bezierToFraction = [&](float c1x, float c1y, float c2x, float c2y,
+                                    float endX, float endY) {
+            const PdfShapePoint c1 = shapePoint(c1x, c1y);
+            const PdfShapePoint c2 = shapePoint(c2x, c2y);
+            const PdfShapePoint end = shapePoint(endX, endY);
+            FPDFPath_BezierTo(path, c1.x, c1.y, c2.x, c2.y, end.x, end.y);
+        };
+        const float controlX = radiusX * 0.5522847498f;
+        const float controlY = radiusY * 0.5522847498f;
+        const PdfShapePoint start = shapePoint(radiusX, 0.0f);
+        path = FPDFPageObj_CreateNewPath(start.x, start.y);
+        if (!path) return false;
+
+        if (pointerOnTop) {
+            lineToFraction(fmax(radiusX, baseX - halfWidthX), 0.0f);
+            lineToFraction(tipX, tipY);
+            lineToFraction(fmin(1.0f - radiusX, baseX + halfWidthX), 0.0f);
+        }
+        lineToFraction(1.0f - radiusX, 0.0f);
+        bezierToFraction(1.0f - radiusX + controlX, 0.0f,
+                         1.0f, radiusY - controlY, 1.0f, radiusY);
+        if (pointerOnRight) {
+            const float centerY = baseY * bodyBottom;
+            lineToFraction(1.0f, fmax(radiusY, centerY - halfWidthY));
+            lineToFraction(tipX, tipY);
+            lineToFraction(1.0f, fmin(bodyBottom - radiusY, centerY + halfWidthY));
+        }
+        lineToFraction(1.0f, bodyBottom - radiusY);
+        bezierToFraction(1.0f, bodyBottom - radiusY + controlY,
+                         1.0f - radiusX + controlX, bodyBottom,
+                         1.0f - radiusX, bodyBottom);
+        if (pointerOnBottom) {
+            lineToFraction(fmin(1.0f - radiusX, baseX + halfWidthX), bodyBottom);
+            lineToFraction(tipX, tipY);
+            lineToFraction(fmax(radiusX, baseX - halfWidthX), bodyBottom);
+        }
+        lineToFraction(radiusX, bodyBottom);
+        bezierToFraction(radiusX - controlX, bodyBottom,
+                         0.0f, bodyBottom - radiusY + controlY,
+                         0.0f, bodyBottom - radiusY);
+        if (pointerOnLeft) {
+            const float centerY = baseY * bodyBottom;
+            lineToFraction(0.0f, fmin(bodyBottom - radiusY, centerY + halfWidthY));
+            lineToFraction(tipX, tipY);
+            lineToFraction(0.0f, fmax(radiusY, centerY - halfWidthY));
+        }
+        lineToFraction(0.0f, radiusY);
+        bezierToFraction(0.0f, radiusY - controlY,
+                         radiusX - controlX, 0.0f,
+                         radiusX, 0.0f);
         FPDFPath_Close(path);
     } else if (typeInt == 14) {
         const int segmentCount = 32;
@@ -11551,6 +11682,25 @@ static bool appendSimplePdfStampShapeObject(
     const bool isSpike = shapeString && (
             strstr(shapeString, "\"shapeType\":\"spike\"") != nullptr ||
             strstr(shapeString, "\"shapeType\": \"spike\"") != nullptr);
+    const bool isCustomPolygon = shapeString && (
+            strstr(shapeString, "\"shapeType\":\"custom_polygon\"") != nullptr ||
+            strstr(shapeString, "\"shapeType\": \"custom_polygon\"") != nullptr);
+    const bool isStar = shapeString && (
+            strstr(shapeString, "\"shapeType\":\"star\"") != nullptr ||
+            strstr(shapeString, "\"shapeType\": \"star\"") != nullptr);
+    const bool isSpeechBubble = shapeString && (
+            strstr(shapeString, "\"shapeType\":\"speech_bubble\"") != nullptr ||
+            strstr(shapeString, "\"shapeType\": \"speech_bubble\"") != nullptr);
+    int strokeLineCap = FPDF_LINECAP_ROUND;
+    if (shapeString && (
+            strstr(shapeString, "\"strokeCap\":\"butt\"") != nullptr ||
+            strstr(shapeString, "\"strokeCap\": \"butt\"") != nullptr)) {
+        strokeLineCap = FPDF_LINECAP_BUTT;
+    } else if (shapeString && (
+            strstr(shapeString, "\"strokeCap\":\"square\"") != nullptr ||
+            strstr(shapeString, "\"strokeCap\": \"square\"") != nullptr)) {
+        strokeLineCap = FPDF_LINECAP_PROJECTING_SQUARE;
+    }
     const int typeInt = shapeString ? GetPdfShapeTypeFromMeta(shapeString, 12) : 12;
     if (shapeString) env->ReleaseStringUTFChars(jShapeString, shapeString);
     if (jShapeString) env->DeleteLocalRef(jShapeString);
@@ -11585,6 +11735,20 @@ static bool appendSimplePdfStampShapeObject(
     const float startAngle = static_cast<float>(optDoubleValue("startAngle", 0.0));
     const float sweepAngle = static_cast<float>(optDoubleValue("sweepAngle", 360.0));
     const int spikeCount = std::max(2, std::min(optIntValue("spikeCount", 12), 180));
+    const int polygonSideCount = std::max(3, std::min(optIntValue("polygonSideCount", 6), 20));
+    const int starArmCount = std::max(3, std::min(optIntValue("starArmCount", 5), 20));
+    const float starInnerRadiusRatio = static_cast<float>(
+            optDoubleValue("starInnerRadiusRatio", 0.45));
+    const float speechPointerTipXRatio = static_cast<float>(
+            optDoubleValue("speechPointerTipXRatio", 0.22));
+    const float speechPointerTipYRatio = static_cast<float>(
+            optDoubleValue("speechPointerTipYRatio", 1.28));
+    const float speechPointerBaseCenterXRatio = static_cast<float>(
+            optDoubleValue("speechPointerBaseCenterXRatio", 0.28));
+    const float speechPointerBaseCenterYRatio = static_cast<float>(
+            optDoubleValue("speechPointerBaseCenterYRatio", 1.0));
+    const float speechPointerWidthRatio = static_cast<float>(
+            optDoubleValue("speechPointerWidthRatio", 0.18));
 
     const int strokeR = optIntValue("strokeR", 0);
     const int strokeG = optIntValue("strokeG", 0);
@@ -11617,6 +11781,18 @@ static bool appendSimplePdfStampShapeObject(
                 sweepAngle,
                 isSpike,
                 spikeCount,
+                isCustomPolygon,
+                polygonSideCount,
+                isStar,
+                starArmCount,
+                starInnerRadiusRatio,
+                isSpeechBubble,
+                speechPointerTipXRatio,
+                speechPointerTipYRatio,
+                speechPointerBaseCenterXRatio,
+                speechPointerBaseCenterYRatio,
+                speechPointerWidthRatio,
+                strokeLineCap,
                 page
         );
     }
@@ -11641,7 +11817,19 @@ static bool appendSimplePdfStampShapeObject(
             startAngle,
             sweepAngle,
             isSpike,
-            spikeCount
+            spikeCount,
+            isCustomPolygon,
+            polygonSideCount,
+            isStar,
+            starArmCount,
+            starInnerRadiusRatio,
+            isSpeechBubble,
+            speechPointerTipXRatio,
+            speechPointerTipYRatio,
+            speechPointerBaseCenterXRatio,
+            speechPointerBaseCenterYRatio,
+            speechPointerWidthRatio,
+            strokeLineCap
     );
 }
 
