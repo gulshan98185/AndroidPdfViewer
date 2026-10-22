@@ -19,6 +19,7 @@ extern "C" {
 using namespace android;
 
 #include <fpdf_doc.h>
+#include <fpdf_save.h>
 #include <fpdfview.h>
 #include <fpdf_doc.h>
 #include <string>
@@ -66,6 +67,31 @@ public:
 
     ~DocumentFile();
 };
+
+struct PdfiumFdWriter {
+    FPDF_FILEWRITE base;
+    int fd;
+};
+
+static int writePdfiumBlock(FPDF_FILEWRITE* fileWrite, const void* data, unsigned long size) {
+    PdfiumFdWriter* writer = reinterpret_cast<PdfiumFdWriter*>(fileWrite);
+    const unsigned char* cursor = static_cast<const unsigned char*>(data);
+    size_t remaining = static_cast<size_t>(size);
+
+    while (remaining > 0) {
+        const size_t chunkSize = remaining > 1024 * 1024 ? 1024 * 1024 : remaining;
+        const ssize_t written = write(writer->fd, cursor, chunkSize);
+        if (written < 0 && errno == EINTR) {
+            continue;
+        }
+        if (written <= 0) {
+            return 0;
+        }
+        cursor += written;
+        remaining -= static_cast<size_t>(written);
+    }
+    return 1;
+}
 
 DocumentFile::~DocumentFile() {
     if (pdfDocument != NULL) {
@@ -300,6 +326,30 @@ JNI_FUNC(jint, PdfiumCore, nativeGetPageCount)(JNI_ARGS, jlong documentPtr) {
 JNI_FUNC(void, PdfiumCore, nativeCloseDocument)(JNI_ARGS, jlong documentPtr) {
     DocumentFile *doc = reinterpret_cast<DocumentFile *>(documentPtr);
     delete doc;
+}
+
+JNI_FUNC(jboolean, PdfiumCore, nativeSaveDocumentWithoutSecurity)(JNI_ARGS,
+                                                                  jlong documentPtr,
+                                                                  jint fd) {
+    if (documentPtr == 0 || fd < 0) {
+        return JNI_FALSE;
+    }
+
+    DocumentFile* doc = reinterpret_cast<DocumentFile*>(documentPtr);
+    if (doc->pdfDocument == nullptr) {
+        return JNI_FALSE;
+    }
+
+    PdfiumFdWriter writer{};
+    writer.base.version = 1;
+    writer.base.WriteBlock = &writePdfiumBlock;
+    writer.fd = fd;
+
+    const FPDF_BOOL saved = FPDF_SaveAsCopy(
+            doc->pdfDocument,
+            &writer.base,
+            FPDF_NO_INCREMENTAL | FPDF_REMOVE_SECURITY);
+    return saved ? JNI_TRUE : JNI_FALSE;
 }
 
 static jlong loadPageInternal(JNIEnv *env, DocumentFile *doc, int pageIndex) {
@@ -1054,7 +1104,6 @@ Java_com_shockwave_pdfium_PdfiumCore_nativeGetTextCount(
 #include <android/log.h>
 #include <stdio.h>
 #include <string.h>
-#include "fpdf_save.h"
 #include "fpdf_annot.h"
 #include "fpdf_edit.h"
 #include "fpdfview.h"

@@ -35,6 +35,8 @@ public class PdfiumCore {
 
     private native long nativeOpenMemDocument(byte[] data, String password);
 
+    private native boolean nativeSaveDocumentWithoutSecurity(long docPtr, int fd);
+
     private native void nativeCloseDocument(long docPtr);
 
     private native int nativeGetPageCount(long docPtr);
@@ -308,6 +310,24 @@ public class PdfiumCore {
     public int getPageCount(PdfDocument doc) {
         synchronized (lock) {
             return nativeGetPageCount(doc.mNativeDocPtr);
+        }
+    }
+
+    /**
+     * Save a copy of the document without its password/security settings.
+     * The supplied descriptor must be writable and positioned at the start of
+     * an empty or truncated output file. The caller retains ownership of it.
+     */
+    public boolean saveDocumentWithoutSecurity(PdfDocument doc, ParcelFileDescriptor outputFd) {
+        if (doc == null || outputFd == null) {
+            throw new IllegalArgumentException("Document and output descriptor are required.");
+        }
+        int fd = getNumFd(outputFd);
+        if (fd < 0) {
+            return false;
+        }
+        synchronized (lock) {
+            return nativeSaveDocumentWithoutSecurity(doc.mNativeDocPtr, fd);
         }
     }
 
