@@ -74,8 +74,12 @@ public class PdfiumCore {
     private native long nativeGetBookmarkDestIndex(long docPtr, long bookmarkPtr);
 
     private native String nativeGetText(long textPtr);
+    private native String nativeGetSelectionText(long textPtr, int start, int count);
+    private native int nativeGetTextIndexFromCharIndex(long textPtr, int index);
+    private native int nativeGetCharIndexFromTextIndex(long textPtr, int index);
 
     private native int nativeGetCharIndexAtCoord(long pagePtr, double width, double height, long textPtr, double posX, double posY, double tolX, double tolY);
+    private native int nativeGetViewerCharIndexAtCoord(long pagePtr, double width, double height, long textPtr, double posX, double posY, double tolX, double tolY);
 
     private native void nativeRenderPageBitmap(long docPtr, long pagePtr, Bitmap bitmap, int dpi,int startX, int startY,int drawSizeHor, int drawSizeVer,boolean renderAnnot);
 
@@ -84,6 +88,8 @@ public class PdfiumCore {
     private native String nativeGetLinkTarget(long docPtr, long linkPtr);
 
     private native long nativeLoadTextPage(long pagePtr);
+    private native long[] nativeCreateViewerSelectionTextPage(long docPtr, int pageIndex);
+    private native void nativeCloseViewerSelectionTextPage(long owner);
 
     private native Size nativeGetPageSizeByIndex(long docPtr, int pageIndex, int dpi);
 
@@ -146,6 +152,17 @@ public class PdfiumCore {
         synchronized (lock) {
             return nativeLoadTextPage(pagePtr);
         }
+    }
+
+    /** Owns an isolated page/text page; returned values are owner and text handles. */
+    public long[] createViewerSelectionTextPage(PdfDocument document, int pageIndex) {
+        synchronized (lock) {
+            return nativeCreateViewerSelectionTextPage(document.mNativeDocPtr, pageIndex);
+        }
+    }
+
+    public void closeViewerSelectionTextPage(long owner) {
+        synchronized (lock) { nativeCloseViewerSelectionTextPage(owner); }
     }
 
     public int getTextRects(long pagePtr, int offsetY, int offsetX, Size size, ArrayList<RectF> arr, long textPtr, int selSt, int selEd) {
@@ -234,9 +251,27 @@ public class PdfiumCore {
         }
     }
 
+    public String getSelectionText(long textPtr, int start, int count) {
+        synchronized (lock) { return nativeGetSelectionText(textPtr, start, count); }
+    }
+
+    public int getTextIndexFromCharIndex(long textPtr, int index) {
+        synchronized (lock) { return nativeGetTextIndexFromCharIndex(textPtr, index); }
+    }
+
+    public int getCharIndexFromTextIndex(long textPtr, int index) {
+        synchronized (lock) { return nativeGetCharIndexFromTextIndex(textPtr, index); }
+    }
+
     public int getCharIndexAtCoord(long pagePtr, double width, double height, long textPtr, double posX, double posY, double tolX, double tolY) {
         synchronized (lock) {
             return nativeGetCharIndexAtCoord(pagePtr, width, height, textPtr, posX, posY, tolX, tolY);
+        }
+    }
+
+    public int getViewerCharIndexAtCoord(long pagePtr, double width, double height, long textPtr, double posX, double posY, double tolX, double tolY) {
+        synchronized (lock) {
+            return nativeGetViewerCharIndexAtCoord(pagePtr, width, height, textPtr, posX, posY, tolX, tolY);
         }
     }
 

@@ -41,9 +41,17 @@ using namespace android;
 #include <cstdint>
 #include <cfloat>
 #include <climits>
+#include <limits>
+#include <memory>
+#include <stdexcept>
+#include <new>
+#include <utility>
+#include <exception>
 #include <chrono>
 #include <zlib.h>
 #include <fpdf_text.h>
+#include <fpdf_searchex.h>
+#include <fpdf_ppo.h>
 
 #define WM_LOGE(...) do {} while (0)
 
@@ -53,6 +61,29 @@ static std::map<FPDF_DOCUMENT, std::map<std::string, FPDF_FONT>> sTextEditFontCa
 static void clearTextEditFontCache(FPDF_DOCUMENT document);
 
 static int sLibraryReferenceCount = 0;
+
+// Match PdfCustomNativeSaver.MAX_ATTACHMENT_BYTES. PDFium needs whole-file buffers.
+static constexpr unsigned long kMaxAttachmentBytes = 16UL * 1024 * 1024;
+
+static bool ReadBoundedAttachmentFile(const char* path, std::vector<unsigned char>& bytes) {
+    std::ifstream input(path, std::ios::binary | std::ios::ate);
+    if (!input.is_open()) return false;
+    const std::streamoff size = input.tellg();
+    if (size < 0 || size > static_cast<std::streamoff>(kMaxAttachmentBytes)) {
+        LOGE("PDF_FILE_ATTACHMENT rejected invalid or oversized payload");
+        return false;
+    }
+    try {
+        bytes.resize(static_cast<size_t>(size));
+    } catch (const std::bad_alloc&) {
+        LOGE("PDF_FILE_ATTACHMENT allocation failed");
+        return false;
+    }
+    input.seekg(0, std::ios::beg);
+    if (!bytes.empty()) input.read(reinterpret_cast<char*>(bytes.data()), size);
+    // Reject truncation/growth rather than embedding partial data from a changing file.
+    return !input.fail() && input.peek() == std::ifstream::traits_type::eof();
+}
 
 static void initLibraryIfNeed() {
     Mutex::Autolock lock(sLibraryLock);
@@ -1000,18 +1031,89 @@ JNI_FUNC(jlong, PdfiumCore, nativeGetLinkAtCoord)(JNI_ARGS, jlong pagePtr, jdoub
 JNI_FUNC(jint, PdfiumCore, nativeGetCharIndexAtCoord)(JNI_ARGS, jlong pagePtr, jdouble width,
                                                       jdouble height, jlong textPtr, jdouble posX,
                                                       jdouble posY, jdouble tolX, jdouble tolY) {
+    if (!pagePtr || !textPtr || width <= 0 || height <= 0) return -1;
     double px, py;
-    FPDF_DeviceToPage((FPDF_PAGE) pagePtr, 0, 0, width, height, 0, posX, posY, &px, &py);
+    if (!FPDF_DeviceToPage((FPDF_PAGE) pagePtr, 0, 0, width, height, 0, posX, posY, &px, &py)) return -1;
     return FPDFText_GetCharIndexAtPos((FPDF_TEXTPAGE) textPtr, px, py, tolX, tolY);
 }
+JNI_FUNC(jint, PdfiumCore, nativeGetViewerCharIndexAtCoord)(JNI_ARGS, jlong pagePtr,
+        jdouble width, jdouble height, jlong textPtr, jdouble posX, jdouble posY,
+        jdouble tolX, jdouble tolY) {
+    if (!pagePtr || !textPtr || width <= 0 || height <= 0 ||
+        !std::isfinite(width) || !std::isfinite(height) ||
+        !std::isfinite(posX) || !std::isfinite(posY) ||
+        !std::isfinite(tolX) || !std::isfinite(tolY) || tolX < 0 || tolY < 0) return -1;
+    FPDF_PAGE page = reinterpret_cast<FPDF_PAGE>(pagePtr);
+    FPDF_TEXTPAGE text = reinterpret_cast<FPDF_TEXTPAGE>(textPtr);
+    double px, py;
+    if (!FPDF_DeviceToPage(page, 0, 0, width, height, 0, posX, posY, &px, &py)) return -1;
+    // Preserve normal viewer hit-testing and every annotation/Edit Text caller.
+    if (FPDFPage_GetRotation(page) == 0)
+        return FPDFText_GetCharIndexAtPos(text, px, py, tolX, tolY);
+    const int exact = FPDFText_GetCharIndexAtPos(text, px, py, 0, 0);
+    if (exact >= 0) return exact;
+
+    // A broad tolerance may return a neighbouring line, especially when /Rotate changes
+    // PDFium's reading order. Rank real glyph bounds, not the first accepted character.
+    int nearest = -1;
+    double bestDistance = std::numeric_limits<double>::max();
+    double bestCenterDistance = std::numeric_limits<double>::max();
+    const int count = FPDFText_CountChars(text);
+    for (int index = 0; index < count; ++index) {
+        double left, right, bottom, top;
+        if (!FPDFText_GetCharBox(text, index, &left, &right, &bottom, &top) ||
+            !std::isfinite(left) || !std::isfinite(right) ||
+            !std::isfinite(bottom) || !std::isfinite(top) || right <= left || top <= bottom) continue;
+        const double dx = std::max(0.0, std::max(left - px, px - right));
+        const double dy = std::max(0.0, std::max(bottom - py, py - top));
+        if (dx > tolX || dy > tolY) continue;
+        const double distance = dx * dx + dy * dy;
+        const double cx = px - (left + right) * 0.5;
+        const double cy = py - (bottom + top) * 0.5;
+        const double centerDistance = cx * cx + cy * cy;
+        if (distance < bestDistance || (distance == bestDistance && centerDistance < bestCenterDistance)) {
+            nearest = index;
+            bestDistance = distance;
+            bestCenterDistance = centerDistance;
+        }
+    }
+    return nearest;
+}
+
 JNI_FUNC(jstring, PdfiumCore, nativeGetText)(JNI_ARGS, jlong textPtr) {
     int len = FPDFText_CountChars((FPDF_TEXTPAGE) textPtr);
-    //unsigned short* buffer = malloc(len*sizeof(unsigned short));
-    unsigned short *buffer = new unsigned short[len + 1];
-    FPDFText_GetText((FPDF_TEXTPAGE) textPtr, 0, len, buffer);
-    jstring ret = env->NewString(buffer, len);
-    delete[]buffer;
-    return ret;
+    if (len <= 0) return env->NewStringUTF("");
+    try {
+        std::vector<unsigned short> buffer((size_t)len + 1, 0);
+        const int written = FPDFText_GetText((FPDF_TEXTPAGE) textPtr, 0, len, buffer.data());
+        return env->NewString(buffer.data(), std::max(0, std::min(written - 1, len)));
+    } catch (const std::exception &) {
+        jniThrowException(env, "java/lang/IllegalStateException", "Unable to extract PDF text");
+        return nullptr;
+    }
+}
+
+JNI_FUNC(jstring, PdfiumCore, nativeGetSelectionText)(JNI_ARGS, jlong textPtr, jint start, jint count) {
+    const int total = FPDFText_CountChars((FPDF_TEXTPAGE)textPtr);
+    if (!textPtr || start < 0 || start >= total || count <= 0)
+        return env->NewStringUTF("");
+    count = std::min(count, total - start);
+    try {
+        std::vector<unsigned short> buffer((size_t)count + 1, 0);
+        const int written = FPDFText_GetText((FPDF_TEXTPAGE)textPtr, start, count, buffer.data());
+        return env->NewString(buffer.data(), std::max(0, std::min(written - 1, count)));
+    } catch (const std::exception &) {
+        jniThrowException(env, "java/lang/IllegalStateException", "Unable to extract selected PDF text");
+        return nullptr;
+    }
+}
+
+JNI_FUNC(jint, PdfiumCore, nativeGetTextIndexFromCharIndex)(JNI_ARGS, jlong textPtr, jint index) {
+    return FPDFText_GetTextIndexFromCharIndex((FPDF_TEXTPAGE)textPtr, index);
+}
+
+JNI_FUNC(jint, PdfiumCore, nativeGetCharIndexFromTextIndex)(JNI_ARGS, jlong textPtr, jint index) {
+    return FPDFText_GetCharIndexFromTextIndex((FPDF_TEXTPAGE)textPtr, index);
 }
 
 JNI_FUNC(void, PdfiumCore, nativeRenderPageBitmap)(JNI_ARGS, jlong docPtr, jlong pagePtr, jobject bitmap,
@@ -1343,7 +1445,13 @@ JNI_FUNC(jint, PdfiumCore, nativeCountAndGetRects)(JNI_ARGS, jlong pagePtr, jint
                                                    jint offsetX, jint width, jint height,
                                                    jobject arr, jlong textPtr, jint st, jint ed,
                                                    jboolean mergeAdjacent) {
+    if (!pagePtr || !textPtr || !arr || width <= 0 || height <= 0 || st < 0) return 0;
+    const int totalChars = FPDFText_CountChars((FPDF_TEXTPAGE)textPtr);
+    if (st >= totalChars || ed == 0 || ed < -1) return 0;
+    ed = ed == -1 ? totalChars - st : std::min(ed, totalChars - st);
+    try {
     if (init_classes) initClasses(env);
+    if (env->ExceptionCheck()) return 0;
     //jclass arrList = env->FindClass("java/util/ArrayList");
     //jmethodID arrList_add = env->GetMethodID(arrList,"add","(Ljava/lang/Object;)Z");
     //jmethodID arrList_get = env->GetMethodID(arrList,"get","(I)Ljava/lang/Object;");
@@ -1355,6 +1463,7 @@ JNI_FUNC(jint, PdfiumCore, nativeCountAndGetRects)(JNI_ARGS, jlong pagePtr, jint
     //jmethodID rectF_set = env->GetMethodID(rectF, "set", "(FFFF)V");
 
     int rectCount = FPDFText_CountRects((FPDF_TEXTPAGE) textPtr, (int) st, (int) ed);
+    if (rectCount <= 0) return 0;
     struct DeviceTextRect {
         float left;
         float top;
@@ -1368,18 +1477,17 @@ JNI_FUNC(jint, PdfiumCore, nativeCountAndGetRects)(JNI_ARGS, jlong pagePtr, jint
     int deviceRight, deviceBottom;
     for (int i = 0; i < rectCount; i++) {//"RectF(373.0, 405.0, 556.0, 434.0)"
         if (FPDFText_GetRect((FPDF_TEXTPAGE) textPtr, i, &left, &top, &right, &bottom)) {
-            FPDF_PageToDevice((FPDF_PAGE) pagePtr, 0, 0, (int)width, (int)height, 0, left, top, &deviceX,
-                              &deviceY);
-
-            FPDF_PageToDevice((FPDF_PAGE) pagePtr, 0, 0, (int)width, (int)height, 0, right, bottom, &deviceRight,
-                              &deviceBottom);
+            if (!FPDF_PageToDevice((FPDF_PAGE) pagePtr, 0, 0, (int)width, (int)height, 0, left, top, &deviceX,
+                              &deviceY) ||
+                !FPDF_PageToDevice((FPDF_PAGE) pagePtr, 0, 0, (int)width, (int)height, 0, right, bottom, &deviceRight,
+                              &deviceBottom)) continue;
             /*int new_width = right - left;
             int new_height = top - bottom;*/
             deviceRects.push_back({
-                (float) (deviceX + offsetX),
-                (float) (deviceY + offsetY),
-                (float) (deviceRight + offsetX),
-                (float) (deviceBottom + offsetY)
+                (float) (std::min(deviceX, deviceRight) + offsetX),
+                (float) (std::min(deviceY, deviceBottom) + offsetY),
+                (float) (std::max(deviceX, deviceRight) + offsetX),
+                (float) (std::max(deviceY, deviceBottom) + offsetY)
             });
         }
     }
@@ -1451,22 +1559,31 @@ JNI_FUNC(jint, PdfiumCore, nativeCountAndGetRects)(JNI_ARGS, jlong pagePtr, jint
 
     const int resultCount = (int) deviceRects.size();
     env->CallVoidMethod(arr, arrList_enssurecap, resultCount);
+    if (env->ExceptionCheck()) return 0;
     const int arraySize = env->CallIntMethod(arr, arrList_size);
+    if (env->ExceptionCheck()) return 0;
     for (int i = 0; i < resultCount; i++) {
         const DeviceTextRect &rect = deviceRects[i];
         if (i >= arraySize) {
             jobject newRect = env->NewObject(
                     rectF, rectF_, rect.left, rect.top, rect.right, rect.bottom);
+            if (!newRect || env->ExceptionCheck()) return 0;
             env->CallBooleanMethod(arr, arrList_add, newRect);
             env->DeleteLocalRef(newRect);
         } else {
             jobject existingRect = env->CallObjectMethod(arr, arrList_get, i);
+            if (!existingRect || env->ExceptionCheck()) return 0;
             env->CallVoidMethod(
                     existingRect, rectF_set, rect.left, rect.top, rect.right, rect.bottom);
             env->DeleteLocalRef(existingRect);
         }
+        if (env->ExceptionCheck()) return 0;
     }
     return resultCount;
+    } catch (const std::exception &) {
+        jniThrowException(env, "java/lang/IllegalStateException", "Unable to extract PDF selection bounds");
+        return 0;
+    }
 }
 
 
@@ -1571,8 +1688,8 @@ JNI_FUNC(jobject, PdfiumCore, nativePageCoordsToDevice)(JNI_ARGS, jlong pagePtr,
 static jlong loadTextPageInternal(JNIEnv *env, FPDF_PAGE page) {
     try {
         FPDF_TEXTPAGE text = FPDFText_LoadPage(page);
-        if (page == NULL) {
-            throw "Loaded page is null";
+        if (text == NULL) {
+            throw "Unable to load text page";
         }
         return reinterpret_cast<jlong>(text);
     } catch (const char *msg) {
@@ -1584,6 +1701,53 @@ static jlong loadTextPageInternal(JNIEnv *env, FPDF_PAGE page) {
         return -1;
     }
 }
+// Own a separate library reference as well as the cloned page. The source document may
+// close before this request-local cache is evicted; never change the displayed page's /Rotate.
+struct ViewerSelectionTextPage {
+    DocumentFile document;
+    FPDF_PAGE page = nullptr;
+    FPDF_TEXTPAGE text = nullptr;
+    ~ViewerSelectionTextPage() {
+        if (text) FPDFText_ClosePage(text);
+        if (page) FPDF_ClosePage(page);
+    }
+};
+
+JNI_FUNC(jlongArray, PdfiumCore, nativeCreateViewerSelectionTextPage)(JNI_ARGS, jlong docPtr, jint pageIndex) {
+    auto* source = reinterpret_cast<DocumentFile*>(docPtr);
+    if (!source || !source->pdfDocument || pageIndex < 0 || pageIndex >= FPDF_GetPageCount(source->pdfDocument)) {
+        jniThrowException(env, "java/lang/IllegalArgumentException", "Invalid viewer selection page");
+        return nullptr;
+    }
+    try {
+        auto owned = std::make_unique<ViewerSelectionTextPage>();
+        owned->document.pdfDocument = FPDF_CreateNewDocument();
+        const int index = pageIndex;
+        if (!owned->document.pdfDocument ||
+            !FPDF_ImportPagesByIndex(owned->document.pdfDocument, source->pdfDocument, &index, 1, 0))
+            throw std::runtime_error("Unable to copy viewer selection page");
+        owned->page = FPDF_LoadPage(owned->document.pdfDocument, 0);
+        if (!owned->page) throw std::runtime_error("Unable to open copied viewer selection page");
+        FPDFPage_SetRotation(owned->page, 0);
+        owned->text = FPDFText_LoadPage(owned->page);
+        if (!owned->text) throw std::runtime_error("Unable to load viewer selection text");
+        jlong handles[2] = {reinterpret_cast<jlong>(owned.get()), reinterpret_cast<jlong>(owned->text)};
+        jlongArray result = env->NewLongArray(2);
+        if (!result) return nullptr;
+        env->SetLongArrayRegion(result, 0, 2, handles);
+        if (env->ExceptionCheck()) return nullptr;
+        owned.release();
+        return result;
+    } catch (const std::exception& failure) {
+        jniThrowException(env, "java/lang/IllegalStateException", failure.what());
+        return nullptr;
+    }
+}
+
+JNI_FUNC(void, PdfiumCore, nativeCloseViewerSelectionTextPage)(JNI_ARGS, jlong owner) {
+    delete reinterpret_cast<ViewerSelectionTextPage*>(owner);
+}
+
 JNI_FUNC(jlong, PdfiumCore, nativeLoadTextPage)(JNI_ARGS, jlong pagePtr) {
     return loadTextPageInternal(env, (FPDF_PAGE) pagePtr);
 }
@@ -1746,7 +1910,7 @@ static jstring GetBridgeDataPropertyJString(JNIEnv* env, jobject obj, jfieldID d
 static jstring BuildBridgeDataPropertiesJString(JNIEnv* env, jclass jsonClass, jmethodID jsonInit, jmethodID jsonPut, jmethodID jsonToString, jstring textProps, jstring fhProps, jstring imageProps, jstring shapeProps, jstring simplePdfStampProps = nullptr, jstring attachmentProps = nullptr);
 static void processStickyNoteComment(JNIEnv* env, jobject obj, FPDF_ANNOTATION annot, jfieldID commentPropsField, int r, int g, int b, int alpha, jclass jsonClass, jmethodID jsonInit);
 static void processTextStamp(JNIEnv* env, jobject obj, FPDF_DOCUMENT doc, FPDF_PAGE page, FPDF_ANNOTATION annot, FS_RECTF rect, jfieldID textPropsField, int r, int g, int b, int alpha, jclass jsonClass, jmethodID jsonInit);
-static void processFreeText(JNIEnv* env, jobject obj, FPDF_DOCUMENT doc, FPDF_PAGE page, FS_RECTF rect, jfieldID textPropsField, int r, int g, int b, int alpha, jclass jsonClass, jmethodID jsonInit);
+static void processFreeText(JNIEnv* env, jobject obj, FPDF_DOCUMENT doc, FPDF_PAGE page, FS_RECTF rect, jfieldID textPropsField, int r, int g, int b, int alpha, jclass jsonClass, jmethodID jsonInit, bool strictContent = false);
 static bool processStickerStamp(JNIEnv* env, FPDF_DOCUMENT doc, FPDF_PAGE page, FPDF_ANNOTATION annot, FS_RECTF rect, jobject json, jstring jJsonStr, jmethodID optS, jmethodID optD, jmethodID optI, jmethodID optB, int r, int g, int b, int alpha, bool saveAsPageContent = false);
 static bool processSvgPathStamp(JNIEnv* env, FPDF_PAGE page, FPDF_ANNOTATION annot, FS_RECTF rect, jobject json, jstring jJsonStr, jmethodID optS, jmethodID optD, jmethodID optI, jmethodID optB, int r, int g, int b, int alpha, bool saveAsPageContent = false);
 static bool processImageOrPresetStamp(JNIEnv* env, jobject obj, FPDF_DOCUMENT doc, FPDF_PAGE page, FPDF_ANNOTATION annot, FS_RECTF rect, jfieldID imagePropsField, jclass jsonClass, jmethodID jsonInit, bool saveAsPageContent = false);
@@ -1756,7 +1920,7 @@ static bool processSimplePdfStamp(JNIEnv* env, jobject obj, FPDF_DOCUMENT doc, F
 static bool processPageLevelTextWatermark(JNIEnv* env, jobject obj, FPDF_DOCUMENT doc, FPDF_PAGE page, jfieldID dataPropsField, jclass jsonClass, jmethodID jsonInit);
 struct RawPdfWatermarkSpec;
 static bool CollectPageLevelTextWatermarkPatternSpec(JNIEnv* env, jobject obj, jfieldID dataPropsField, jclass jsonClass, jmethodID jsonInit, RawPdfWatermarkSpec* outSpec);
-static bool PatchRawPdfWatermarkPatterns(JNIEnv* env, const char* outputPath, const std::vector<RawPdfWatermarkSpec>& specs);
+static bool PatchRawPdfWatermarkPatterns(JNIEnv* env, const char* outputPath, const std::vector<RawPdfWatermarkSpec>& specs, bool strictPdfToolkit = false);
 static bool AppendPdfEditContentMarker(const char* outputPath);
 static bool PdfFileHasPdfiumGraphicsStateWrapperMarker(const char* inputPath);
 static bool AppendPdfiumGraphicsStateWrapperMarker(const char* outputPath);
@@ -4210,6 +4374,59 @@ static bool WriteStringToFile(const char* path, const std::string& data) {
     return true;
 }
 
+// PDF-toolkit staging only: never publish a partially written or unflushed PDF.
+static bool WriteCheckedToolkitWatermarkFile(const char* path, const std::string& data,
+                                            const char* tool = "PDF_WATERMARK") {
+    FILE* file = fopen(path, "wb");
+    if (!file) return false;
+    bool success = fwrite(data.data(), 1, data.size(), file) == data.size();
+    if (fflush(file) != 0 || ferror(file) || fsync(fileno(file)) != 0) success = false;
+    if (fclose(file) != 0) success = false;
+    if (!success) LOGE("%s staged write failed; working PDF retained", tool);
+    return success;
+}
+
+static bool CopyCheckedToolkitWatermarkFile(const char* source, const char* destination) {
+    FILE* input = fopen(source, "rb");
+    if (!input) return false;
+    FILE* output = fopen(destination, "wb");
+    if (!output) { fclose(input); return false; }
+    char buffer[64 * 1024];
+    bool success = true;
+    size_t size;
+    while ((size = fread(buffer, 1, sizeof(buffer), input)) > 0) {
+        if (fwrite(buffer, 1, size, output) != size) { success = false; break; }
+    }
+    if (ferror(input) || fflush(output) != 0 || ferror(output) || fsync(fileno(output)) != 0) success = false;
+    if (fclose(input) != 0) success = false;
+    if (fclose(output) != 0) success = false;
+    return success;
+}
+
+// Estimate headroom before whole-file/object scanning, without imposing a fixed PDF size cap.
+// Recheck after PDFium serialization because compressed-object inputs can expand.
+static bool HasToolkitWatermarkMemoryHeadroom(const char* path, const char* tool = "PDF_WATERMARK") {
+    struct stat info{};
+    if (stat(path, &info) != 0 || info.st_size <= 0) return false;
+    std::ifstream memory("/proc/meminfo");
+    std::string line;
+    while (std::getline(memory, line)) {
+        if (line.compare(0, 13, "MemAvailable:") != 0) continue;
+        unsigned long long availableKb = 0;
+        if (sscanf(line.c_str() + 13, "%llu", &availableKb) != 1) break;
+        // Reserve half of currently available system memory for the viewer/other processes.
+        const uint64_t budget = availableKb * 1024ULL / 2;
+        const uint64_t reserve = 32ULL * 1024 * 1024;
+        if (budget <= reserve || static_cast<uint64_t>(info.st_size) > (budget - reserve) / 4) {
+            LOGE("%s insufficient memory headroom; working PDF retained", tool);
+            return false;
+        }
+        return true;
+    }
+    // Some kernels omit MemAvailable. Allocation exceptions still fail at the JNI boundary.
+    return true;
+}
+
 static bool ReadFileTailToString(
         const char* path,
         size_t maximumBytes,
@@ -4871,8 +5088,76 @@ static bool BuildRasterWatermarkImageReplacements(
         return true;
     }
 
-    WM_LOGE("Native raster watermark requires prepared JPEG asset: path=%s", spec.imagePath.c_str());
-    return false;
+    // Only the PDF-toolkit opt-in prepares PNG. Keep the legacy JPEG route above unchanged.
+    if (spec.imagePath.size() < 4 || spec.imagePath.compare(spec.imagePath.size() - 4, 4, ".png") != 0 ||
+        smaskObjectNumber <= 0) return false;
+    struct BitmapOwner {
+        JNIEnv* env;
+        jobject value;
+        ~BitmapOwner() {
+            if (!value) return;
+            if (!env->ExceptionCheck()) {
+                jclass cls = env->GetObjectClass(value);
+                jmethodID recycle = cls ? env->GetMethodID(cls, "recycle", "()V") : nullptr;
+                if (recycle) env->CallVoidMethod(value, recycle);
+                if (cls) env->DeleteLocalRef(cls);
+            }
+            env->DeleteLocalRef(value);
+        }
+    } bitmap{env, DecodeBitmapFile(env, spec.imagePath.c_str())};
+    if (!bitmap.value) return false;
+    AndroidBitmapInfo info{};
+    if (AndroidBitmap_getInfo(env, bitmap.value, &info) != ANDROID_BITMAP_RESULT_SUCCESS ||
+        info.format != ANDROID_BITMAP_FORMAT_RGBA_8888 || info.width == 0 || info.height == 0 ||
+        info.width > 1024 || info.height > 1024 || info.stride < info.width * 4) return false;
+    const size_t count = static_cast<size_t>(info.width) * info.height;
+    // Allocate before locking pixels: an allocation exception must not leave the bitmap locked.
+    std::vector<unsigned char> rgb(count * 3);
+    std::vector<unsigned char> alpha(count);
+    void* pixels = nullptr;
+    if (AndroidBitmap_lockPixels(env, bitmap.value, &pixels) != ANDROID_BITMAP_RESULT_SUCCESS) return false;
+    if (!pixels) {
+        AndroidBitmap_unlockPixels(env, bitmap.value);
+        return false;
+    }
+    const bool premultiplied = (info.flags & ANDROID_BITMAP_FLAGS_ALPHA_MASK) == ANDROID_BITMAP_FLAGS_ALPHA_PREMUL;
+    bool transparent = false;
+    for (uint32_t y = 0; y < info.height; ++y) {
+        const auto* row = static_cast<const unsigned char*>(pixels) + y * info.stride;
+        for (uint32_t x = 0; x < info.width; ++x) {
+            const size_t index = static_cast<size_t>(y) * info.width + x;
+            const auto* pixel = row + x * 4;
+            const unsigned int a = pixel[3];
+            alpha[index] = a;
+            transparent = transparent || a < 255;
+            for (size_t channel = 0; channel < 3; ++channel) {
+                // PDF RGB and SMask are straight alpha; Android normally supplies premultiplied RGB.
+                rgb[index * 3 + channel] = a == 0 ? 0 : premultiplied
+                    ? static_cast<unsigned char>(std::min(255U, (pixel[channel] * 255U + a / 2) / a))
+                    : pixel[channel];
+            }
+        }
+    }
+    AndroidBitmap_unlockPixels(env, bitmap.value);
+    auto deflate = [](const std::vector<unsigned char>& source, std::string& encoded) {
+        uLongf size = compressBound(static_cast<uLong>(source.size()));
+        encoded.resize(size);
+        if (compress2(reinterpret_cast<Bytef*>(&encoded[0]), &size, source.data(),
+                      static_cast<uLong>(source.size()), Z_DEFAULT_COMPRESSION) != Z_OK) return false;
+        encoded.resize(size);
+        return true;
+    };
+    std::string rgbData;
+    std::string alphaData;
+    if (!deflate(rgb, rgbData) || (transparent && !deflate(alpha, alphaData))) return false;
+    if (transparent) {
+        replacements->push_back({smaskObjectNumber, 0,
+            BuildPdfImageXObjectBody(alphaData, info.width, info.height, "/DeviceGray", "/FlateDecode", 0)});
+    }
+    replacements->push_back({imageObjectNumber, 0,
+        BuildPdfImageXObjectBody(rgbData, info.width, info.height, "/DeviceRGB", "/FlateDecode",
+                                transparent ? smaskObjectNumber : 0)});
+    return true;
 }
 
 static std::string BuildPdfWatermarkRasterImagePatternStream(
@@ -6171,8 +6456,9 @@ static std::string BuildRawPdfWatermarkPatternKey(const RawPdfWatermarkSpec& spe
 }
 
 // Method that reads the saved PDF as bytes/text and scans PDF objects
-static bool PatchRawPdfWatermarkPatterns(JNIEnv* env, const char* outputPath, const std::vector<RawPdfWatermarkSpec>& specs) {
+static bool PatchRawPdfWatermarkPatterns(JNIEnv* env, const char* outputPath, const std::vector<RawPdfWatermarkSpec>& specs, bool strictPdfToolkit) {
     if (!outputPath) return false;
+    if (strictPdfToolkit && !HasToolkitWatermarkMemoryHeadroom(outputPath)) return false;
 
     std::string data;
     if (!ReadFileToString(outputPath, &data)) {
@@ -6186,7 +6472,26 @@ static bool PatchRawPdfWatermarkPatterns(JNIEnv* env, const char* outputPath, co
         return false;
     }
 
-    const std::vector<PdfObjectInfo> latestObjects = BuildLatestPdfObjectsByRef(objects);
+    // Move, rather than duplicate, large object bodies for the PDF-only strict path.
+    std::vector<PdfObjectInfo> legacyLatestObjects;
+    if (strictPdfToolkit) {
+        std::vector<PdfObjectInfo> compact;
+        std::map<std::string, size_t> indices;
+        for (auto& object : objects) {
+            const std::string key = PdfObjectRefKey(object.objectNumber, object.generation);
+            const auto found = indices.find(key);
+            if (found == indices.end()) {
+                indices[key] = compact.size();
+                compact.push_back(std::move(object));
+            } else {
+                compact[found->second] = std::move(object);
+            }
+        }
+        objects.swap(compact);
+    } else {
+        legacyLatestObjects = BuildLatestPdfObjectsByRef(objects);
+    }
+    const auto& latestObjects = strictPdfToolkit ? objects : legacyLatestObjects;
     const std::set<int> toolkitWatermarkContentObjects = CollectToolkitWatermarkContentObjectNumbers(latestObjects);
     WM_LOGE(
             "Native watermark compact patch found %zu previous toolkit watermark content stream(s)",
@@ -6452,6 +6757,11 @@ static bool PatchRawPdfWatermarkPatterns(JNIEnv* env, const char* outputPath, co
         patchedCount++;
     }
 
+    if (strictPdfToolkit && !specs.empty() && static_cast<size_t>(patchedCount) != specs.size()) {
+        LOGE("PDF_WATERMARK incomplete page patch; staged output rejected");
+        return false;
+    }
+    if (strictPdfToolkit && specs.empty() && patchedCount == 0) return true; // No existing watermark: valid no-op removal.
     if (patchedCount <= 0) {
         WM_LOGE("Native watermark compact patch failed: no page was patched, specs=%zu pages=%zu objects=%zu", specs.size(), pages.size(), objects.size());
         return false;
@@ -6477,7 +6787,7 @@ static bool PatchRawPdfWatermarkPatterns(JNIEnv* env, const char* outputPath, co
         WM_LOGE("Native watermark compact patch failed: unable to append incremental PDF updates, replacements=%zu patched=%d", replacements.size(), patchedCount);
         return false;
     }
-    if (!WriteStringToFile(outputPath, data)) {
+    if (!(strictPdfToolkit ? WriteCheckedToolkitWatermarkFile(outputPath, data) : WriteStringToFile(outputPath, data))) {
         WM_LOGE("Native watermark compact patch failed: unable to write patched PDF");
         return false;
     }
@@ -7668,18 +7978,16 @@ static bool ProcessFileAttachment(
     bool success = false;
 
     if (filePath && fileNameValue && env->GetStringLength(fileNameValue) > 0) {
-        std::ifstream input(filePath, std::ios::binary);
-        std::vector<unsigned char> bytes(
-                (std::istreambuf_iterator<char>(input)),
-                std::istreambuf_iterator<char>());
-        if (input.good() || input.eof()) {
+        std::vector<unsigned char> bytes;
+        if (ReadBoundedAttachmentFile(filePath, bytes)) {
             const std::u16string fileName = JStringToUtf16(env, fileNameValue);
             FPDF_ATTACHMENT attachment = FPDFAnnot_AddFileAttachment(
                     annot, reinterpret_cast<FPDF_WIDESTRING>(fileName.c_str()));
+            const unsigned char emptyFileByte = 0;
             if (attachment && FPDFAttachment_SetFile(
                     attachment,
                     document,
-                    bytes.empty() ? nullptr : bytes.data(),
+                    bytes.empty() ? &emptyFileByte : bytes.data(),
                     static_cast<unsigned long>(bytes.size()))) {
                 if (mimeTypeValue && env->GetStringLength(mimeTypeValue) > 0) {
                     const std::u16string mimeType = JStringToUtf16(env, mimeTypeValue);
@@ -7706,21 +8014,23 @@ static bool ProcessFileAttachment(
                 FPDFAnnot_SetColor(annot, FPDFANNOT_COLORTYPE_Color, red, green, blue, alpha);
                 FPDFAnnot_SetColor(annot, FPDFANNOT_COLORTYPE_InteriorColor, red, green, blue, alpha);
                 FS_RECTF attachmentRect{};
+                bool appearanceWritten = false;
                 if (FPDFAnnot_GetRect(annot, &attachmentRect)) {
                     const std::u16string appearance =
                             BuildFileAttachmentAppearanceStream(
                                     attachmentRect, iconName, red, green, blue);
                     if (!appearance.empty()) {
-                        FPDFAnnot_SetAP(
+                        appearanceWritten = FPDFAnnot_SetAP(
                                 annot,
                                 FPDF_ANNOT_APPEARANCEMODE_NORMAL,
-                                reinterpret_cast<FPDF_WIDESTRING>(appearance.c_str()));
+                                reinterpret_cast<FPDF_WIDESTRING>(appearance.c_str())) != 0;
                     }
                 }
                 if (requestedIconName) {
                     env->ReleaseStringUTFChars(iconNameValue, requestedIconName);
                 }
-                success = true;
+                success = appearanceWritten;
+                if (!success) LOGE("PDF_FILE_ATTACHMENT creation appearance failed");
             }
         }
     }
@@ -7982,6 +8292,7 @@ static void processLink(JNIEnv* env, jobject obj, FPDF_PAGE page, FPDF_ANNOTATIO
         const char* url = env->GetStringUTFChars(jUrl, 0);
         FPDFAnnot_SetURI(annot, url);
         env->ReleaseStringUTFChars(jUrl, url);
+        env->DeleteLocalRef(jUrl);
     }
 
     FS_QUADPOINTSF qp = {rect.left, rect.top, rect.right, rect.top, rect.left, rect.bottom, rect.right, rect.bottom};
@@ -8031,7 +8342,8 @@ static void processStickyNoteComment(
     jstring jIconKey = (jstring)env->CallObjectMethod(json, optString, iconKeyKey);
     jstring jCreatedAtRaw = (jstring)env->CallObjectMethod(json, optString, createdAtRawKey);
 
-    if (jTitle && env->GetStringLength(jTitle) > 0) {
+    // An empty title must clear the old /T of an existing note too.
+    if (jTitle) {
         SetAnnotWideStringValueFromJString(env, annot, "T", jTitle);
     }
     if (jText && env->GetStringLength(jText) > 0) {
@@ -8490,7 +8802,14 @@ static bool SaveToolkitTextWatermarksWithPdfium(
 }
 
 // --- HELPER 2B: EDIT PANEL ADD TEXT CONTENT LOGIC ---
-static void processFreeText(JNIEnv* env, jobject obj, FPDF_DOCUMENT doc, FPDF_PAGE page, FS_RECTF rect, jfieldID textPropsField, int r, int g, int b, int alpha, jclass jsonClass, jmethodID jsonInit) {
+static bool IsDefaultCanvasFontName(const char* name) {
+    return !name || !*name || strcmp(name, "Default") == 0 || strcmp(name, "default") == 0 ||
+           strcmp(name, "sans-serif") == 0 || strcmp(name, "serif") == 0 ||
+           strcmp(name, "monospace") == 0 || strcmp(name, "Helvetica") == 0 ||
+           strcmp(name, "Times-Roman") == 0 || strcmp(name, "Courier") == 0;
+}
+
+static void processFreeText(JNIEnv* env, jobject obj, FPDF_DOCUMENT doc, FPDF_PAGE page, FS_RECTF rect, jfieldID textPropsField, int r, int g, int b, int alpha, jclass jsonClass, jmethodID jsonInit, bool strictContent) {
     jstring jJsonStr = GetBridgeDataPropertyJString(env, obj, textPropsField, jsonClass, jsonInit, "textProperties");
     if (!jJsonStr) {
         return;
@@ -8631,11 +8950,18 @@ static void processFreeText(JNIEnv* env, jobject obj, FPDF_DOCUMENT doc, FPDF_PA
         FILE* f = fopen(fontPath, "rb");
         if (f) {
             fseek(f, 0, SEEK_END); long fSize = ftell(f); rewind(f);
-            std::vector<uint8_t> buffer(fSize); fread(buffer.data(), 1, fSize, f); fclose(f);
-            loadedFont = FPDFText_LoadFont(doc, buffer.data(), fSize, FPDF_FONT_TRUETYPE, true);
+            if (fSize > 0 && fSize <= 64 * 1024 * 1024) {
+                std::vector<uint8_t> buffer(static_cast<size_t>(fSize));
+                if (fread(buffer.data(), 1, buffer.size(), f) == buffer.size()) {
+                    loadedFont = FPDFText_LoadFont(doc, buffer.data(), buffer.size(), FPDF_FONT_TRUETYPE, true);
+                }
+            }
+            fclose(f);
         }
     }
-    if (!loadedFont) {
+    // An explicitly supplied font must not silently turn into Helvetica on final save.
+    if (!loadedFont && (!strictContent ||
+        ((!fontPath || !*fontPath) && IsDefaultCanvasFontName(fontName)))) {
         const char* fallbackFontName = "Helvetica";
         if (fontName) {
             if (strcmp(fontName, "serif") == 0 || strstr(fontName, "Serif") != nullptr || strstr(fontName, "serif") != nullptr) {
@@ -8653,11 +8979,12 @@ static void processFreeText(JNIEnv* env, jobject obj, FPDF_DOCUMENT doc, FPDF_PA
         FPDF_PAGEOBJECT textObject = nullptr;
     };
     std::vector<FreeTextLineBounds> lineBounds(textLines.size());
+    bool textWriteFailed = !loadedFont;
     float maxUnitLineWidth = 0.0f;
     for (size_t lineIndex = 0; lineIndex < textLines.size(); lineIndex++) {
         if (textLines[lineIndex].size() <= 1) continue;
-        FPDF_PAGEOBJECT textObject = FPDFPageObj_CreateTextObj(doc, loadedFont, 1.0f);
-        if (!textObject) continue;
+        FPDF_PAGEOBJECT textObject = loadedFont ? FPDFPageObj_CreateTextObj(doc, loadedFont, 1.0f) : nullptr;
+        if (!textObject) { textWriteFailed = true; continue; }
         if (FPDFText_SetText(textObject, (FPDF_WIDESTRING)textLines[lineIndex].data())) {
             float lineLeft = 0.0f, lineBottom = 0.0f, lineRight = 0.0f, lineTop = 0.0f;
             if (FPDFPageObj_GetBounds(textObject, &lineLeft, &lineBottom, &lineRight, &lineTop)) {
@@ -8666,9 +8993,11 @@ static void processFreeText(JNIEnv* env, jobject obj, FPDF_DOCUMENT doc, FPDF_PA
                 lineBounds[lineIndex].width = fmax(0.0f, lineRight - lineLeft);
                 maxUnitLineWidth = fmax(maxUnitLineWidth, lineBounds[lineIndex].width);
             } else {
+                textWriteFailed = true;
                 FPDFPageObj_Destroy(textObject);
             }
         } else {
+            textWriteFailed = true;
             FPDFPageObj_Destroy(textObject);
         }
     }
@@ -8776,6 +9105,7 @@ static void processFreeText(JNIEnv* env, jobject obj, FPDF_DOCUMENT doc, FPDF_PA
         if (hasStrikeout) drawDecoration(baselineY + (fontSize * 0.30f));
     }
 
+    if (loadedFont) FPDFFont_Close(loadedFont);
     if (rawRenderedText) env->ReleaseStringChars(jRenderedText, rawRenderedText);
     if (fontName) env->ReleaseStringUTFChars(jFont, fontName);
     if (jAlign && alignStr) env->ReleaseStringUTFChars(jAlign, alignStr);
@@ -8787,6 +9117,10 @@ static void processFreeText(JNIEnv* env, jobject obj, FPDF_DOCUMENT doc, FPDF_PA
     if (jFontPath) env->DeleteLocalRef(jFontPath);
     env->DeleteLocalRef(json);
     env->DeleteLocalRef(jJsonStr);
+    if (strictContent && textWriteFailed && !env->ExceptionCheck()) {
+        LOGE("PDF_CONTENT_SAVE unable to create requested text/font");
+        jniThrowException(env, "java/io/IOException", "Unable to save requested PDF text/font");
+    }
 }
 
 // for sticker tff to pdf path conversion code----
@@ -11561,7 +11895,7 @@ static bool processPdfShapeContent(
     const int fillG = optIntValue("fillG", 0);
     const int fillB = optIntValue("fillB", 0);
     const int requestedFillA = std::max(0, std::min(optIntValue("fillA", 0), 255));
-    const int fillA = requestedFillA > 0 ? strokeA : 0;
+    const int fillA = requestedFillA;
     bool arrowStart = false;
     bool arrowEnd = typeInt == 18;
     if (json && optB) {
@@ -11610,7 +11944,7 @@ static bool processPdfShapeContent(
                     strokeB,
                     strokeA,
                     strokeWidth
-            ) || inserted;
+            ) && inserted;
         }
         if (arrowEnd) {
             inserted = InsertPdfShapeArrowHeadContent(
@@ -11622,7 +11956,7 @@ static bool processPdfShapeContent(
                     strokeB,
                     strokeA,
                     strokeWidth
-            ) || inserted;
+            ) && inserted;
         }
     }
 
@@ -11727,6 +12061,16 @@ static bool appendSimplePdfStampShapeObject(
     baseRect.right = fmax(rawLeft, rawRight);
     baseRect.bottom = fmin(rawTop, rawBottom);
     baseRect.top = fmax(rawTop, rawBottom);
+    if (saveAsPageContent) {
+        // A rotated page swaps the mapped rectangle axes, not the shape's local axes.
+        const float centerX = (baseRect.left + baseRect.right) * 0.5f;
+        const float centerY = (baseRect.top + baseRect.bottom) * 0.5f;
+        const float width = static_cast<float>(optDoubleValue("baseWidth", baseRect.right - baseRect.left));
+        const float height = static_cast<float>(optDoubleValue("baseHeight", baseRect.top - baseRect.bottom));
+        if (!std::isfinite(width) || !std::isfinite(height) || width <= 0 || height <= 0) return false;
+        baseRect = {centerX - width * 0.5f, centerY + height * 0.5f,
+                    centerX + width * 0.5f, centerY - height * 0.5f};
+    }
     const float rotation = static_cast<float>(optDoubleValue("rotation", 0.0));
     const float strokeWidth = static_cast<float>(optDoubleValue("strokeWidth", 1.0));
     const float cornerRadius = static_cast<float>(optDoubleValue("cornerRadius", 0.0));
@@ -11951,13 +12295,17 @@ static bool appendSimplePdfStampTextObject(
             fseek(f, 0, SEEK_END);
             long fSize = ftell(f);
             rewind(f);
-            std::vector<uint8_t> buffer(fSize);
-            fread(buffer.data(), 1, fSize, f);
+            if (fSize > 0 && fSize <= 64 * 1024 * 1024) {
+                std::vector<uint8_t> buffer(static_cast<size_t>(fSize));
+                if (fread(buffer.data(), 1, buffer.size(), f) == buffer.size()) {
+                    loadedFont = FPDFText_LoadFont(doc, buffer.data(), buffer.size(), FPDF_FONT_TRUETYPE, true);
+                }
+            }
             fclose(f);
-            loadedFont = FPDFText_LoadFont(doc, buffer.data(), fSize, FPDF_FONT_TRUETYPE, true);
         }
     }
-    if (!loadedFont) {
+    if (!loadedFont && (!saveAsPageContent ||
+        ((!fontPath || !*fontPath) && IsDefaultCanvasFontName(fontName)))) {
         const char* fallbackFont = "Helvetica";
         if (fontName) {
             if (strcmp(fontName, "serif") == 0 || strstr(fontName, "Serif") != nullptr || strstr(fontName, "serif") != nullptr) {
@@ -11970,6 +12318,7 @@ static bool appendSimplePdfStampTextObject(
     }
 
     bool appended = false;
+    bool allTextWritten = loadedFont != nullptr;
     std::vector<std::u16string> layoutLines;
     std::u16string currentLine;
     const int textLength = env->GetStringLength(jTextSource);
@@ -12011,12 +12360,17 @@ static bool appendSimplePdfStampTextObject(
     for (size_t lineIndex = 0; lineIndex < layoutLines.size(); lineIndex++) {
         const std::u16string& lineText = layoutLines[lineIndex];
         if (!lineText.empty()) {
-            FPDF_PAGEOBJECT textObj = FPDFPageObj_CreateTextObj(doc, loadedFont, 1.0f);
+            FPDF_PAGEOBJECT textObj = loadedFont ? FPDFPageObj_CreateTextObj(doc, loadedFont, 1.0f) : nullptr;
             if (textObj) {
-                FPDFText_SetText(textObj, (FPDF_WIDESTRING)lineText.c_str());
+                float tL = 0, tB = 0, tR = 0, tT = 0;
+                if (!FPDFText_SetText(textObj, (FPDF_WIDESTRING)lineText.c_str()) ||
+                    !FPDFPageObj_GetBounds(textObj, &tL, &tB, &tR, &tT)) {
+                    FPDFPageObj_Destroy(textObj);
+                    allTextWritten = false;
+                    baselineYPx += fontSpacingPx * lineSpacing;
+                    continue;
+                }
                 FPDFPageObj_SetFillColor(textObj, textR, textG, textB, textA);
-                float tL, tB, tR, tT;
-                FPDFPageObj_GetBounds(textObj, &tL, &tB, &tR, &tT);
                 const float textW = (tR - tL) * scale;
                 const float textH = (tT - tB) * scale;
                 const float lineWidthPx = textW / fmax(pxToPageX, 0.0001f);
@@ -12049,9 +12403,10 @@ static bool appendSimplePdfStampTextObject(
                     decorationY = localY;
                     decorationHeight = textH;
                 } else {
+                    allTextWritten = false;
                     FPDFPageObj_Destroy(textObj);
                 }
-            }
+            } else allTextWritten = false;
         }
         if (lineIndex < layoutLines.size() - 1) {
             baselineYPx += fontSpacingPx * lineSpacing;
@@ -12081,6 +12436,7 @@ static bool appendSimplePdfStampTextObject(
     if (hasUnderline) drawLine(-0.15f);
     if (hasStrikeout) drawLine(0.30f);
 
+    if (loadedFont) FPDFFont_Close(loadedFont);
     env->ReleaseStringChars(jTextSource, (const jchar*)textContent);
     if (fontPath) env->ReleaseStringUTFChars(jFontPath, fontPath);
     if (alignStr && jAlign) env->ReleaseStringUTFChars(jAlign, alignStr);
@@ -12090,7 +12446,7 @@ static bool appendSimplePdfStampTextObject(
     if (jFont) env->DeleteLocalRef(jFont);
     if (jLayoutText) env->DeleteLocalRef(jLayoutText);
     if (jText) env->DeleteLocalRef(jText);
-    return appended;
+    return appended && (!saveAsPageContent || allTextWritten);
 }
 
 static bool processSimplePdfStamp(
@@ -12221,12 +12577,128 @@ static bool processSimplePdfStamp(
 }
 
 // --- HELPER 3: FREEHAND LOGIC ---
+// Validate before the renderer uses throwing getters or creates PDF objects. Keep
+// malformed geometry as a failed transaction, never a partial successful drawing.
+static bool ValidateFreehandGeometry(JNIEnv* env, jobject json, jclass jsonClass) {
+    if (env->ExceptionCheck() || env->PushLocalFrame(32) < 0) return false;
+    auto validate = [&]() -> bool {
+        jclass arrayClass = env->FindClass("org/json/JSONArray");
+        if (!arrayClass || env->ExceptionCheck()) return false;
+        jmethodID length = env->GetMethodID(arrayClass, "length", "()I");
+        jmethodID objectAt = env->GetMethodID(arrayClass, "optJSONObject", "(I)Lorg/json/JSONObject;");
+        jmethodID array = env->GetMethodID(jsonClass, "optJSONArray", "(Ljava/lang/String;)Lorg/json/JSONArray;");
+        jmethodID number = env->GetMethodID(jsonClass, "optDouble", "(Ljava/lang/String;D)D");
+        jmethodID string = env->GetMethodID(jsonClass, "optString", "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;");
+        if (env->ExceptionCheck() || !length || !objectAt || !array || !number || !string) return false;
+        jstring modeKey = env->NewStringUTF("mode");
+        jstring pointsKey = env->NewStringUTF("points");
+        jstring strokesKey = env->NewStringUTF("strokes");
+        jstring segmentsKey = env->NewStringUTF("segments");
+        jstring xKey = env->NewStringUTF("x");
+        jstring yKey = env->NewStringUTF("y");
+        if (env->ExceptionCheck()) return false;
+        jstring mode = static_cast<jstring>(env->CallObjectMethod(json, string, modeKey, nullptr));
+        if (env->ExceptionCheck() || !mode || env->GetStringLength(mode) == 0) return false;
+        auto validPoints = [&](jobject points) -> bool {
+            if (!points || env->ExceptionCheck()) return false;
+            const int count = env->CallIntMethod(points, length);
+            if (env->ExceptionCheck() || count < 2) return false;
+            for (int i = 0; i < count; ++i) {
+                jobject point = env->CallObjectMethod(points, objectAt, i);
+                if (env->ExceptionCheck() || !point) return false;
+                const double x = env->CallDoubleMethod(point, number, xKey, NAN);
+                if (env->ExceptionCheck()) return false;
+                const double y = env->CallDoubleMethod(point, number, yKey, NAN);
+                if (env->ExceptionCheck()) return false;
+                env->DeleteLocalRef(point);
+                if (!std::isfinite(x) || !std::isfinite(y) ||
+                    !std::isfinite(static_cast<float>(x)) || !std::isfinite(static_cast<float>(y))) return false;
+            }
+            return true;
+        };
+        jobject strokes = env->CallObjectMethod(json, array, strokesKey);
+        if (env->ExceptionCheck()) return false;
+        if (strokes) {
+            const int count = env->CallIntMethod(strokes, length);
+            if (env->ExceptionCheck() || count == 0) return false;
+            for (int i = 0; i < count; ++i) {
+                jobject stroke = env->CallObjectMethod(strokes, objectAt, i);
+                if (env->ExceptionCheck() || !stroke) return false;
+                jobject points = env->CallObjectMethod(stroke, array, pointsKey);
+                if (!validPoints(points)) return false;
+                env->DeleteLocalRef(points);
+                env->DeleteLocalRef(stroke);
+            }
+            return true;
+        }
+        jobject segments = env->CallObjectMethod(json, array, segmentsKey);
+        if (env->ExceptionCheck()) return false;
+        if (segments) return validPoints(segments);
+        jobject points = env->CallObjectMethod(json, array, pointsKey);
+        return validPoints(points);
+    };
+    const bool valid = validate();
+    env->PopLocalFrame(nullptr);
+    if (!valid && !env->ExceptionCheck()) {
+        LOGE("PDF_EDIT_NATIVE rejected malformed freehand geometry");
+        jniThrowException(env, "java/lang/IllegalArgumentException", "Invalid PDF drawing geometry");
+    }
+    return valid;
+}
+
+// Optional only for NEW content signatures; legacy drawing/annotation coordinates stay unchanged.
+static bool ReadContentSignatureMatrix(JNIEnv* env, jobject json, jclass jsonClass,
+                                      bool allowed, FS_MATRIX* matrix, bool* present) {
+    *present = false;
+    if (env->ExceptionCheck() || env->PushLocalFrame(12) < 0) return false;
+    auto read = [&]() -> bool {
+        jmethodID has = env->GetMethodID(jsonClass, "has", "(Ljava/lang/String;)Z");
+        jmethodID array = env->GetMethodID(jsonClass, "optJSONArray", "(Ljava/lang/String;)Lorg/json/JSONArray;");
+        jstring key = env->NewStringUTF("contentMatrix");
+        if (env->ExceptionCheck() || !has || !array || !key) return false;
+        const bool exists = env->CallBooleanMethod(json, has, key);
+        if (env->ExceptionCheck()) return false;
+        if (!exists) return true;
+        if (!allowed) return false;
+        jobject values = env->CallObjectMethod(json, array, key);
+        if (!values || env->ExceptionCheck()) return false;
+        jclass arrayClass = env->GetObjectClass(values);
+        jmethodID length = env->GetMethodID(arrayClass, "length", "()I");
+        jmethodID number = env->GetMethodID(arrayClass, "optDouble", "(ID)D");
+        if (env->ExceptionCheck() || !length || !number || env->CallIntMethod(values, length) != 6) return false;
+        float components[6];
+        for (int i = 0; i < 6; ++i) {
+            const double value = env->CallDoubleMethod(values, number, i, NAN);
+            if (env->ExceptionCheck() || !std::isfinite(value) || !std::isfinite(static_cast<float>(value))) return false;
+            components[i] = static_cast<float>(value);
+        }
+        const double determinant = static_cast<double>(components[0]) * components[3] -
+                                   static_cast<double>(components[1]) * components[2];
+        if (!std::isfinite(determinant) || determinant == 0) return false;
+        *matrix = {components[0], components[1], components[2], components[3], components[4], components[5]};
+        *present = true;
+        return true;
+    };
+    const bool valid = read();
+    env->PopLocalFrame(nullptr);
+    if (!valid && !env->ExceptionCheck()) {
+        LOGE("PDF_SIGNATURE_SAVE rejected invalid content matrix");
+        jniThrowException(env, "java/lang/IllegalArgumentException", "Invalid PDF signature transform");
+    }
+    return valid;
+}
+
 static void processFreeHand(JNIEnv* env, jobject obj, FPDF_PAGE page, jfieldID fhField, int r, int g, int b, jclass jsonClass, jmethodID jsonInit, bool saveAsPageContent) {
     jstring jJsonStr = GetBridgeDataPropertyJString(env, obj, fhField, jsonClass, jsonInit, "fhDrawingProperties");
-    if (!jJsonStr) return;
+    if (env->ExceptionCheck()) return;
+    if (!jJsonStr) {
+        jniThrowException(env, "java/lang/IllegalArgumentException", "Missing PDF drawing geometry");
+        return;
+    }
 
     jobject json = env->NewObject(jsonClass, jsonInit, jJsonStr);
-    if (!json) {
+    if (env->ExceptionCheck() || !json || !ValidateFreehandGeometry(env, json, jsonClass)) {
+        if (json) env->DeleteLocalRef(json);
         env->DeleteLocalRef(jJsonStr);
         return;
     }
@@ -12267,6 +12739,13 @@ static void processFreeHand(JNIEnv* env, jobject obj, FPDF_PAGE page, jfieldID f
         }
     }
 
+    FS_MATRIX contentMatrix{1, 0, 0, 1, 0, 0};
+    bool hasContentMatrix = false;
+    if (!ReadContentSignatureMatrix(env, json, jsonClass, saveAsPageContent && isSignatureDraw,
+                                    &contentMatrix, &hasContentMatrix)) {
+        if (jMode && modeStr) env->ReleaseStringUTFChars(jMode, modeStr);
+        return; // The pending exception aborts the caller's staged save, never publishes partial output.
+    }
     jclass arrayClass = env->FindClass("org/json/JSONArray");
     jmethodID lenM = env->GetMethodID(arrayClass, "length", "()I");
     jmethodID getObjM = env->GetMethodID(arrayClass, "getJSONObject", "(I)Lorg/json/JSONObject;");
@@ -12274,9 +12753,23 @@ static void processFreeHand(JNIEnv* env, jobject obj, FPDF_PAGE page, jfieldID f
     const int alphaValue = env->CallIntMethod(json, optI, jAlphaKey, 255);
     const int lineJoin = env->CallIntMethod(json, optI, jLineJoinKey, FPDF_LINEJOIN_ROUND);
     const int lineCap = env->CallIntMethod(json, optI, jLineCapKey, FPDF_LINECAP_ROUND);
+    if (hasContentMatrix && (!std::isfinite(strokeWidth) || strokeWidth <= 0 ||
+        alphaValue < 0 || alphaValue > 255 || lineCap < 0 || lineCap > 2 || lineJoin < 0 || lineJoin > 2)) {
+        if (jMode && modeStr) env->ReleaseStringUTFChars(jMode, modeStr);
+        jniThrowException(env, "java/lang/IllegalArgumentException", "Invalid PDF signature stroke style");
+        return;
+    }
     const bool isHighlighter = strcmp(modeStr, "HIGHLIGHTER") == 0;
-    auto appendInkPoint = [](std::vector<FS_POINTF>& inkPoints, float x, float y) {
-        if (inkPoints.empty() ||
+    // Preserve the same opacity as the live brush in both PDF routes.
+    const int highlighterAlpha = alphaValue;
+    jmethodID hasProperty = env->GetMethodID(jsonClass, "has", "(Ljava/lang/String;)Z");
+    const bool explicitAnnotationStrokeStyle = !saveAsPageContent &&
+            (env->CallBooleanMethod(json, hasProperty, jLineCapKey) ||
+             env->CallBooleanMethod(json, hasProperty, jLineJoinKey));
+    bool annotationWriteFailed = false;
+    auto appendInkPoint = [hasContentMatrix](std::vector<FS_POINTF>& inkPoints, float x, float y) {
+        // Local signature points can be much closer than a PDF-point threshold.
+        if (hasContentMatrix || inkPoints.empty() ||
             fabs(inkPoints.back().x - x) > 0.01f ||
             fabs(inkPoints.back().y - y) > 0.01f) {
             inkPoints.push_back({x, y});
@@ -12286,6 +12779,7 @@ static void processFreeHand(JNIEnv* env, jobject obj, FPDF_PAGE page, jfieldID f
     auto finalizeInkAnnot = [&](FPDF_PAGEOBJECT path, const std::vector<FS_POINTF>& inkPoints) {
         if (!path || inkPoints.size() < 2) {
             if (path) FPDFPageObj_Destroy(path);
+            annotationWriteFailed = true;
             return;
         }
 
@@ -12302,18 +12796,23 @@ static void processFreeHand(JNIEnv* env, jobject obj, FPDF_PAGE page, jfieldID f
 
         const float effectiveStrokeWidth = strokeWidth > 0.0f ? strokeWidth : 1.0f;
 
-        FPDFPageObj_SetStrokeWidth(path, effectiveStrokeWidth);
-        FPDFPageObj_SetLineJoin(path, lineJoin);
-        FPDFPageObj_SetLineCap(path, lineCap);
+        bool styleReady = FPDFPageObj_SetStrokeWidth(path, effectiveStrokeWidth) != 0;
+        if (!FPDFPageObj_SetLineJoin(path, lineJoin)) styleReady = false;
+        if (!FPDFPageObj_SetLineCap(path, lineCap)) styleReady = false;
         if (isHighlighter) {
-            FPDFPageObj_SetStrokeColor(path, r, g, b, 125);
+            if (!FPDFPageObj_SetStrokeColor(path, r, g, b, highlighterAlpha)) styleReady = false;
             FPDFPageObj_SetBlendMode(path, "Multiply");
         } else {
-            FPDFPageObj_SetStrokeColor(path, r, g, b, alphaValue);
+            if (!FPDFPageObj_SetStrokeColor(path, r, g, b, alphaValue)) styleReady = false;
         }
-        FPDFPath_SetDrawMode(path, 0, JNI_TRUE);
+        if (!FPDFPath_SetDrawMode(path, 0, JNI_TRUE)) styleReady = false;
 
         if (saveAsPageContent) {
+            if (hasContentMatrix && (!styleReady || !FPDFPageObj_SetMatrix(path, &contentMatrix))) {
+                FPDFPageObj_Destroy(path);
+                annotationWriteFailed = true;
+                return;
+            }
             FPDFPage_InsertObject(page, path);
             return;
         }
@@ -12321,23 +12820,24 @@ static void processFreeHand(JNIEnv* env, jobject obj, FPDF_PAGE page, jfieldID f
         const float rectMargin = fmax((effectiveStrokeWidth * 0.5f) + 0.5f, 1.0f);
         FS_RECTF rect = {
                 minX - rectMargin,
-                minY - rectMargin,
+                maxY + rectMargin,
                 maxX + rectMargin,
-                maxY + rectMargin
+                minY - rectMargin
         };
 
         FPDF_ANNOTATION annot = FPDFPage_CreateAnnot(page, FPDF_ANNOT_INK);
         if (!annot) {
             FPDFPageObj_Destroy(path);
+            annotationWriteFailed = true;
             return;
         }
 
         FPDFAnnot_SetBorder(annot, 0, 0, effectiveStrokeWidth);
         FPDFAnnot_SetRect(annot, &rect);
         const int inkStrokeIndex = FPDFAnnot_AddInkStroke(annot, inkPoints.data(), inkPoints.size());
-        FPDFAnnot_SetColor(annot, FPDFANNOT_COLORTYPE_Color, r, g, b, isHighlighter ? 125 : alphaValue);
+        FPDFAnnot_SetColor(annot, FPDFANNOT_COLORTYPE_Color, r, g, b, isHighlighter ? highlighterAlpha : alphaValue);
         bool appendedObject = false;
-        if (!isHighlighter) {
+        if (!isHighlighter && !explicitAnnotationStrokeStyle) {
             FPDFPageObj_Destroy(path);
         } else {
             appendedObject = FPDFAnnot_AppendObject(annot, path);
@@ -12354,7 +12854,8 @@ static void processFreeHand(JNIEnv* env, jobject obj, FPDF_PAGE page, jfieldID f
             }
         }
 
-        if (inkStrokeIndex < 0 || (isHighlighter && !appendedObject)) {
+        if (inkStrokeIndex < 0 || ((isHighlighter || explicitAnnotationStrokeStyle) && !appendedObject)) {
+            annotationWriteFailed = true;
             const int annotIndex = FPDFPage_GetAnnotIndex(page, annot);
             FPDFPage_CloseAnnot(annot);
             if (annotIndex >= 0) {
@@ -12371,7 +12872,9 @@ static void processFreeHand(JNIEnv* env, jobject obj, FPDF_PAGE page, jfieldID f
     };
 
     jobject strokesArray = optA ? env->CallObjectMethod(json, optA, jStrokesKey) : nullptr;
-    if (isSignatureDraw && strokesArray) {
+    // Imported Ink annotations also use strokes, without signature metadata.
+    // Keep their independent pen strokes together instead of requiring root points.
+    if (strokesArray) {
         const int strokeCount = env->CallIntMethod(strokesArray, lenM);
         std::vector<std::vector<FS_POINTF>> inkStrokes;
         float minX = 0.0f;
@@ -12421,17 +12924,27 @@ static void processFreeHand(JNIEnv* env, jobject obj, FPDF_PAGE page, jfieldID f
                     if (inkPoints.size() < 2) continue;
 
                     FPDF_PAGEOBJECT path = FPDFPageObj_CreateNewPath(inkPoints[0].x, inkPoints[0].y);
-                    if (!path) continue;
+                    if (!path) { annotationWriteFailed = true; continue; }
 
+                    bool pathReady = true;
                     for (size_t pointIndex = 1; pointIndex < inkPoints.size(); pointIndex++) {
-                        FPDFPath_LineTo(path, inkPoints[pointIndex].x, inkPoints[pointIndex].y);
+                        if (!FPDFPath_LineTo(path, inkPoints[pointIndex].x, inkPoints[pointIndex].y)) pathReady = false;
                     }
 
-                    FPDFPageObj_SetStrokeWidth(path, effectiveStrokeWidth);
-                    FPDFPageObj_SetLineJoin(path, lineJoin);
-                    FPDFPageObj_SetLineCap(path, lineCap);
-                    FPDFPageObj_SetStrokeColor(path, r, g, b, alphaValue);
-                    FPDFPath_SetDrawMode(path, 0, JNI_TRUE);
+                    if (!FPDFPageObj_SetStrokeWidth(path, effectiveStrokeWidth)) pathReady = false;
+                    if (!FPDFPageObj_SetLineJoin(path, lineJoin)) pathReady = false;
+                    if (!FPDFPageObj_SetLineCap(path, lineCap)) pathReady = false;
+                    if (!FPDFPageObj_SetStrokeColor(path, r, g, b, alphaValue)) pathReady = false;
+                    if (!FPDFPath_SetDrawMode(path, 0, JNI_TRUE)) pathReady = false;
+                    if (hasContentMatrix) {
+                        // Transform the pen as well as its points, just like Canvas.concat().
+                        if (!FPDFPageObj_SetMatrix(path, &contentMatrix)) pathReady = false;
+                    }
+                    if (!pathReady) {
+                        FPDFPageObj_Destroy(path);
+                        annotationWriteFailed = true;
+                        continue;
+                    }
                     FPDFPage_InsertObject(page, path);
                     insertedPathCount++;
                 }
@@ -12440,9 +12953,9 @@ static void processFreeHand(JNIEnv* env, jobject obj, FPDF_PAGE page, jfieldID f
                 const float rectMargin = fmax((effectiveStrokeWidth * 0.5f) + 0.5f, 1.0f);
                 FS_RECTF rect = {
                         minX - rectMargin,
-                        minY - rectMargin,
+                        maxY + rectMargin,
                         maxX + rectMargin,
-                        maxY + rectMargin
+                        minY - rectMargin
                 };
 
                 FPDF_ANNOTATION annot = FPDFPage_CreateAnnot(page, FPDF_ANNOT_INK);
@@ -12457,17 +12970,42 @@ static void processFreeHand(JNIEnv* env, jobject obj, FPDF_PAGE page, jfieldID f
                             break;
                         }
                     }
+                    // Keep the existing Ink subtype/InkList, but persist supplied cap/join in its AP.
+                    if (addedAllStrokes && explicitAnnotationStrokeStyle) {
+                        for (const auto& inkPoints : inkStrokes) {
+                            FPDF_PAGEOBJECT path = FPDFPageObj_CreateNewPath(inkPoints[0].x, inkPoints[0].y);
+                            if (!path) { addedAllStrokes = false; break; }
+                            for (size_t i = 1; i < inkPoints.size(); i++) {
+                                FPDFPath_LineTo(path, inkPoints[i].x, inkPoints[i].y);
+                            }
+                            FPDFPageObj_SetStrokeWidth(path, effectiveStrokeWidth);
+                            FPDFPageObj_SetLineCap(path, lineCap);
+                            FPDFPageObj_SetLineJoin(path, lineJoin);
+                            FPDFPageObj_SetStrokeColor(path, r, g, b, alphaValue);
+                            FPDFPath_SetDrawMode(path, 0, JNI_TRUE);
+                            if (!FPDFAnnot_AppendObject(annot, path)) {
+                                FPDFPageObj_Destroy(path);
+                                addedAllStrokes = false;
+                                break;
+                            }
+                        }
+                    }
                     if (addedAllStrokes) {
-                        SetAnnotWideStringValueFromJString(env, annot, "LufickSignatureSubtype", jSignatureSubtype);
+                        if (isSignatureDraw) {
+                            SetAnnotWideStringValueFromJString(env, annot, "LufickSignatureSubtype", jSignatureSubtype);
+                        }
                         FPDFAnnot_SetFlags(annot, FPDF_ANNOT_FLAG_PRINT);
                         FPDFPage_CloseAnnot(annot);
                     } else {
+                        annotationWriteFailed = true;
                         const int annotIndex = FPDFPage_GetAnnotIndex(page, annot);
                         FPDFPage_CloseAnnot(annot);
                         if (annotIndex >= 0) {
                             FPDFPage_RemoveAnnot(page, annotIndex);
                         }
                     }
+                } else {
+                    annotationWriteFailed = true;
                 }
             }
         }
@@ -12481,6 +13019,7 @@ static void processFreeHand(JNIEnv* env, jobject obj, FPDF_PAGE page, jfieldID f
                 const float startX = (float)env->CallDoubleMethod(firstSegment, getD, jXKey);
                 const float startY = (float)env->CallDoubleMethod(firstSegment, getD, jYKey);
                 FPDF_PAGEOBJECT path = FPDFPageObj_CreateNewPath(startX, startY);
+                bool pathReady = path != nullptr;
                 std::vector<FS_POINTF> inkPoints;
                 inkPoints.push_back({startX, startY});
                 float currentX = startX;
@@ -12496,12 +13035,8 @@ static void processFreeHand(JNIEnv* env, jobject obj, FPDF_PAGE page, jfieldID f
                     const bool close = env->CallIntMethod(segment, optI, jCloseKey, 0) != 0;
 
                     if (type == FPDF_SEGMENT_MOVETO) {
-                        FPDFPath_MoveTo(path, x, y);
-                        if (inkPoints.empty() ||
-                            fabs(inkPoints.back().x - x) > 0.01f ||
-                            fabs(inkPoints.back().y - y) > 0.01f) {
-                            inkPoints.push_back({x, y});
-                        }
+                        if (!FPDFPath_MoveTo(path, x, y)) pathReady = false;
+                        appendInkPoint(inkPoints, x, y);
                         currentX = x;
                         currentY = y;
                     } else if (type == FPDF_SEGMENT_BEZIERTO && index + 2 < segmentCount) {
@@ -12519,7 +13054,7 @@ static void processFreeHand(JNIEnv* env, jobject obj, FPDF_PAGE page, jfieldID f
                             const float cp2Y = (float)env->CallDoubleMethod(control2, getD, jYKey);
                             const float endX = (float)env->CallDoubleMethod(endPoint, getD, jXKey);
                             const float endY = (float)env->CallDoubleMethod(endPoint, getD, jYKey);
-                            FPDFPath_BezierTo(path, cp1X, cp1Y, cp2X, cp2Y, endX, endY);
+                            if (!FPDFPath_BezierTo(path, cp1X, cp1Y, cp2X, cp2Y, endX, endY)) pathReady = false;
                             for (int sampleIndex = 1; sampleIndex <= 8; sampleIndex++) {
                                 const float t = sampleIndex / 8.0f;
                                 const float omt = 1.0f - t;
@@ -12533,14 +13068,10 @@ static void processFreeHand(JNIEnv* env, jobject obj, FPDF_PAGE page, jfieldID f
                                         3.0f * omt * omt * t * cp1Y +
                                         3.0f * omt * t * t * cp2Y +
                                         t * t * t * endY;
-                                if (inkPoints.empty() ||
-                                    fabs(inkPoints.back().x - sampleX) > 0.01f ||
-                                    fabs(inkPoints.back().y - sampleY) > 0.01f) {
-                                    inkPoints.push_back({sampleX, sampleY});
-                                }
+                                appendInkPoint(inkPoints, sampleX, sampleY);
                             }
                             if (env->CallIntMethod(endPoint, optI, jCloseKey, 0) != 0) {
-                                FPDFPath_Close(path);
+                                if (!FPDFPath_Close(path)) pathReady = false;
                             }
                             currentX = endX;
                             currentY = endY;
@@ -12553,31 +13084,26 @@ static void processFreeHand(JNIEnv* env, jobject obj, FPDF_PAGE page, jfieldID f
 
                         if (control2) env->DeleteLocalRef(control2);
                         if (endPoint) env->DeleteLocalRef(endPoint);
-                        FPDFPath_LineTo(path, x, y);
-                        if (inkPoints.empty() ||
-                            fabs(inkPoints.back().x - x) > 0.01f ||
-                            fabs(inkPoints.back().y - y) > 0.01f) {
-                            inkPoints.push_back({x, y});
-                        }
+                        if (!FPDFPath_LineTo(path, x, y)) pathReady = false;
+                        appendInkPoint(inkPoints, x, y);
                         currentX = x;
                         currentY = y;
-                        if (close) FPDFPath_Close(path);
+                        if (close && !FPDFPath_Close(path)) pathReady = false;
                     } else {
-                        FPDFPath_LineTo(path, x, y);
-                        if (inkPoints.empty() ||
-                            fabs(inkPoints.back().x - x) > 0.01f ||
-                            fabs(inkPoints.back().y - y) > 0.01f) {
-                            inkPoints.push_back({x, y});
-                        }
+                        if (!FPDFPath_LineTo(path, x, y)) pathReady = false;
+                        appendInkPoint(inkPoints, x, y);
                         currentX = x;
                         currentY = y;
-                        if (close) FPDFPath_Close(path);
+                        if (close && !FPDFPath_Close(path)) pathReady = false;
                     }
 
                     env->DeleteLocalRef(segment);
                 }
 
-                finalizeInkAnnot(path, inkPoints);
+                if (hasContentMatrix && !pathReady) {
+                    if (path) FPDFPageObj_Destroy(path);
+                    annotationWriteFailed = true;
+                } else finalizeInkAnnot(path, inkPoints);
                 env->DeleteLocalRef(firstSegment);
             }
         }
@@ -12649,6 +13175,11 @@ static void processFreeHand(JNIEnv* env, jobject obj, FPDF_PAGE page, jfieldID f
     }
 
     if (strokesArray) env->DeleteLocalRef(strokesArray);
+    // Existing callers already abort on JNI exceptions; do not silently drop failed Ink.
+    if (annotationWriteFailed && !env->ExceptionCheck()) {
+        LOGE("PDF_SAVE unable to write drawing content=%d", saveAsPageContent ? 1 : 0);
+        jniThrowException(env, "java/io/IOException", "Unable to save PDF drawing");
+    }
     if (jMode) {
         env->ReleaseStringUTFChars(jMode, modeStr);
         env->DeleteLocalRef(jMode);
@@ -12765,7 +13296,7 @@ static float GetSquigglyRenderThickness(float rectHeight, float strokeRatio) {
 }
 
 static void AppendStraightTextMarkupAppearance(
-        FPDF_ANNOTATION annot,
+        std::ostringstream& markupAppearance,
         float left,
         float right,
         float lineY,
@@ -12774,16 +13305,11 @@ static void AppendStraightTextMarkupAppearance(
         int b,
         int alpha,
         float strokeWidth) {
-    FPDF_PAGEOBJECT lineObj = FPDFPageObj_CreateNewPath(fmin(left, right), lineY);
-    if (!lineObj) return;
-
-    FPDFPath_LineTo(lineObj, fmax(left, right), lineY);
-    FPDFPageObj_SetStrokeColor(lineObj, r, g, b, alpha);
-    FPDFPageObj_SetFillColor(lineObj, r, g, b, alpha);
-    FPDFPageObj_SetStrokeWidth(lineObj, strokeWidth);
-    FPDFPath_SetDrawMode(lineObj, 0, JNI_TRUE);
-    FPDFAnnot_AppendObject(annot, lineObj);
-    FPDFAnnot_UpdateObject(annot, lineObj);
+    // Text-markup subtypes reject AppendObject; their normal AP supports custom strokes.
+    markupAppearance << "q /GS gs " << r / 255.0f << ' ' << g / 255.0f << ' ' << b / 255.0f
+                     << " RG " << strokeWidth << " w 0 J "
+                     << fmin(left, right) << ' ' << lineY << " m "
+                     << fmax(left, right) << ' ' << lineY << " l S Q\n";
 }
 
 static float GetSquigglyAppearanceStrokeWidth(float thickness) {
@@ -12813,7 +13339,7 @@ static float GetSquigglyAttachmentTop(float rectBottom, float rectTop, float thi
 }
 
 static void AppendSquigglyTextMarkupAppearance(
-        FPDF_ANNOTATION annot,
+        std::ostringstream& markupAppearance,
         float left,
         float right,
         float rectBottom,
@@ -12832,51 +13358,60 @@ static void AppendSquigglyTextMarkupAppearance(
     const float peakY = GetSquigglyPathPeakY(rectBottom, rectTop, thickness);
     const float step = GetSquigglyAppearanceStep(thickness);
 
-    FPDF_PAGEOBJECT waveObj = FPDFPageObj_CreateNewPath(minX, baseY);
-    if (!waveObj) return;
+    markupAppearance << "q /GS gs " << r / 255.0f << ' ' << g / 255.0f << ' ' << b / 255.0f
+                     << " RG " << strokeWidth << " w 1 J 1 j " << minX << ' ' << baseY << " m ";
 
     if ((maxX - minX) <= step) {
         const float midX = (minX + maxX) * 0.5f;
-        FPDFPath_LineTo(waveObj, midX, peakY);
-        FPDFPath_LineTo(waveObj, maxX, baseY);
+        markupAppearance << midX << ' ' << peakY << " l ";
+        markupAppearance << maxX << ' ' << baseY << " l ";
     } else {
         float x = minX;
         while (x < maxX) {
             const float midX = fmin(x + (step * 0.5f), maxX);
             const float nextX = fmin(x + step, maxX);
-            FPDFPath_LineTo(waveObj, midX, peakY);
-            FPDFPath_LineTo(waveObj, nextX, baseY);
+            markupAppearance << midX << ' ' << peakY << " l ";
+            markupAppearance << nextX << ' ' << baseY << " l ";
             x = nextX;
         }
     }
 
-    FPDFPageObj_SetStrokeColor(waveObj, r, g, b, alpha);
-    FPDFPageObj_SetFillColor(waveObj, r, g, b, alpha);
-    FPDFPageObj_SetStrokeWidth(waveObj, strokeWidth);
-    FPDFPageObj_SetLineJoin(waveObj, FPDF_LINEJOIN_ROUND);
-    FPDFPageObj_SetLineCap(waveObj, FPDF_LINECAP_ROUND);
-    FPDFPath_SetDrawMode(waveObj, 0, JNI_TRUE);
-    FPDFAnnot_AppendObject(annot, waveObj);
-    FPDFAnnot_UpdateObject(annot, waveObj);
+    markupAppearance << "S Q\n";
+}
+
+static bool SetTextMarkupAppearance(FPDF_ANNOTATION annot, const std::ostringstream& markupAppearance) {
+    const std::string commands = markupAppearance.str();
+    if (commands.empty()) return false;
+    FS_RECTF bounds;
+    // SetAP uses the annotation rectangle as its BBox; inverted bounds clip the custom stroke.
+    if (!FPDFAnnot_GetRect(annot, &bounds) ||
+        !(bounds.right > bounds.left && bounds.top > bounds.bottom)) {
+        LOGE("PDF_TEXT_MARKUP invalid bounds before writing thickness appearance");
+        return false;
+    }
+    const std::u16string appearance(commands.begin(), commands.end());
+    // SetAP supplies /GS resources from the annotation color alpha.
+    const bool success = FPDFAnnot_SetAP(annot, FPDF_ANNOT_APPEARANCEMODE_NORMAL,
+            reinterpret_cast<FPDF_WIDESTRING>(appearance.c_str())) != 0;
+    if (!success) LOGE("PDF_TEXT_MARKUP failed to set normal appearance");
+    return success;
 }
 
 static void ClearAnnotationAppearanceObjects(FPDF_ANNOTATION annot) {
     if (!annot) return;
 
-    for (int objectIndex = FPDFAnnot_GetObjectCount(annot) - 1; objectIndex >= 0; objectIndex--) {
-        FPDFAnnot_RemoveObject(annot, objectIndex);
-    }
+    FPDFAnnot_SetAP(annot, FPDF_ANNOT_APPEARANCEMODE_NORMAL, nullptr);
 }
 
 static void AppendFallbackTextMarkupAppearance(
-        FPDF_ANNOTATION annot,
+        std::ostringstream& markupAppearance,
         int typeInt,
         FS_RECTF rect,
         int r,
         int g,
         int b,
         int alpha) {
-    if (!annot || !(typeInt == 1 || typeInt == 2 || typeInt == 8)) return;
+    if (!(typeInt == 1 || typeInt == 2 || typeInt == 8)) return;
 
     const float rectTop = fmax(rect.top, rect.bottom);
     const float rectBottom = fmin(rect.top, rect.bottom);
@@ -12888,18 +13423,18 @@ static void AppendFallbackTextMarkupAppearance(
 
     if (typeInt == 1) {
         const float lineY = rectBottom + (thickness * 0.5f);
-        AppendStraightTextMarkupAppearance(annot, rect.left, rect.right, lineY, r, g, b, alpha, thickness);
+        AppendStraightTextMarkupAppearance(markupAppearance, rect.left, rect.right, lineY, r, g, b, alpha, thickness);
         return;
     }
 
     if (typeInt == 2) {
         const float lineY = (rectTop + rectBottom) * 0.5f;
-        AppendStraightTextMarkupAppearance(annot, rect.left, rect.right, lineY, r, g, b, alpha, thickness);
+        AppendStraightTextMarkupAppearance(markupAppearance, rect.left, rect.right, lineY, r, g, b, alpha, thickness);
         return;
     }
 
     AppendSquigglyTextMarkupAppearance(
-            annot,
+            markupAppearance,
             rect.left,
             rect.right,
             rectBottom,
@@ -13507,7 +14042,7 @@ static bool BuildFreehandPropsFromInkAnnot(
     return false;
 }
 
-static void ApplyExistingTextMarkupStyle(
+static bool ApplyExistingTextMarkupStyle(
         JNIEnv* env,
         FPDF_ANNOTATION annot,
         int typeInt,
@@ -13523,7 +14058,7 @@ static void ApplyExistingTextMarkupStyle(
         jmethodID jsonGetDouble,
         jmethodID jsonOptDouble
 ) {
-    if (!annot) return;
+    if (!annot) return false;
 
     if (!markupRectsJson.empty()) {
         SetAnnotAsciiStringValue(annot, "LufickMarkupMeta", markupRectsJson.c_str());
@@ -13531,18 +14066,20 @@ static void ApplyExistingTextMarkupStyle(
 
     if (!(typeInt == 1 || typeInt == 2 || typeInt == 8) || markupRectsJson.empty()) {
         ApplyExistingAnnotationColor(annot, typeInt, r, g, b, alpha);
-        return;
+        return true;
     }
 
+    // SetColor rejects annotations with an AP; clear it before applying a new style/alpha.
+    ClearAnnotationAppearanceObjects(annot);
     FPDFAnnot_SetColor(annot, FPDFANNOT_COLORTYPE_Color, r, g, b, alpha);
 
     jstring jMarkupRects = env->NewStringUTF(markupRectsJson.c_str());
-    if (!jMarkupRects) return;
+    if (!jMarkupRects) return false;
 
     jobject rectsArray = env->NewObject(jsonArrayClass, jsonArrayInit, jMarkupRects);
     if (!rectsArray) {
         env->DeleteLocalRef(jMarkupRects);
-        return;
+        return false;
     }
 
     jstring jLeftKey = env->NewStringUTF("left");
@@ -13558,7 +14095,7 @@ static void ApplyExistingTextMarkupStyle(
         if (jStrokeWidthRatioKey) env->DeleteLocalRef(jStrokeWidthRatioKey);
         env->DeleteLocalRef(rectsArray);
         env->DeleteLocalRef(jMarkupRects);
-        return;
+        return false;
     }
 
     const jchar* rawMarkupMeta = env->GetStringChars(jMarkupRects, nullptr);
@@ -13566,7 +14103,7 @@ static void ApplyExistingTextMarkupStyle(
         env->ReleaseStringChars(jMarkupRects, rawMarkupMeta);
     }
 
-    ClearAnnotationAppearanceObjects(annot);
+    std::ostringstream markupAppearance;
 
     const int rectCount = env->CallIntMethod(rectsArray, jsonArrayLength);
     const size_t existingQuadCount = FPDFAnnot_CountAttachmentPoints(annot);
@@ -13602,7 +14139,7 @@ static void ApplyExistingTextMarkupStyle(
         if (typeInt == 1) {
             const float lineY = rectBottom + (thickness * 0.5f);
             AppendStraightTextMarkupAppearance(
-                    annot,
+                    markupAppearance,
                     quadLeft,
                     quadRight,
                     lineY,
@@ -13615,7 +14152,7 @@ static void ApplyExistingTextMarkupStyle(
         } else if (typeInt == 2) {
             const float centerY = (rectTop + rectBottom) * 0.5f;
             AppendStraightTextMarkupAppearance(
-                    annot,
+                    markupAppearance,
                     quadLeft,
                     quadRight,
                     centerY,
@@ -13628,7 +14165,7 @@ static void ApplyExistingTextMarkupStyle(
         } else {
             const float appearanceTop = GetSquigglyAttachmentTop(rectBottom, rectTop, thickness);
             AppendSquigglyTextMarkupAppearance(
-                    annot,
+                    markupAppearance,
                     quadLeft,
                     quadRight,
                     rectBottom,
@@ -13656,9 +14193,9 @@ static void ApplyExistingTextMarkupStyle(
 
         const FS_RECTF pieceBounds = {
                 fmin(quadLeft, quadRight),
-                rectBottom,
+                rectTop,
                 fmax(quadLeft, quadRight),
-                rectTop
+                rectBottom
         };
         if (!hasBounds) {
             bounds = pieceBounds;
@@ -13680,10 +14217,11 @@ static void ApplyExistingTextMarkupStyle(
     if (!appended) {
         FS_RECTF rect = {0.0f, 0.0f, 0.0f, 0.0f};
         if (FPDFAnnot_GetRect(annot, &rect)) {
-            AppendFallbackTextMarkupAppearance(annot, typeInt, rect, r, g, b, alpha);
+            AppendFallbackTextMarkupAppearance(markupAppearance, typeInt, rect, r, g, b, alpha);
         }
     }
 
+    const bool appearanceUpdated = SetTextMarkupAppearance(annot, markupAppearance);
     env->DeleteLocalRef(jStrokeWidthRatioKey);
     env->DeleteLocalRef(jBottomKey);
     env->DeleteLocalRef(jRightKey);
@@ -13691,6 +14229,7 @@ static void ApplyExistingTextMarkupStyle(
     env->DeleteLocalRef(jLeftKey);
     env->DeleteLocalRef(rectsArray);
     env->DeleteLocalRef(jMarkupRects);
+    return appearanceUpdated;
 }
 
 static bool ApplyNativeAnnotationEditActions(
@@ -13755,6 +14294,7 @@ static bool ApplyNativeAnnotationEditActions(
     struct FreehandRemovalTarget {
         int objectIndex;
         int objectType;
+        bool isContentObject;
         float left;
         float top;
         float right;
@@ -13846,6 +14386,7 @@ static bool ApplyNativeAnnotationEditActions(
     };
     std::map<int, std::vector<ContentPathStyleUpdate>> contentPathStyleUpdateMap;
     std::map<int, std::vector<ContentPathTransformUpdate>> contentPathTransformUpdateMap;
+    std::map<int, bool> pageContentAdditions;
     bool removeAllAnnotations = false;
 
     int highlightCount = env->GetArrayLength(highlightsArray);
@@ -13856,6 +14397,12 @@ static bool ApplyNativeAnnotationEditActions(
         int pageIndex = env->GetIntField(obj, pageField);
         int nativeSourceId = env->GetIntField(obj, nativeSourceIdField);
         int nativeEditAction = env->GetIntField(obj, nativeEditActionField);
+        // The legacy FreeText writer inserts page objects, unlike the stamp/AP
+        // writers. Preserve content generation for that existing route too.
+        if (processNewObjects && (providedPage != nullptr || providedPageIndex >= 0) &&
+            nativeEditAction == 0 && env->GetIntField(obj, typeField) == 11) {
+            pageContentAdditions[pageIndex] = true;
+        }
         if (nativeEditAction == 5) {
             removeAllAnnotations = true;
         } else if (nativeSourceId >= 0 && nativeEditAction == 1) {
@@ -13864,6 +14411,7 @@ static bool ApplyNativeAnnotationEditActions(
                 objectRemovalMap[pageIndex].push_back({
                     nativeSourceId,
                     objectType,
+                    false,
                     env->GetFloatField(obj, leftField),
                     env->GetFloatField(obj, topField),
                     env->GetFloatField(obj, rightField),
@@ -13881,6 +14429,7 @@ static bool ApplyNativeAnnotationEditActions(
             objectRemovalMap[pageIndex].push_back({
                 nativeSourceId,
                 objectType,
+                true,
                 env->GetFloatField(obj, leftField),
                 env->GetFloatField(obj, topField),
                 env->GetFloatField(obj, rightField),
@@ -14236,6 +14785,7 @@ static bool ApplyNativeAnnotationEditActions(
 
     if (removeAllAnnotations) {
         LOGE("PDF_EDIT_NATIVE ApplyNativeAnnotationEditActions removeAllAnnotations requested");
+        bool removalSucceeded = true;
         const int pageCount = FPDF_GetPageCount(doc);
         for (int pageIndex = 0; pageIndex < pageCount; pageIndex++) {
             bool shouldClosePage = false;
@@ -14246,17 +14796,24 @@ static bool ApplyNativeAnnotationEditActions(
                 page = FPDF_LoadPage(doc, pageIndex);
                 shouldClosePage = true;
             }
-            if (!page) continue;
+            if (!page) {
+                LOGE("PDF_ANNOTATION_REMOVE_ALL unable to load page=%d", pageIndex);
+                removalSucceeded = false;
+                continue;
+            }
 
             for (int annotIndex = FPDFPage_GetAnnotCount(page) - 1; annotIndex >= 0; annotIndex--) {
-                FPDFPage_RemoveAnnot(page, annotIndex);
+                if (!FPDFPage_RemoveAnnot(page, annotIndex)) {
+                    LOGE("PDF_ANNOTATION_REMOVE_ALL failed page=%d index=%d", pageIndex, annotIndex);
+                    removalSucceeded = false;
+                }
             }
 
             if (shouldClosePage) {
                 FPDF_ClosePage(page);
             }
         }
-        return true;
+        return removalSucceeded;
     }
 
     std::map<int, bool> touchedPages;
@@ -14280,6 +14837,7 @@ static bool ApplyNativeAnnotationEditActions(
             for (const auto& update : contentImageUpdateMap[pageIndex]) {
                 if (update.replacementBitmap) FPDFBitmap_Destroy(update.replacementBitmap);
             }
+            allPagesSucceeded = false;
             continue;
         }
         if (!(providedPage && pageIndex == providedPageIndex)) {
@@ -14297,7 +14855,32 @@ static bool ApplyNativeAnnotationEditActions(
                 processNewObjects ? 1 : 0
         );
 
-        if (!ConvertNativeShadingsToEditableProxies(doc, page)) {
+        // Annotation dictionaries/AP streams are separate from page content.
+        // Do not convert shadings or regenerate an untouched page for annotation
+        // edits/replay. Legacy freehand removals can address page objects too.
+        bool removalEditsPageContent = false;
+        for (const auto& target : objectRemovalMap[pageIndex]) {
+            bool annotationInk = false;
+            if (!target.isContentObject && target.objectType == 6 &&
+                target.objectIndex >= 0 && target.objectIndex < FPDFPage_GetAnnotCount(page)) {
+                FPDF_ANNOTATION annot = FPDFPage_GetAnnot(page, target.objectIndex);
+                if (annot) {
+                    annotationInk = FPDFAnnot_GetSubtype(annot) == FPDF_ANNOT_INK;
+                    FPDFPage_CloseAnnot(annot);
+                }
+            }
+            if (!annotationInk) {
+                removalEditsPageContent = true;
+                break;
+            }
+        }
+        const bool editsPageContent =
+                pageContentAdditions[pageIndex] ||
+                removalEditsPageContent ||
+                !contentImageUpdateMap[pageIndex].empty() ||
+                !contentPathStyleUpdateMap[pageIndex].empty() ||
+                !contentPathTransformUpdateMap[pageIndex].empty();
+        if (editsPageContent && !ConvertNativeShadingsToEditableProxies(doc, page)) {
             LOGE(
                     "PDF_EDIT_NATIVE failed to preserve shading objects on page=%d",
                     pageIndex
@@ -14316,7 +14899,7 @@ static bool ApplyNativeAnnotationEditActions(
                 if (update.annotIndex < 0 || update.annotIndex >= FPDFPage_GetAnnotCount(page)) continue;
                 FPDF_ANNOTATION annot = FPDFPage_GetAnnot(page, update.annotIndex);
                 if (!annot) continue;
-                ApplyExistingTextMarkupStyle(
+                if (!ApplyExistingTextMarkupStyle(
                         env,
                         annot,
                         update.typeInt,
@@ -14331,7 +14914,7 @@ static bool ApplyNativeAnnotationEditActions(
                         jsonArrayGetObject,
                         jsonGetDouble,
                         jsonOptDouble
-                );
+                )) allPagesSucceeded = false;
                 FPDFPage_CloseAnnot(annot);
             }
         }
@@ -14355,9 +14938,15 @@ static bool ApplyNativeAnnotationEditActions(
         auto attachmentUpdatesIt = fileAttachmentUpdateMap.find(pageIndex);
         if (attachmentUpdatesIt != fileAttachmentUpdateMap.end()) {
             for (const auto& update : attachmentUpdatesIt->second) {
-                if (update.annotIndex < 0 || update.annotIndex >= FPDFPage_GetAnnotCount(page)) continue;
+                if (update.annotIndex < 0 || update.annotIndex >= FPDFPage_GetAnnotCount(page)) {
+                    LOGE("PDF_FILE_ATTACHMENT invalid target page=%d index=%d", pageIndex, update.annotIndex);
+                    allPagesSucceeded = false;
+                    continue;
+                }
                 FPDF_ANNOTATION annot = FPDFPage_GetAnnot(page, update.annotIndex);
                 if (!annot || FPDFAnnot_GetSubtype(annot) != FPDF_ANNOT_FILEATTACHMENT) {
+                    LOGE("PDF_FILE_ATTACHMENT target unavailable page=%d index=%d", pageIndex, update.annotIndex);
+                    allPagesSucceeded = false;
                     if (annot) FPDFPage_CloseAnnot(annot);
                     continue;
                 }
@@ -14369,6 +14958,8 @@ static bool ApplyNativeAnnotationEditActions(
                 };
                 FPDFAnnot_SetRect(annot, &rect);
                 if (update.applyAppearanceUpdate) {
+                    // SetColor rejects an annotation that still owns a custom AP.
+                    FPDFAnnot_SetAP(annot, FPDF_ANNOT_APPEARANCEMODE_NORMAL, nullptr);
                     FPDFAnnot_SetColor(
                             annot, FPDFANNOT_COLORTYPE_Color,
                             update.r, update.g, update.b, update.alpha);
@@ -14379,23 +14970,31 @@ static bool ApplyNativeAnnotationEditActions(
                 }
 
                 FPDF_ATTACHMENT attachment = FPDFAnnot_GetFileAttachment(annot);
-                if (attachment && !update.filePath.empty()) {
+                if (!update.filePath.empty()) {
+                    // Read the replacement before replacing the annotation's file specification.
+                    std::vector<unsigned char> bytes;
+                    if (!ReadBoundedAttachmentFile(update.filePath.c_str(), bytes)) {
+                        LOGE("PDF_FILE_ATTACHMENT replacement read failed page=%d index=%d", pageIndex, update.annotIndex);
+                        allPagesSucceeded = false;
+                        FPDFPage_CloseAnnot(annot);
+                        continue;
+                    }
                     if (!update.fileName.empty()) {
                         FPDF_ATTACHMENT replacement = FPDFAnnot_AddFileAttachment(
                                 annot,
                                 reinterpret_cast<FPDF_WIDESTRING>(update.fileName.c_str()));
-                        if (replacement) attachment = replacement;
+                        attachment = replacement;
                     }
-                    std::ifstream input(update.filePath, std::ios::binary);
-                    std::vector<unsigned char> bytes(
-                            (std::istreambuf_iterator<char>(input)),
-                            std::istreambuf_iterator<char>());
-                    if (input.good() || input.eof()) {
-                        FPDFAttachment_SetFile(
+                    const unsigned char emptyFileByte = 0;
+                    if (!attachment || !FPDFAttachment_SetFile(
                                 attachment,
                                 doc,
-                                bytes.empty() ? nullptr : bytes.data(),
-                                static_cast<unsigned long>(bytes.size()));
+                                bytes.empty() ? &emptyFileByte : bytes.data(),
+                                static_cast<unsigned long>(bytes.size()))) {
+                        LOGE("PDF_FILE_ATTACHMENT replacement write failed page=%d index=%d", pageIndex, update.annotIndex);
+                        allPagesSucceeded = false;
+                        FPDFPage_CloseAnnot(annot);
+                        continue;
                     }
                 }
                 if (attachment && !update.fileName.empty()) {
@@ -14415,13 +15014,16 @@ static bool ApplyNativeAnnotationEditActions(
                             update.g,
                             update.b);
                     if (!appearance.empty()) {
-                        FPDFAnnot_SetAP(
+                        if (!FPDFAnnot_SetAP(
                                 annot,
                                 FPDF_ANNOT_APPEARANCEMODE_NORMAL,
-                                reinterpret_cast<FPDF_WIDESTRING>(appearance.c_str()));
+                                reinterpret_cast<FPDF_WIDESTRING>(appearance.c_str()))) {
+                            LOGE("PDF_FILE_ATTACHMENT appearance update failed");
+                            allPagesSucceeded = false;
+                        }
                     }
                 }
-                FPDFAnnot_SetFlags(annot, FPDF_ANNOT_FLAG_PRINT);
+                FPDFAnnot_SetFlags(annot, FPDFAnnot_GetFlags(annot) | FPDF_ANNOT_FLAG_PRINT);
                 FPDFPage_CloseAnnot(annot);
             }
         }
@@ -14659,15 +15261,19 @@ static bool ApplyNativeAnnotationEditActions(
         if (objectRemovalsIt != objectRemovalMap.end()) {
             auto targets = objectRemovalsIt->second;
             std::sort(targets.begin(), targets.end(), [](const FreehandRemovalTarget& first, const FreehandRemovalTarget& second) {
-                return first.objectIndex > second.objectIndex;
+                if (first.objectIndex != second.objectIndex) return first.objectIndex > second.objectIndex;
+                if (first.isContentObject != second.isContentObject) return first.isContentObject < second.isContentObject;
+                return first.objectType < second.objectType;
             });
             targets.erase(std::unique(targets.begin(), targets.end(), [](const FreehandRemovalTarget& first, const FreehandRemovalTarget& second) {
-                return first.objectIndex == second.objectIndex;
+                return first.objectIndex == second.objectIndex &&
+                       first.isContentObject == second.isContentObject &&
+                       first.objectType == second.objectType;
             }), targets.end());
 
             for (const auto& target : targets) {
                 bool isAnnotBackedInk = false;
-                if (target.objectType == 6 &&
+                if (!target.isContentObject && target.objectType == 6 &&
                     target.objectIndex >= 0 && target.objectIndex < FPDFPage_GetAnnotCount(page)) {
                     FPDF_ANNOTATION annot = FPDFPage_GetAnnot(page, target.objectIndex);
                     if (annot) {
@@ -14707,7 +15313,7 @@ static bool ApplyNativeAnnotationEditActions(
                 const float targetBottom = fmin(target.top, target.bottom);
                 const float targetTop = fmax(target.top, target.bottom);
 
-                if (target.objectType == 6 &&
+                if (!target.isContentObject && target.objectType == 6 &&
                     target.objectIndex >= 0 && target.objectIndex < FPDFPage_GetAnnotCount(page)) {
                     FPDF_ANNOTATION annot = FPDFPage_GetAnnot(page, target.objectIndex);
                     if (annot) {
@@ -14741,6 +15347,16 @@ static bool ApplyNativeAnnotationEditActions(
                         FPDFPageObj_Destroy(pageObject);
                         removed = true;
                     }
+                }
+                // Content IDs address the pristine page-object array. Do not
+                // reinterpret them as annotation IDs or guess a nearby object.
+                if (target.isContentObject) {
+                    if (!removed) {
+                        LOGE("PDF_EDIT_NATIVE content delete failed page=%d id=%d type=%d",
+                             pageIndex, target.objectIndex, target.objectType);
+                        allPagesSucceeded = false;
+                    }
+                    continue;
                 }
                 if (!removed && (target.objectType == 19 || target.objectType == 20)) {
                     continue;
@@ -14841,6 +15457,11 @@ static bool ApplyNativeAnnotationEditActions(
 
                 if (typeInt == 6) {
                     processFreeHand(env, obj, page, dataPropsField, r, g, b, jsonClass, jsonInit);
+                    if (env->ExceptionCheck()) {
+                        env->DeleteLocalRef(obj);
+                        if (shouldClosePage) FPDF_ClosePage(page);
+                        return false;
+                    }
                 } else {
                     if (typeInt == 11) {
                         processFreeText(env, obj, doc, page, rect, dataPropsField, r, g, b, alpha, jsonClass, jsonInit);
@@ -14860,6 +15481,10 @@ static bool ApplyNativeAnnotationEditActions(
                     FPDF_ANNOTATION annot = IsPdfShapeNativeType(typeInt)
                                             ? CreatePdfShapeAnnotation(page, typeInt)
                                             : FPDFPage_CreateAnnot(page, (typeInt == 5 || typeInt == 9) ? FPDF_ANNOT_STAMP : pdfType);
+                    if (!annot) {
+                        LOGE("PDF_ANNOTATION unable to create preview annotation page=%d type=%d", pageIndex, typeInt);
+                        allPagesSucceeded = false;
+                    }
                     if (annot) {
                         FPDFAnnot_SetRect(annot, &rect);
                         if (typeInt == 3) processLink(env, obj, page, annot, rect, urlField);
@@ -14869,12 +15494,27 @@ static bool ApplyNativeAnnotationEditActions(
                             SetAnnotAsciiStringValue(annot, "LufickPdfRedaction", "1");
                         }
                         else if (typeInt == 10) processStickyNoteComment(env, obj, annot, dataPropsField, r, g, b, alpha, jsonClass, jsonInit);
+                        else if (typeInt == 21) {
+                            if (!ProcessFileAttachment(env, obj, doc, annot, dataPropsField,
+                                    jsonClass, jsonInit, r, g, b, alpha)) {
+                                LOGE("PDF_FILE_ATTACHMENT preview creation failed page=%d", pageIndex);
+                                allPagesSucceeded = false;
+                            }
+                        }
                         else if (isSimplePdfStampBridgeAnnotation(env, obj, dataPropsField, jsonClass, jsonInit)) {
-                            processSimplePdfStamp(env, obj, doc, page, annot, rect, typeInt, dataPropsField, r, g, b, alpha, jsonClass, jsonInit);
+                            if (!processSimplePdfStamp(env, obj, doc, page, annot, rect, typeInt, dataPropsField, r, g, b, alpha, jsonClass, jsonInit)) {
+                                LOGE("PDF_ANNOTATION_SAVE vector stamp preview failed page=%d", pageIndex);
+                                allPagesSucceeded = false;
+                            }
                         }
                         else if (typeInt == 5) processTextStamp(env, obj, doc, page, annot, rect, dataPropsField, r, g, b, alpha, jsonClass, jsonInit);
                         else if (typeInt == 11) processFreeText(env, obj, doc, page, rect, dataPropsField, r, g, b, alpha, jsonClass, jsonInit);
-                        else if (typeInt == 9) processImageOrPresetStamp(env, obj, doc, page, annot, rect, dataPropsField, jsonClass, jsonInit);
+                        else if (typeInt == 9) {
+                            if (!processImageOrPresetStamp(env, obj, doc, page, annot, rect, dataPropsField, jsonClass, jsonInit)) {
+                                LOGE("PDF_ANNOTATION_SAVE image stamp preview failed page=%d", pageIndex);
+                                allPagesSucceeded = false;
+                            }
+                        }
                         else if (typeInt == 7) {
                             processRegionHighlight(env, obj, page, annot, rect, r, g, b, alpha);
                         }
@@ -14882,6 +15522,7 @@ static bool ApplyNativeAnnotationEditActions(
                             processPdfShape(env, obj, annot, rect, typeInt, dataPropsField, r, g, b, alpha, jsonClass, jsonInit);
                         }
                         else {
+                            std::ostringstream markupAppearance;
                             FPDFAnnot_SetColor(annot, FPDFANNOT_COLORTYPE_Color, r, g, b, alpha);
                             if (typeInt == 1 || typeInt == 2 || typeInt == 8) {
                                 ClearAnnotationAppearanceObjects(annot);
@@ -14918,7 +15559,7 @@ static bool ApplyNativeAnnotationEditActions(
                                             if (typeInt == 1) {
                                                 float lineY = rectBottom + (thickness * 0.5f);
                                                 AppendStraightTextMarkupAppearance(
-                                                        annot,
+                                                        markupAppearance,
                                                         quadLeft,
                                                         quadRight,
                                                         lineY,
@@ -14932,7 +15573,7 @@ static bool ApplyNativeAnnotationEditActions(
                                                 if (typeInt == 2) {
                                                     float centerY = (rectTop + rectBottom) * 0.5f;
                                                     AppendStraightTextMarkupAppearance(
-                                                            annot,
+                                                            markupAppearance,
                                                             quadLeft,
                                                             quadRight,
                                                             centerY,
@@ -14946,7 +15587,7 @@ static bool ApplyNativeAnnotationEditActions(
                                                     const float appearanceTop =
                                                             GetSquigglyAttachmentTop(rectBottom, rectTop, thickness);
                                                     AppendSquigglyTextMarkupAppearance(
-                                                            annot,
+                                                            markupAppearance,
                                                             quadLeft,
                                                             quadRight,
                                                             rectBottom,
@@ -14979,11 +15620,15 @@ static bool ApplyNativeAnnotationEditActions(
                                 env->ReleaseStringChars(jMarkupRects, rawMarkupMeta);
                             }
                             if (!appended) {
-                                AppendFallbackTextMarkupAppearance(annot, typeInt, rect, r, g, b, alpha);
+                                AppendFallbackTextMarkupAppearance(markupAppearance, typeInt, rect, r, g, b, alpha);
                                 FS_QUADPOINTSF qp = {rect.left, rect.top, rect.right, rect.top, rect.left, rect.bottom, rect.right, rect.bottom};
                                 FPDFAnnot_AppendAttachmentPoints(annot, &qp);
                             }
 
+                            if ((typeInt == 1 || typeInt == 2 || typeInt == 8) &&
+                                !SetTextMarkupAppearance(annot, markupAppearance)) {
+                                allPagesSucceeded = false;
+                            }
                             if (typeInt == 0) {
                                 FPDFAnnot_SetColor(annot, FPDFANNOT_COLORTYPE_InteriorColor, r, g, b, alpha);
                                 const unsigned short blendMode[] = {'M','u','l','t','i','p','l','y',0};
@@ -14999,7 +15644,12 @@ static bool ApplyNativeAnnotationEditActions(
             }
         }
 
-        FPDFPage_GenerateContent(page);
+        if (editsPageContent) {
+            if (!FPDFPage_GenerateContent(page)) {
+                LOGE("PDF_EDIT_NATIVE failed to generate edited content page=%d", pageIndex);
+                allPagesSucceeded = false;
+            }
+        }
         LOGE(
                 "PDF_EDIT_NATIVE ApplyNativeAnnotationEditActions page=%d afterGenerate annotCount=%d objectCount=%d shouldClose=%d",
                 pageIndex,
@@ -15057,10 +15707,17 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeSaveAnnotat
     jmethodID jsonOptDouble = env->GetMethodID(jsonClass, "optDouble", "(Ljava/lang/String;D)D");
     int highlightCount = env->GetArrayLength(highlightsArray);
 
-    ApplyNativeAnnotationEditActions(env, doc, highlightsArray);
+    if (!ApplyNativeAnnotationEditActions(env, doc, highlightsArray) || env->ExceptionCheck()) {
+        FPDF_CloseDocument(doc);
+        env->ReleaseStringUTFChars(inputPath_, inputPath);
+        env->ReleaseStringUTFChars(outputPath_, outputPath);
+        return JNI_FALSE;
+    }
 
     FPDF_PAGE currentPage = nullptr;
     int lastPageIndex = -1;
+    bool newMarkupAppearancesSucceeded = true;
+    bool newStampWritesSucceeded = true;
 
     for (int i = 0; i < highlightCount; i++) {
         jobject obj = env->GetObjectArrayElement(highlightsArray, i);
@@ -15080,6 +15737,15 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeSaveAnnotat
             lastPageIndex = pageIndex;
         }
 
+        if (!currentPage) {
+            LOGE("PDF_ANNOTATION unable to load save page=%d", pageIndex);
+            env->DeleteLocalRef(obj);
+            FPDF_CloseDocument(doc);
+            env->ReleaseStringUTFChars(inputPath_, inputPath);
+            env->ReleaseStringUTFChars(outputPath_, outputPath);
+            return JNI_FALSE;
+        }
+
         if (currentPage) {
             float left = env->GetFloatField(obj, leftField);
             float top = env->GetFloatField(obj, topField);
@@ -15096,6 +15762,14 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeSaveAnnotat
 
             if (typeInt == 6) { // Freehand is not a standard Annotation type in your logic
                 processFreeHand(env, obj, currentPage, dataPropsField, r, g, b, jsonClass, jsonInit);
+                if (env->ExceptionCheck()) {
+                    env->DeleteLocalRef(obj);
+                    FPDF_ClosePage(currentPage);
+                    FPDF_CloseDocument(doc);
+                    env->ReleaseStringUTFChars(inputPath_, inputPath);
+                    env->ReleaseStringUTFChars(outputPath_, outputPath);
+                    return JNI_FALSE;
+                }
             } else {
                 if (typeInt == 11) {
                     processFreeText(env, obj, doc, currentPage, rect, dataPropsField, r, g, b, alpha, jsonClass, jsonInit);
@@ -15116,6 +15790,15 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeSaveAnnotat
                 FPDF_ANNOTATION annot = IsPdfShapeNativeType(typeInt)
                                         ? CreatePdfShapeAnnotation(currentPage, typeInt)
                                         : FPDFPage_CreateAnnot(currentPage, (typeInt == 5 || typeInt == 9) ? FPDF_ANNOT_STAMP : pdfType);
+                if (!annot) {
+                    LOGE("PDF_ANNOTATION unable to create saved annotation page=%d type=%d", pageIndex, typeInt);
+                    env->DeleteLocalRef(obj);
+                    FPDF_ClosePage(currentPage);
+                    FPDF_CloseDocument(doc);
+                    env->ReleaseStringUTFChars(inputPath_, inputPath);
+                    env->ReleaseStringUTFChars(outputPath_, outputPath);
+                    return JNI_FALSE;
+                }
                 if (annot) {
                     FPDFAnnot_SetRect(annot, &rect);
                     if (typeInt == 3) processLink(env, obj, currentPage, annot, rect, urlField);
@@ -15126,16 +15809,33 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeSaveAnnotat
                     }
                     else if (typeInt == 10) processStickyNoteComment(env, obj, annot, dataPropsField, r, g, b, alpha, jsonClass, jsonInit);
                     else if (typeInt == 21) {
-                        ProcessFileAttachment(
+                        if (!ProcessFileAttachment(
                                 env, obj, doc, annot, dataPropsField, jsonClass, jsonInit,
-                                r, g, b, alpha);
+                                r, g, b, alpha)) {
+                            LOGE("PDF_FILE_ATTACHMENT creation failed page=%d", pageIndex);
+                            FPDFPage_CloseAnnot(annot);
+                            env->DeleteLocalRef(obj);
+                            FPDF_ClosePage(currentPage);
+                            FPDF_CloseDocument(doc);
+                            env->ReleaseStringUTFChars(inputPath_, inputPath);
+                            env->ReleaseStringUTFChars(outputPath_, outputPath);
+                            return JNI_FALSE;
+                        }
                     }
                     else if (isSimplePdfStampBridgeAnnotation(env, obj, dataPropsField, jsonClass, jsonInit)) {
-                        processSimplePdfStamp(env, obj, doc, currentPage, annot, rect, typeInt, dataPropsField, r, g, b, alpha, jsonClass, jsonInit);
+                        if (!processSimplePdfStamp(env, obj, doc, currentPage, annot, rect, typeInt, dataPropsField, r, g, b, alpha, jsonClass, jsonInit)) {
+                            LOGE("PDF_ANNOTATION_SAVE vector stamp save failed page=%d", pageIndex);
+                            newStampWritesSucceeded = false;
+                        }
                     }
                     else if (typeInt == 5) processTextStamp(env, obj, doc, currentPage, annot, rect, dataPropsField, r, g, b, alpha, jsonClass, jsonInit);
                     else if (typeInt == 11) processFreeText(env, obj, doc, currentPage, rect, dataPropsField, r, g, b, alpha, jsonClass, jsonInit);
-                    else if (typeInt == 9) processImageOrPresetStamp(env, obj, doc, currentPage, annot, rect, dataPropsField, jsonClass, jsonInit);
+                    else if (typeInt == 9) {
+                        if (!processImageOrPresetStamp(env, obj, doc, currentPage, annot, rect, dataPropsField, jsonClass, jsonInit)) {
+                            LOGE("PDF_ANNOTATION_SAVE image stamp save failed page=%d", pageIndex);
+                            newStampWritesSucceeded = false;
+                        }
+                    }
                     else if (typeInt == 7) {
                         processRegionHighlight(env, obj, currentPage, annot, rect, r, g, b, alpha);
                     }
@@ -15143,6 +15843,7 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeSaveAnnotat
                         processPdfShape(env, obj, annot, rect, typeInt, dataPropsField, r, g, b, alpha, jsonClass, jsonInit);
                     }
                     else { // Highlight / Underline / Strikeout / Squiggly
+                        std::ostringstream markupAppearance;
                         FPDFAnnot_SetColor(annot, FPDFANNOT_COLORTYPE_Color, r, g, b, alpha);
                         if (typeInt == 1 || typeInt == 2 || typeInt == 8) {
                             ClearAnnotationAppearanceObjects(annot);
@@ -15185,7 +15886,7 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeSaveAnnotat
                                         if (typeInt == 1) {
                                             float lineY = rectBottom + (thickness * 0.5f);
                                             AppendStraightTextMarkupAppearance(
-                                                    annot,
+                                                    markupAppearance,
                                                     quadLeft,
                                                     quadRight,
                                                     lineY,
@@ -15199,7 +15900,7 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeSaveAnnotat
                                             if (typeInt == 2) {
                                                 float centerY = (rectTop + rectBottom) * 0.5f;
                                                 AppendStraightTextMarkupAppearance(
-                                                        annot,
+                                                        markupAppearance,
                                                         quadLeft,
                                                         quadRight,
                                                         centerY,
@@ -15213,7 +15914,7 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeSaveAnnotat
                                             const float appearanceTop =
                                                     GetSquigglyAttachmentTop(rectBottom, rectTop, thickness);
                                             AppendSquigglyTextMarkupAppearance(
-                                                    annot,
+                                                    markupAppearance,
                                                     quadLeft,
                                                     quadRight,
                                                     rectBottom,
@@ -15237,9 +15938,9 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeSaveAnnotat
                                     FPDFAnnot_AppendAttachmentPoints(annot, &qp);
                                     const FS_RECTF pieceBounds = {
                                             fmin(quadLeft, quadRight),
-                                            fmin(rectTop, rectBottom),
+                                            rectTop,
                                             fmax(quadLeft, quadRight),
-                                            fmax(rectTop, rectBottom)
+                                            rectBottom
                                     };
                                     if (!hasBounds) {
                                         bounds = pieceBounds;
@@ -15261,11 +15962,15 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeSaveAnnotat
                             env->ReleaseStringChars(jMarkupRects, rawMarkupMeta);
                         }
                         if (!appended) {
-                            AppendFallbackTextMarkupAppearance(annot, typeInt, rect, r, g, b, alpha);
+                            AppendFallbackTextMarkupAppearance(markupAppearance, typeInt, rect, r, g, b, alpha);
                             FS_QUADPOINTSF qp = {rect.left, rect.top, rect.right, rect.top, rect.left, rect.bottom, rect.right, rect.bottom};
                             FPDFAnnot_AppendAttachmentPoints(annot, &qp);
                         } else if (hasBounds) {
                             FPDFAnnot_SetRect(annot, &bounds);
+                        }
+                        if ((typeInt == 1 || typeInt == 2 || typeInt == 8) &&
+                            !SetTextMarkupAppearance(annot, markupAppearance)) {
+                            newMarkupAppearancesSucceeded = false;
                         }
                     }
                     FPDFAnnot_SetFlags(annot, FPDF_ANNOT_FLAG_PRINT);
@@ -15278,6 +15983,18 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeSaveAnnotat
 
     if (currentPage) { FPDFPage_GenerateContent(currentPage); FPDF_ClosePage(currentPage); }
 
+    if (!newStampWritesSucceeded) {
+        FPDF_CloseDocument(doc);
+        env->ReleaseStringUTFChars(inputPath_, inputPath);
+        env->ReleaseStringUTFChars(outputPath_, outputPath);
+        return JNI_FALSE;
+    }
+    if (!newMarkupAppearancesSucceeded) {
+        FPDF_CloseDocument(doc);
+        env->ReleaseStringUTFChars(inputPath_, inputPath);
+        env->ReleaseStringUTFChars(outputPath_, outputPath);
+        return JNI_FALSE;
+    }
     // Save Logic
     FILE* file = fopen(outputPath, "wb");
     PdfFileWriter writer{ {1, WriteBlock}, file };
@@ -19124,12 +19841,20 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeSavePdfEdit
         env->ReleaseStringUTFChars(outputPath_, outputPath);
         return JNI_FALSE;
     }
-    ApplyNativeAnnotationEditActions(env, doc, savedContentUpdatesArray, nullptr, -1, false);
+    if ((savedContentUpdatesArray && !ApplyNativeAnnotationEditActions(env, doc, savedContentUpdatesArray, nullptr, -1, false)) || env->ExceptionCheck()) {
+        FPDF_CloseDocument(doc);
+        if (usingWrappedInput) ::remove(wrappedInputPath.c_str());
+        if (usingRawPatchedInput) ::remove(rawPatchedInputPath.c_str());
+        env->ReleaseStringUTFChars(inputPath_, inputPath);
+        env->ReleaseStringUTFChars(outputPath_, outputPath);
+        return JNI_FALSE;
+    }
     LOGE("PDF_EDIT_NATIVE nativeSavePdfEditObjects after ApplyNativeAnnotationEditActions(processNewObjects=false)");
 
     FPDF_PAGE currentPage = nullptr;
     int lastPageIndex = -1;
     bool needsShapeDictionaryPatch = false;
+    bool newContentWritesSucceeded = true;
 
     for (int i = 0; i < editObjectCount; i++) {
         jobject obj = env->GetObjectArrayElement(editObjectsArray, i);
@@ -19169,7 +19894,7 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeSavePdfEdit
                         FPDFPage_CountObjects(currentPage),
                         FPDFPage_GetAnnotCount(currentPage)
                 );
-                FPDFPage_GenerateContent(currentPage);
+                newContentWritesSucceeded = FPDFPage_GenerateContent(currentPage);
                 LOGE(
                         "PDF_EDIT_NATIVE nativeSavePdfEditObjects previousPage=%d afterGenerate objectCount=%d annotCount=%d",
                         lastPageIndex,
@@ -19177,6 +19902,11 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeSavePdfEdit
                         FPDFPage_GetAnnotCount(currentPage)
                 );
                 FPDF_ClosePage(currentPage);
+                currentPage = nullptr;
+                if (!newContentWritesSucceeded) {
+                    env->DeleteLocalRef(obj);
+                    break;
+                }
             }
             currentPage = FPDF_LoadPage(doc, pageIndex);
             lastPageIndex = pageIndex;
@@ -19192,7 +19922,8 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeSavePdfEdit
         if (!currentPage) {
             LOGE("PDF_EDIT_NATIVE nativeSavePdfEditObjects skip object index=%d because page load failed page=%d", i, pageIndex);
             env->DeleteLocalRef(obj);
-            continue;
+            newContentWritesSucceeded = false;
+            break;
         }
 
         float left = env->GetFloatField(obj, leftField);
@@ -19284,7 +20015,7 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeSavePdfEdit
                         i,
                         pageIndex
                 );
-            }
+            } else newContentWritesSucceeded = false;
         } else if (typeInt == 4) {
             const bool savedRedactionContent = processRedactionContent(
                     currentPage,
@@ -19294,6 +20025,7 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeSavePdfEdit
                     b,
                     alpha
             );
+            newContentWritesSucceeded = savedRedactionContent;
             LOGE(
                     "PDF_EDIT_NATIVE nativeSavePdfEditObjects processRedactionContent index=%d page=%d success=%d afterObjects=%d",
                     i,
@@ -19304,27 +20036,50 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeSavePdfEdit
         } else if (typeInt == 6) {
             LOGE("PDF_EDIT_NATIVE nativeSavePdfEditObjects processFreeHand index=%d page=%d beforeObjects=%d", i, pageIndex, FPDFPage_CountObjects(currentPage));
             processFreeHand(env, obj, currentPage, dataPropsField, r, g, b, jsonClass, jsonInit, true);
+            if (env->ExceptionCheck()) {
+                env->DeleteLocalRef(obj);
+                FPDF_ClosePage(currentPage);
+                FPDF_CloseDocument(doc);
+                if (usingWrappedInput) ::remove(wrappedInputPath.c_str());
+                if (usingRawPatchedInput) ::remove(rawPatchedInputPath.c_str());
+                env->ReleaseStringUTFChars(inputPath_, inputPath);
+                env->ReleaseStringUTFChars(outputPath_, outputPath);
+                return JNI_FALSE;
+            }
             LOGE("PDF_EDIT_NATIVE nativeSavePdfEditObjects processFreeHand done index=%d page=%d afterObjects=%d", i, pageIndex, FPDFPage_CountObjects(currentPage));
+            newContentWritesSucceeded = FPDFPage_CountObjects(currentPage) > pageObjectCountBeforeSave;
         } else if (isSimplePdfStampEdit) {
             const bool savedSimplePdfStampContent = processSimplePdfStamp(env, obj, doc, currentPage, nullptr, rect, typeInt, dataPropsField, r, g, b, alpha, jsonClass, jsonInit, true);
+            newContentWritesSucceeded = savedSimplePdfStampContent;
             LOGE("PDF_EDIT_NATIVE nativeSavePdfEditObjects processSimplePdfStamp pageContent index=%d page=%d success=%d afterObjects=%d",
                  i, pageIndex, savedSimplePdfStampContent ? 1 : 0, FPDFPage_CountObjects(currentPage));
         } else if (typeInt == 11 || isEditTextSignature) {
             if (isEditTextSignature) {
                 LOGE("PDF_EDIT_NATIVE nativeSavePdfEditObjects route Sign_text type=%d through processFreeText index=%d page=%d", typeInt, i, pageIndex);
             }
-            processFreeText(env, obj, doc, currentPage, rect, dataPropsField, r, g, b, alpha, jsonClass, jsonInit);
+            processFreeText(env, obj, doc, currentPage, rect, dataPropsField, r, g, b, alpha, jsonClass, jsonInit, true);
+            newContentWritesSucceeded = !env->ExceptionCheck() && FPDFPage_CountObjects(currentPage) > pageObjectCountBeforeSave;
         } else if (typeInt == 9) {
             const bool savedImageContent = processImageOrPresetStamp(env, obj, doc, currentPage, nullptr, rect, dataPropsField, jsonClass, jsonInit, true);
+            newContentWritesSucceeded = savedImageContent;
             LOGE("PDF_EDIT_NATIVE nativeSavePdfEditObjects processImageOrPresetStamp pageContent index=%d page=%d success=%d afterObjects=%d",
                  i, pageIndex, savedImageContent ? 1 : 0, FPDFPage_CountObjects(currentPage));
         } else if (IsPdfShapeNativeType(typeInt)) {
             const bool savedShapeContent = processPdfShapeContent(env, obj, currentPage, rect, typeInt, dataPropsField, r, g, b, alpha, jsonClass, jsonInit);
+            newContentWritesSucceeded = savedShapeContent;
             needsShapeDictionaryPatch = needsShapeDictionaryPatch || savedShapeContent;
             LOGE("PDF_EDIT_NATIVE nativeSavePdfEditObjects processPdfShapeContent index=%d page=%d type=%d success=%d afterObjects=%d",
                  i, pageIndex, typeInt, savedShapeContent ? 1 : 0, FPDFPage_CountObjects(currentPage));
         } else {
             LOGE("PDF_EDIT_NATIVE nativeSavePdfEditObjects skip unsupported edit content type index=%d type=%d page=%d", i, typeInt, pageIndex);
+            newContentWritesSucceeded = false;
+        }
+
+        if (!newContentWritesSucceeded || env->ExceptionCheck()) {
+            newContentWritesSucceeded = false;
+            LOGE("PDF_CONTENT_SAVE object write failed index=%d page=%d type=%d", i, pageIndex, typeInt);
+            env->DeleteLocalRef(obj);
+            break;
         }
 
         if (!contentMetadataKind.empty()) {
@@ -19355,7 +20110,7 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeSavePdfEdit
                 FPDFPage_CountObjects(currentPage),
                 FPDFPage_GetAnnotCount(currentPage)
         );
-        FPDFPage_GenerateContent(currentPage);
+        if (newContentWritesSucceeded) newContentWritesSucceeded = FPDFPage_GenerateContent(currentPage);
         LOGE(
                 "PDF_EDIT_NATIVE nativeSavePdfEditObjects finalPage=%d afterGenerate objectCount=%d annotCount=%d",
                 lastPageIndex,
@@ -19363,6 +20118,15 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeSavePdfEdit
                 FPDFPage_GetAnnotCount(currentPage)
         );
         FPDF_ClosePage(currentPage);
+    }
+
+    if (!newContentWritesSucceeded) {
+        FPDF_CloseDocument(doc);
+        if (usingWrappedInput) ::remove(wrappedInputPath.c_str());
+        if (usingRawPatchedInput) ::remove(rawPatchedInputPath.c_str());
+        env->ReleaseStringUTFChars(inputPath_, inputPath);
+        env->ReleaseStringUTFChars(outputPath_, outputPath);
+        return JNI_FALSE;
     }
 
     FILE* file = fopen(outputPath, "wb");
@@ -19509,12 +20273,6 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeSaveScanned
     return success;
 }
 
-static float ClampCropPercent(float value) {
-    if (value < 0.0f) return 0.0f;
-    if (value > 95.0f) return 95.0f;
-    return value;
-}
-
 JNIEXPORT jboolean JNICALL
 Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeSavePdfCrop(
         JNIEnv* env,
@@ -19523,8 +20281,15 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeSavePdfCrop
         jstring outputPath_,
         jobjectArray cropsArray
 ) {
+    if (!inputPath_ || !outputPath_) return JNI_FALSE;
     const char* inputPath = env->GetStringUTFChars(inputPath_, 0);
+    if (!inputPath) return JNI_FALSE;
     const char* outputPath = env->GetStringUTFChars(outputPath_, 0);
+    if (!outputPath || strcmp(inputPath, outputPath) == 0) {
+        if (outputPath) env->ReleaseStringUTFChars(outputPath_, outputPath);
+        env->ReleaseStringUTFChars(inputPath_, inputPath);
+        return JNI_FALSE;
+    }
 
     FPDF_DOCUMENT doc = FPDF_LoadDocument(inputPath, nullptr);
     if (!doc) {
@@ -19570,16 +20335,20 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeSavePdfCrop
 
     for (int i = 0; i < cropCount; i++) {
         jobject cropObj = env->GetObjectArrayElement(cropsArray, i);
-        if (!cropObj) continue;
+        if (!cropObj) { failed = true; break; }
 
         const int pageIndex = env->GetIntField(cropObj, pageIndexField);
-        const float leftPercent = ClampCropPercent(env->GetFloatField(cropObj, leftPercentField));
-        const float topPercent = ClampCropPercent(env->GetFloatField(cropObj, topPercentField));
-        const float rightPercent = ClampCropPercent(env->GetFloatField(cropObj, rightPercentField));
-        const float bottomPercent = ClampCropPercent(env->GetFloatField(cropObj, bottomPercentField));
+        const float leftPercent = env->GetFloatField(cropObj, leftPercentField);
+        const float topPercent = env->GetFloatField(cropObj, topPercentField);
+        const float rightPercent = env->GetFloatField(cropObj, rightPercentField);
+        const float bottomPercent = env->GetFloatField(cropObj, bottomPercentField);
         env->DeleteLocalRef(cropObj);
 
-        if (pageIndex < 0 || pageIndex >= pageCount) {
+        if (env->ExceptionCheck() || pageIndex < 0 || pageIndex >= pageCount ||
+            !std::isfinite(leftPercent) || !std::isfinite(topPercent) ||
+            !std::isfinite(rightPercent) || !std::isfinite(bottomPercent) ||
+            leftPercent < 0 || topPercent < 0 || rightPercent < 0 || bottomPercent < 0 ||
+            leftPercent + rightPercent >= 100 || topPercent + bottomPercent >= 100) {
             failed = true;
             break;
         }
@@ -19590,16 +20359,20 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeSavePdfCrop
             break;
         }
 
-        float baseLeft = 0.0f;
-        float baseBottom = 0.0f;
-        float baseRight = 0.0f;
-        float baseTop = 0.0f;
-        if (!FPDFPage_GetCropBox(page, &baseLeft, &baseBottom, &baseRight, &baseTop)) {
-            if (!FPDFPage_GetMediaBox(page, &baseLeft, &baseBottom, &baseRight, &baseTop)) {
-                baseRight = static_cast<float>(FPDF_GetPageWidth(page));
-                baseTop = static_cast<float>(FPDF_GetPageHeight(page));
-            }
+        // Match the visible thumbnail: PDFium defines this as CropBox intersect MediaBox.
+        FS_RECTF visible{};
+        if (!FPDF_GetPageBoundingBox(page, &visible) ||
+            !std::isfinite(visible.left) || !std::isfinite(visible.bottom) ||
+            !std::isfinite(visible.right) || !std::isfinite(visible.top) ||
+            visible.right <= visible.left || visible.top <= visible.bottom) {
+            FPDF_ClosePage(page);
+            failed = true;
+            break;
         }
+        const float baseLeft = visible.left;
+        const float baseBottom = visible.bottom;
+        const float baseRight = visible.right;
+        const float baseTop = visible.top;
 
         float originalLeftPercent = leftPercent;
         float originalTopPercent = topPercent;
@@ -19651,10 +20424,23 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeSavePdfCrop
         FILE* file = fopen(outputPath, "wb");
         PdfFileWriter writer{ {1, WriteBlock}, file };
         success = (file) ? FPDF_SaveAsCopy(doc, (FPDF_FILEWRITE*)&writer, FPDF_NO_INCREMENTAL) : JNI_FALSE;
-        if (file) fclose(file);
+        // Buffered errors may surface only during flush/close, after PDFium returned success.
+        if (file) {
+            if (fflush(file) != 0 || ferror(file) || fsync(fileno(file)) != 0) success = JNI_FALSE;
+            if (fclose(file) != 0) success = JNI_FALSE;
+        }
     }
 
     FPDF_CloseDocument(doc);
+    if (success) {
+        FPDF_DOCUMENT verified = FPDF_LoadDocument(outputPath, nullptr);
+        success = verified && FPDF_GetPageCount(verified) == pageCount;
+        if (verified) FPDF_CloseDocument(verified);
+    }
+    if (!success) {
+        LOGE("PDF_CROP staged save failed; working PDF retained");
+        remove(outputPath);
+    }
     env->ReleaseStringUTFChars(inputPath_, inputPath);
     env->ReleaseStringUTFChars(outputPath_, outputPath);
     return success ? JNI_TRUE : JNI_FALSE;
@@ -20726,10 +21512,11 @@ static bool NativeTransformPatternMatrix(
         const FS_MATRIX& pageMatrix,
         std::string* outBody
 ) {
-    if (!outBody ||
-        !ContainsPdfNameValue(originalBody, "Type", "Pattern")) {
-        return false;
-    }
+    // /Type is optional for patterns; /PatternType is the required discriminator.
+    std::string rawType;
+    int patternType = 0;
+    if (!outBody || !ExtractPdfDictionaryRawValue(originalBody, "PatternType", &rawType) ||
+        !(std::istringstream(rawType) >> patternType) || (patternType != 1 && patternType != 2)) return false;
     size_t dictStart = 0;
     size_t dictEnd = 0;
     if (!FindTopLevelPdfDictionary(originalBody, &dictStart, &dictEnd)) return false;
@@ -20760,6 +21547,9 @@ static bool NativeTransformPatternMatrix(
                     pageMatrix.c * patternMatrix.f + pageMatrix.e;
     transformed.f = pageMatrix.b * patternMatrix.e +
                     pageMatrix.d * patternMatrix.f + pageMatrix.f;
+    if (!std::isfinite(transformed.a) || !std::isfinite(transformed.b) ||
+        !std::isfinite(transformed.c) || !std::isfinite(transformed.d) ||
+        !std::isfinite(transformed.e) || !std::isfinite(transformed.f)) return false;
     const std::string matrixValue =
             "[" + FormatPdfFloat(transformed.a) + " " +
             FormatPdfFloat(transformed.b) + " " +
@@ -20778,44 +21568,162 @@ static bool NativeTransformPatternMatrix(
     return true;
 }
 
+// Page Size edits dictionaries on the selected page, never shared resource owners.
+static bool NativePageSizeSetValue(std::string* body, const std::string& key,
+                                   const std::string& value) {
+    size_t start = 0, end = 0, valueStart = 0, valueEnd = 0;
+    if (!body || !FindTopLevelPdfDictionary(*body, &start, &end)) return false;
+    if (FindPdfDictionaryRawValueSegment(*body, start, end, key, &valueStart, &valueEnd)) {
+        body->replace(valueStart, valueEnd - valueStart, value);
+    } else {
+        body->insert(end - 2, "/" + key + " " + value + " ");
+    }
+    return true;
+}
+
+static bool NativePageSizeResolveValue(const std::string& value,
+                                       const std::vector<PdfObjectInfo>& objects,
+                                       std::string* resolved) {
+    int number = 0, generation = 0;
+    if (ParsePdfIndirectReferenceString(value, &number, &generation)) {
+        const PdfObjectInfo* object = FindPdfObjectInfoByRef(objects, number, generation);
+        if (!object) return false;
+        *resolved = object->body;
+    } else {
+        *resolved = value;
+    }
+    return true;
+}
+
+static bool NativePageSizeClonePatterns(std::string* pageBody,
+                                       const std::vector<PdfObjectInfo>& objects,
+                                       const FS_MATRIX& matrix, int* nextObjectNumber,
+                                       std::vector<PdfObjectReplacement>* replacements,
+                                       std::map<std::string, int>* patternClones) {
+    std::set<std::pair<int, int>> refs;
+    // A page without resources/patterns needs no resource copy.
+    if (!NativeCollectPagePatternRefs(*pageBody, objects, &refs)) return false;
+    std::string resources, patternValue, patterns;
+    if (!NativeResolvePageResourcesBody(*pageBody, objects, &resources)) return refs.empty();
+    if (!ExtractPdfDictionaryRawValue(resources, "Pattern", &patternValue)) return true;
+    if (!NativePageSizeResolveValue(patternValue, objects, &patterns)) return false;
+    size_t start = 0, end = 0;
+    if (!FindTopLevelPdfDictionary(patterns, &start, &end)) return false;
+    std::string localPatterns = "<< ";
+    const std::string matrixKey = FormatPdfFloat(matrix.a) + " " + FormatPdfFloat(matrix.b) + " " +
+            FormatPdfFloat(matrix.c) + " " + FormatPdfFloat(matrix.d) + " " +
+            FormatPdfFloat(matrix.e) + " " + FormatPdfFloat(matrix.f);
+    size_t cursor = start + 2;
+    while (cursor < end - 2) {
+        const unsigned char ch = static_cast<unsigned char>(patterns[cursor]);
+        if (std::isspace(ch)) { ++cursor; continue; }
+        if (ch == '%') {
+            cursor = patterns.find_first_of("\r\n", cursor);
+            if (cursor == std::string::npos) return false;
+            continue;
+        }
+        if (ch != '/') return false;
+        const size_t nameStart = ++cursor;
+        while (cursor < end && !IsPdfNameDelimiter(patterns[cursor]) &&
+               !std::isspace(static_cast<unsigned char>(patterns[cursor]))) ++cursor;
+        const std::string name = patterns.substr(nameStart, cursor - nameStart);
+        size_t valueStart = 0, valueEnd = 0;
+        if (name.empty() || !FindPdfDictionaryRawValueSegment(
+                patterns, start, end, name, &valueStart, &valueEnd) || valueEnd <= cursor) return false;
+        const std::string value = patterns.substr(valueStart, valueEnd - valueStart);
+        int number = 0, generation = 0;
+        const bool indirect = ParsePdfIndirectReferenceString(value, &number, &generation);
+        const std::string cacheKey = std::to_string(number) + ":" + std::to_string(generation) + "|" + matrixKey;
+        const auto cached = patternClones->find(cacheKey);
+        int clone;
+        if (indirect && cached != patternClones->end()) {
+            clone = cached->second;
+        } else {
+            std::string pattern, transformed;
+            if (!NativePageSizeResolveValue(value, objects, &pattern)) return false;
+            std::string matrixValue, resolvedMatrix;
+            if (ExtractPdfDictionaryRawValue(pattern, "Matrix", &matrixValue) &&
+                (!NativePageSizeResolveValue(matrixValue, objects, &resolvedMatrix) ||
+                 !NativePageSizeSetValue(&pattern, "Matrix", resolvedMatrix))) return false;
+            if (!NativeTransformPatternMatrix(pattern, matrix, &transformed)) return false;
+            clone = (*nextObjectNumber)++;
+            replacements->push_back({clone, 0, std::move(transformed)});
+            // Equal transforms share their clone; mixed-size pages remain isolated.
+            if (indirect) (*patternClones)[cacheKey] = clone;
+        }
+        localPatterns += "/" + name + " " + std::to_string(clone) + " 0 R ";
+        cursor = valueEnd;
+    }
+    localPatterns += ">>";
+    return NativePageSizeSetValue(&resources, "Pattern", localPatterns) &&
+           NativePageSizeSetValue(pageBody, "Resources", resources);
+}
+
 static bool NativePatchPageSizeContentMatrices(
         const char* outputPath,
-        const std::map<int, FS_MATRIX>& pageMatrices
+        const std::map<int, FS_MATRIX>& pageMatrices,
+        const std::map<int, FS_RECTF>& sourceBounds
 ) {
-    if (!outputPath || pageMatrices.empty()) return false;
+    if (!outputPath || pageMatrices.empty() ||
+        !HasToolkitWatermarkMemoryHeadroom(outputPath, "PDF_PAGE_SIZE_SCALE")) return false;
     std::string data;
-    if (!ReadFileToString(outputPath, &data)) return false;
-
-    const std::vector<PdfObjectInfo> objects = ScanPdfObjects(data);
-    const std::vector<PdfObjectInfo> latestObjects = BuildLatestPdfObjectsByRef(objects);
+    // Allocate once, and reject a file that changes while it is read.
+    std::ifstream input(outputPath, std::ios::binary | std::ios::ate);
+    if (!input || input.tellg() <= 0) return false;
+    data.resize(static_cast<size_t>(input.tellg()));
+    input.seekg(0);
+    input.read(&data[0], static_cast<std::streamsize>(data.size()));
+    if (!input || input.peek() != std::ifstream::traits_type::eof()) return false;
+    input.close();
+    std::vector<PdfObjectInfo> scanned = ScanPdfObjects(data);
+    std::vector<PdfObjectInfo> latestObjects;
+    std::map<std::pair<int, int>, size_t> indices;
+    for (auto& object : scanned) {
+        const auto key = std::make_pair(object.objectNumber, object.generation);
+        const auto found = indices.find(key);
+        if (found == indices.end()) {
+            indices[key] = latestObjects.size();
+            latestObjects.push_back(std::move(object));
+        } else latestObjects[found->second] = std::move(object);
+    }
+    scanned.clear();
     std::vector<PdfObjectInfo> pages = BuildPdfPageObjectsFromCatalog(data, latestObjects);
     if (pages.empty()) {
-        pages = BuildLatestPdfPageObjects(objects, latestObjects);
+        pages = BuildLatestPdfPageObjects(latestObjects, latestObjects);
     }
     if (pages.empty()) return false;
 
-    int nextObjectNumber = GetMaxPdfObjectNumber(objects) + 1;
+    int nextObjectNumber = GetMaxPdfObjectNumber(latestObjects) + 1;
     std::vector<PdfObjectReplacement> replacements;
-    std::map<std::pair<int, int>, FS_MATRIX> patternMatrices;
+    std::map<std::string, int> patternClones;
     int patchedPages = 0;
     for (const auto& pageMatrix : pageMatrices) {
         const int pageIndex = pageMatrix.first;
-        if (pageIndex < 0 || static_cast<size_t>(pageIndex) >= pages.size()) return false;
+        if (pageIndex < 0 || static_cast<size_t>(pageIndex) >= pages.size() ||
+            sourceBounds.find(pageIndex) == sourceBounds.end()) return false;
 
         const int prefixObjectNumber = nextObjectNumber++;
         const int suffixObjectNumber = nextObjectNumber++;
         std::string pageBody = GetCurrentPdfObjectBody(pages[pageIndex], &replacements);
-        if (!NativeWrapPageContentsWithMatrix(
-                pageBody,
-                latestObjects,
-                &replacements,
-                prefixObjectNumber,
-                suffixObjectNumber,
-                &pageBody)) {
-            return false;
+        std::string contents, resolvedContents;
+        if (ExtractPdfDictionaryRawValue(pageBody, "Contents", &contents) && contents != "null") {
+            if (!NativePageSizeResolveValue(contents, latestObjects, &resolvedContents)) return false;
+            const size_t first = resolvedContents.find_first_not_of(" \r\n\t");
+            if (first != std::string::npos && resolvedContents[first] == '[') {
+                const size_t last = resolvedContents.find_last_of(']');
+                if (last == std::string::npos) return false;
+                contents = resolvedContents.substr(first + 1, last - first - 1);
+            }
+        } else {
+            contents.clear(); // Blank pages still support resize.
         }
+        // Materialize indirect arrays locally: another page may share their owner.
+        if (!NativePageSizeSetValue(&pageBody, "Contents", "[ " +
+                std::to_string(prefixObjectNumber) + " 0 R " + contents + " " +
+                std::to_string(suffixObjectNumber) + " 0 R ]")) return false;
 
         const FS_MATRIX& matrix = pageMatrix.second;
+        const FS_RECTF& bounds = sourceBounds.at(pageIndex);
         const std::string matrixStream =
                 "q\n" +
                 FormatPdfFloat(matrix.a) + " " +
@@ -20823,7 +21731,10 @@ static bool NativePatchPageSizeContentMatrices(
                 FormatPdfFloat(matrix.c) + " " +
                 FormatPdfFloat(matrix.d) + " " +
                 FormatPdfFloat(matrix.e) + " " +
-                FormatPdfFloat(matrix.f) + " cm\n";
+                FormatPdfFloat(matrix.f) + " cm\n" +
+                FormatPdfFloat(bounds.left) + " " + FormatPdfFloat(bounds.bottom) + " " +
+                FormatPdfFloat(bounds.right - bounds.left) + " " +
+                FormatPdfFloat(bounds.top - bounds.bottom) + " re W n\n";
         replacements.push_back({
                 prefixObjectNumber,
                 0,
@@ -20835,6 +21746,11 @@ static bool NativePatchPageSizeContentMatrices(
                 0,
                 "<< /Length 2 >>\nstream\nQ\nendstream"
         });
+        if (!NativePageSizeClonePatterns(&pageBody, latestObjects, matrix, &nextObjectNumber,
+                                         &replacements, &patternClones)) {
+            LOGE("PDF_PAGE_SIZE_SCALE unable to isolate page pattern resources");
+            return false;
+        }
         if (!UpsertPdfObjectReplacement(
                 &replacements,
                 pages[pageIndex].objectNumber,
@@ -20842,69 +21758,35 @@ static bool NativePatchPageSizeContentMatrices(
                 pageBody)) {
             return false;
         }
-        std::set<std::pair<int, int>> patternRefs;
-        if (!NativeCollectPagePatternRefs(
-                pages[pageIndex].body, latestObjects, &patternRefs)) {
-            return false;
-        }
-        for (const auto& patternRef : patternRefs) {
-            patternMatrices.emplace(patternRef, matrix);
-        }
         patchedPages++;
     }
 
-    for (const auto& patternMatrix : patternMatrices) {
-        const PdfObjectInfo* patternObject = FindPdfObjectInfoByRef(
-                latestObjects, patternMatrix.first.first, patternMatrix.first.second);
-        if (!patternObject) return false;
-        std::string transformedPatternBody;
-        if (!NativeTransformPatternMatrix(
-                patternObject->body, patternMatrix.second, &transformedPatternBody)) {
-            continue;
-        }
-        if (!UpsertPdfObjectReplacement(
-                &replacements,
-                patternObject->objectNumber,
-                patternObject->generation,
-                transformedPatternBody)) {
-            return false;
-        }
-    }
-
-    if (patchedPages != static_cast<int>(pageMatrices.size()) ||
+    if (!HasToolkitWatermarkMemoryHeadroom(outputPath, "PDF_PAGE_SIZE_SCALE") ||
+        patchedPages != static_cast<int>(pageMatrices.size()) ||
         !AppendIncrementalPdfObjectUpdates(&data, &replacements)) {
         return false;
     }
-    return WriteStringToFile(outputPath, data);
+    return WriteCheckedToolkitWatermarkFile(outputPath, data, "PDF_PAGE_SIZE_SCALE");
 }
 
 static bool NativeResolvePageSize(FPDF_PAGE page, float* left, float* bottom, float* width, float* height) {
     if (!page || !left || !bottom || !width || !height) return false;
 
-    float mediaLeft = 0.0f;
-    float mediaBottom = 0.0f;
-    float mediaRight = 0.0f;
-    float mediaTop = 0.0f;
-    if (FPDFPage_GetMediaBox(page, &mediaLeft, &mediaBottom, &mediaRight, &mediaTop) &&
-        mediaRight > mediaLeft &&
-        mediaTop > mediaBottom) {
-        *left = mediaLeft;
-        *bottom = mediaBottom;
-        *width = mediaRight - mediaLeft;
-        *height = mediaTop - mediaBottom;
-        return true;
-    }
-
-    *left = 0.0f;
-    *bottom = 0.0f;
-    *width = static_cast<float>(FPDF_GetPageWidth(page));
-    *height = static_cast<float>(FPDF_GetPageHeight(page));
-    return *width > 0.0f && *height > 0.0f;
+    FS_RECTF visible;
+    if (!FPDF_GetPageBoundingBox(page, &visible) ||
+        !std::isfinite(visible.left) || !std::isfinite(visible.bottom) ||
+        !std::isfinite(visible.right) || !std::isfinite(visible.top)) return false;
+    *left = visible.left;
+    *bottom = visible.bottom;
+    *width = visible.right - visible.left;
+    *height = visible.top - visible.bottom;
+    return std::isfinite(*width) && std::isfinite(*height) && *width > 0.0f && *height > 0.0f;
 }
 
 struct NativeTextMarkupGeometry {
     int annotIndex = -1;
     int subtype = -1;
+    FS_RECTF originalRect{};
     std::vector<FS_QUADPOINTSF> attachmentPoints;
 };
 
@@ -20968,128 +21850,87 @@ static int NativeTextMarkupSubtypeToTypeInt(int subtype) {
     }
 }
 
-static FS_RECTF NativeQuadBounds(const FS_QUADPOINTSF& quad) {
-    const FS_POINTF p1 = {quad.x1, quad.y1};
-    const FS_POINTF p2 = {quad.x2, quad.y2};
-    const FS_POINTF p3 = {quad.x3, quad.y3};
-    const FS_POINTF p4 = {quad.x4, quad.y4};
-    return NativeNormalizeRect(p1, p2, p3, p4);
-}
+struct NativePageSizeAnnotationHandle {
+    FPDF_ANNOTATION value;
+    ~NativePageSizeAnnotationHandle() { if (value) FPDFPage_CloseAnnot(value); }
+};
 
-static void NativeExpandRect(FS_RECTF* base, const FS_RECTF& add) {
-    if (!base) return;
-    base->left = std::min(base->left, add.left);
-    base->right = std::max(base->right, add.right);
-    base->bottom = std::min(base->bottom, add.bottom);
-    base->top = std::max(base->top, add.top);
-}
-
-static std::vector<NativeTextMarkupGeometry> NativeCollectTextMarkupGeometry(FPDF_PAGE page) {
-    std::vector<NativeTextMarkupGeometry> geometries;
-    if (!page) return geometries;
+static bool NativeCollectTextMarkupGeometry(FPDF_PAGE page,
+                                             std::vector<NativeTextMarkupGeometry>* geometries) {
+    if (!page || !geometries) return false;
 
     const int annotCount = FPDFPage_GetAnnotCount(page);
     for (int annotIndex = 0; annotIndex < annotCount; annotIndex++) {
-        FPDF_ANNOTATION annot = FPDFPage_GetAnnot(page, annotIndex);
+        NativePageSizeAnnotationHandle owner{FPDFPage_GetAnnot(page, annotIndex)};
+        FPDF_ANNOTATION annot = owner.value;
+        if (!annot) return false;
         if (annot) {
             const int subtype = FPDFAnnot_GetSubtype(annot);
             if (NativeIsTextMarkupSubtype(subtype)) {
                 NativeTextMarkupGeometry geometry;
                 geometry.annotIndex = annotIndex;
                 geometry.subtype = subtype;
+                if (!FPDFAnnot_GetRect(annot, &geometry.originalRect)) {
+                    return false;
+                }
                 const int quadCount = FPDFAnnot_CountAttachmentPoints(annot);
                 geometry.attachmentPoints.reserve(std::max(quadCount, 0));
                 for (int quadIndex = 0; quadIndex < quadCount; quadIndex++) {
                     FS_QUADPOINTSF quad;
-                    if (FPDFAnnot_GetAttachmentPoints(annot, quadIndex, &quad)) {
-                        geometry.attachmentPoints.push_back(quad);
-                    }
+                    if (!FPDFAnnot_GetAttachmentPoints(annot, quadIndex, &quad)) return false;
+                    geometry.attachmentPoints.push_back(quad);
                 }
                 if (!geometry.attachmentPoints.empty()) {
-                    geometries.push_back(std::move(geometry));
+                    geometries->push_back(std::move(geometry));
                 }
             }
-            FPDFPage_CloseAnnot(annot);
         }
     }
-    return geometries;
+    return true;
 }
 
-static void NativeFixTextMarkupAfterPageSizeScale(
+static bool NativeFixTextMarkupAfterPageSizeScale(
         FPDF_PAGE page,
         const FS_MATRIX& matrix,
         const std::vector<NativeTextMarkupGeometry>& geometries
 ) {
-    if (!page || geometries.empty()) return;
+    if (!page) return false;
 
     const int annotCount = FPDFPage_GetAnnotCount(page);
     for (const NativeTextMarkupGeometry& geometry : geometries) {
-        if (geometry.annotIndex < 0 || geometry.annotIndex >= annotCount) continue;
+        if (geometry.annotIndex < 0 || geometry.annotIndex >= annotCount) return false;
         FPDF_ANNOTATION annot = FPDFPage_GetAnnot(page, geometry.annotIndex);
-        if (!annot) continue;
+        if (!annot) return false;
         if (FPDFAnnot_GetSubtype(annot) != geometry.subtype) {
             FPDFPage_CloseAnnot(annot);
-            continue;
+            return false;
         }
 
-        bool hasBounds = false;
-        FS_RECTF bounds = {0.0f, 0.0f, 0.0f, 0.0f};
-        std::vector<FS_RECTF> transformedQuadBounds;
+        bool success = true;
         const int currentQuadCount = FPDFAnnot_CountAttachmentPoints(annot);
         const int quadCount = static_cast<int>(geometry.attachmentPoints.size());
-        transformedQuadBounds.reserve(std::max(quadCount, 0));
         for (int quadIndex = 0; quadIndex < quadCount; quadIndex++) {
             FS_QUADPOINTSF transformedQuad = NativeTransformQuad(
                     matrix,
                     geometry.attachmentPoints[quadIndex]
             );
-            if (quadIndex < currentQuadCount) {
-                FPDFAnnot_SetAttachmentPoints(annot, quadIndex, &transformedQuad);
-            }
-            const FS_RECTF quadBounds = NativeQuadBounds(transformedQuad);
-            transformedQuadBounds.push_back(quadBounds);
-            if (!hasBounds) {
-                bounds = quadBounds;
-                hasBounds = true;
-            } else {
-                NativeExpandRect(&bounds, quadBounds);
-            }
+            if (quadIndex >= currentQuadCount ||
+                !FPDFAnnot_SetAttachmentPoints(annot, quadIndex, &transformedQuad)) success = false;
         }
 
-        if (hasBounds) {
-            FPDFAnnot_SetRect(annot, &bounds);
-            FPDFAnnot_SetAP(annot, FPDF_ANNOT_APPEARANCEMODE_NORMAL, nullptr);
-
-            unsigned int r = 255;
-            unsigned int g = 255;
-            unsigned int b = 0;
-            unsigned int a = 125;
-            if (!FPDFAnnot_GetColor(annot, FPDFANNOT_COLORTYPE_Color, &r, &g, &b, &a)) {
-                FPDFAnnot_GetColor(annot, FPDFANNOT_COLORTYPE_InteriorColor, &r, &g, &b, &a);
-            }
-            FPDFAnnot_SetColor(annot, FPDFANNOT_COLORTYPE_Color, r, g, b, a);
-            if (geometry.subtype == FPDF_ANNOT_HIGHLIGHT) {
-                FPDFAnnot_SetColor(annot, FPDFANNOT_COLORTYPE_InteriorColor, r, g, b, a);
-                const unsigned short blendMode[] = {'M','u','l','t','i','p','l','y',0};
-                FPDFAnnot_SetStringValue(annot, "BM", (FPDF_WIDESTRING)blendMode);
-            } else {
-                const int typeInt = NativeTextMarkupSubtypeToTypeInt(geometry.subtype);
-                for (const FS_RECTF& quadBounds : transformedQuadBounds) {
-                    AppendFallbackTextMarkupAppearance(
-                            annot,
-                            typeInt,
-                            quadBounds,
-                            static_cast<int>(r),
-                            static_cast<int>(g),
-                            static_cast<int>(b),
-                            static_cast<int>(a)
-                    );
-                }
-            }
-        }
-
+        // Rect maps the existing appearance's BBox into the resized page. Keep the
+        // appearance stream/resources (including stroke width, alpha and margins).
+        const FS_RECTF& original = geometry.originalRect;
+        const FS_RECTF bounds = NativeNormalizeRect(
+                NativeTransformPoint(matrix, original.left, original.bottom),
+                NativeTransformPoint(matrix, original.left, original.top),
+                NativeTransformPoint(matrix, original.right, original.bottom),
+                NativeTransformPoint(matrix, original.right, original.top));
+        if (!FPDFAnnot_SetRect(annot, &bounds)) success = false;
         FPDFPage_CloseAnnot(annot);
+        if (!success) return false;
     }
+    return true;
 }
 
 static bool NativeApplyPageSizeScale(
@@ -21100,7 +21941,8 @@ static bool NativeApplyPageSizeScale(
         float scaleFactor,
         float* outScaleX = nullptr,
         float* outScaleY = nullptr,
-        FS_MATRIX* outMatrix = nullptr
+        FS_MATRIX* outMatrix = nullptr,
+        FS_RECTF* outSourceBounds = nullptr
 ) {
     float sourceLeft = 0.0f;
     float sourceBottom = 0.0f;
@@ -21113,7 +21955,8 @@ static bool NativeApplyPageSizeScale(
     const float finalWidth = targetWidth > 0.0f ? targetWidth : sourceWidth;
     const float finalHeight = targetHeight > 0.0f ? targetHeight : sourceHeight;
     const float factor = std::isfinite(scaleFactor) && scaleFactor > 0.0f ? scaleFactor : 1.0f;
-    if (finalWidth <= 0.0f || finalHeight <= 0.0f) {
+    if (!std::isfinite(finalWidth) || !std::isfinite(finalHeight) ||
+        finalWidth <= 0.0f || finalHeight <= 0.0f) {
         return false;
     }
 
@@ -21153,14 +21996,82 @@ static bool NativeApplyPageSizeScale(
     matrix.d = scaleY;
     matrix.e = offsetX - (sourceLeft * scaleX);
     matrix.f = offsetY - (sourceBottom * scaleY);
+    if (!std::isfinite(matrix.a) || !std::isfinite(matrix.d) ||
+        !std::isfinite(matrix.e) || !std::isfinite(matrix.f) ||
+        matrix.a <= 0.0f || matrix.d <= 0.0f) return false;
     if (outMatrix) *outMatrix = matrix;
+    if (outSourceBounds) *outSourceBounds = {
+        sourceLeft, sourceBottom + sourceHeight, sourceLeft + sourceWidth, sourceBottom};
 
-    const std::vector<NativeTextMarkupGeometry> textMarkupGeometry =
-            NativeCollectTextMarkupGeometry(page);
+    std::vector<NativeTextMarkupGeometry> textMarkupGeometry;
+    if (!NativeCollectTextMarkupGeometry(page, &textMarkupGeometry)) return false;
     FPDFPage_TransformAnnots(page, matrix.a, matrix.b, matrix.c, matrix.d, matrix.e, matrix.f);
-    NativeFixTextMarkupAfterPageSizeScale(page, matrix, textMarkupGeometry);
+    if (!NativeFixTextMarkupAfterPageSizeScale(page, matrix, textMarkupGeometry)) return false;
     FPDFPage_SetMediaBox(page, 0.0f, 0.0f, finalWidth, finalHeight);
     FPDFPage_SetCropBox(page, 0.0f, 0.0f, finalWidth, finalHeight);
+    return true;
+}
+
+// Only Page Size uses these scoped handles; legacy save routes are unchanged.
+struct NativePageSizeHandles {
+    FPDF_DOCUMENT document = nullptr;
+    FPDF_PAGE page = nullptr;
+    FILE* file = nullptr;
+    ~NativePageSizeHandles() {
+        if (file) fclose(file);
+        if (page) FPDF_ClosePage(page);
+        if (document) FPDF_CloseDocument(document);
+    }
+};
+
+static bool NativeSavePageSizeFile(const char* inputPath, const char* outputPath,
+                                   float targetWidth, float targetHeight, int scaleMode,
+                                   float scaleFactor, const std::set<int>& requestedPages) {
+    if (!HasToolkitWatermarkMemoryHeadroom(inputPath, "PDF_PAGE_SIZE_SCALE")) return false;
+    NativePageSizeHandles handles;
+    handles.document = FPDF_LoadDocument(inputPath, nullptr);
+    if (!handles.document) return false;
+    const int pageCount = FPDF_GetPageCount(handles.document);
+    if (pageCount <= 0 || (!requestedPages.empty() && *requestedPages.rbegin() >= pageCount)) return false;
+    std::map<int, FS_MATRIX> pageMatrices;
+    std::map<int, FS_RECTF> sourceBounds;
+    for (int pageIndex = 0; pageIndex < pageCount; ++pageIndex) {
+        if (!NativePageIndexRequested(requestedPages, pageIndex)) continue;
+        handles.page = FPDF_LoadPage(handles.document, pageIndex);
+        if (!handles.page) return false;
+        FS_MATRIX matrix;
+        FS_RECTF bounds;
+        if (!NativeApplyPageSizeScale(handles.page, targetWidth, targetHeight, scaleMode,
+                                      scaleFactor, nullptr, nullptr, &matrix, &bounds)) return false;
+        pageMatrices[pageIndex] = matrix;
+        sourceBounds[pageIndex] = bounds;
+        FPDF_ClosePage(handles.page);
+        handles.page = nullptr;
+    }
+    if (pageMatrices.empty()) return false;
+    handles.file = fopen(outputPath, "wb");
+    if (!handles.file) return false;
+    PdfFileWriter writer{{1, WriteBlock}, handles.file};
+    bool saved = FPDF_SaveAsCopy(handles.document, reinterpret_cast<FPDF_FILEWRITE*>(&writer),
+                                 FPDF_NO_INCREMENTAL) != 0;
+    if (fflush(handles.file) != 0 || ferror(handles.file) || fsync(fileno(handles.file)) != 0) saved = false;
+    if (fclose(handles.file) != 0) saved = false;
+    handles.file = nullptr;
+    FPDF_CloseDocument(handles.document);
+    handles.document = nullptr; // Release PDFium memory before scanning serialized objects.
+    if (!saved || !NativePatchPageSizeContentMatrices(outputPath, pageMatrices, sourceBounds)) return false;
+
+    // Validate the FINAL patched bytes, not just PDFium's intermediate copy.
+    handles.document = FPDF_LoadDocument(outputPath, nullptr);
+    if (!handles.document || FPDF_GetPageCount(handles.document) != pageCount) return false;
+    for (int index = 0; index < pageCount; ++index) {
+        handles.page = FPDF_LoadPage(handles.document, index);
+        if (!handles.page) return false;
+        const double width = FPDF_GetPageWidth(handles.page), height = FPDF_GetPageHeight(handles.page);
+        if (!std::isfinite(width) || !std::isfinite(height) || width <= 0 || height <= 0) return false;
+        FPDF_ClosePage(handles.page);
+        handles.page = nullptr;
+    }
     return true;
 }
 
@@ -21176,103 +22087,68 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeSavePdfPage
         jfloat scaleFactor,
         jintArray pageIndices_
 ) {
-    const char* inputPath = env->GetStringUTFChars(inputPath_, 0);
-    const char* outputPath = env->GetStringUTFChars(outputPath_, 0);
-
-    std::set<int> requestedPages;
-    if (pageIndices_) {
-        const int indexCount = env->GetArrayLength(pageIndices_);
-        std::vector<jint> indices(indexCount);
-        if (indexCount > 0) {
-            env->GetIntArrayRegion(pageIndices_, 0, indexCount, indices.data());
-            for (int i = 0; i < indexCount; i++) {
-                if (indices[i] >= 0) {
-                    requestedPages.insert(indices[i]);
-                }
+    if (!inputPath_ || !outputPath_) return JNI_FALSE;
+    const char* inputPath = env->GetStringUTFChars(inputPath_, nullptr);
+    if (!inputPath) return JNI_FALSE;
+    const char* outputPath = env->GetStringUTFChars(outputPath_, nullptr);
+    if (!outputPath) { env->ReleaseStringUTFChars(inputPath_, inputPath); return JNI_FALSE; }
+    const bool samePath = strcmp(inputPath, outputPath) == 0;
+    bool success = false;
+    try {
+        std::set<int> requestedPages;
+        bool valid = !samePath && std::isfinite(targetWidth) && std::isfinite(targetHeight) &&
+                     targetWidth >= 0 && targetHeight >= 0 && scaleMode >= 0 && scaleMode <= 4 &&
+                     std::isfinite(scaleFactor) && scaleFactor > 0;
+        if (pageIndices_) {
+            const int count = env->GetArrayLength(pageIndices_);
+            std::vector<jint> indices(count);
+            if (count > 0) env->GetIntArrayRegion(pageIndices_, 0, count, indices.data());
+            for (const int index : indices) {
+                if (index < 0) valid = false;
+                else requestedPages.insert(index);
             }
         }
+        if (valid && !env->ExceptionCheck()) success = NativeSavePageSizeFile(
+                inputPath, outputPath, targetWidth, targetHeight, scaleMode, scaleFactor, requestedPages);
+    } catch (const std::bad_alloc&) {
+        LOGE("PDF_PAGE_SIZE_SCALE allocation failed; working PDF retained");
+    } catch (const std::exception&) {
+        LOGE("PDF_PAGE_SIZE_SCALE native processing failed; working PDF retained");
+    } catch (...) {
+        LOGE("PDF_PAGE_SIZE_SCALE unexpected native failure; working PDF retained");
     }
-
-    FPDF_DOCUMENT doc = FPDF_LoadDocument(inputPath, nullptr);
-    if (!doc) {
-        env->ReleaseStringUTFChars(inputPath_, inputPath);
-        env->ReleaseStringUTFChars(outputPath_, outputPath);
-        return JNI_FALSE;
+    if (env->ExceptionCheck()) success = false;
+    if (!success && !samePath) {
+        remove(outputPath);
+        LOGE("PDF_PAGE_SIZE_SCALE staged output rejected");
     }
-
-    const int pageCount = FPDF_GetPageCount(doc);
-    bool appliedAnyPage = false;
-    bool failed = false;
-    std::map<int, FS_MATRIX> pageMatrices;
-    for (int pageIndex = 0; pageIndex < pageCount; pageIndex++) {
-        if (!NativePageIndexRequested(requestedPages, pageIndex)) continue;
-
-        FPDF_PAGE page = FPDF_LoadPage(doc, pageIndex);
-        if (!page) {
-            failed = true;
-            break;
-        }
-
-        FS_MATRIX pageMatrix;
-        const bool applied = NativeApplyPageSizeScale(
-                page,
-                targetWidth,
-                targetHeight,
-                scaleMode,
-                scaleFactor,
-                nullptr,
-                nullptr,
-                &pageMatrix
-        );
-        FPDF_ClosePage(page);
-        if (!applied) {
-            failed = true;
-            break;
-        }
-        pageMatrices[pageIndex] = pageMatrix;
-        appliedAnyPage = true;
-    }
-
-    int success = JNI_FALSE;
-    if (!failed && appliedAnyPage) {
-        FILE* file = fopen(outputPath, "wb");
-        PdfFileWriter writer{ {1, WriteBlock}, file };
-        success = (file) ? FPDF_SaveAsCopy(doc, (FPDF_FILEWRITE*)&writer, FPDF_NO_INCREMENTAL) : JNI_FALSE;
-        if (file) fclose(file);
-        if (success && !NativePatchPageSizeContentMatrices(outputPath, pageMatrices)) {
-            success = JNI_FALSE;
-        }
-    }
-
-    FPDF_CloseDocument(doc);
     env->ReleaseStringUTFChars(inputPath_, inputPath);
     env->ReleaseStringUTFChars(outputPath_, outputPath);
     return success ? JNI_TRUE : JNI_FALSE;
 }
 
-JNIEXPORT jboolean JNICALL
-Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeSaveEdit(
-        JNIEnv* env,
-    jobject thiz,
-    jstring inputPath_,
-    jstring outputPath_,
-    jobjectArray watermarksArray
-) {
-    const char* inputPath = env->GetStringUTFChars(inputPath_, 0);
-    const char* outputPath = env->GetStringUTFChars(outputPath_, 0);
-
+static bool SaveWatermarkEditFile(JNIEnv* env, const char* inputPath, const char* outputPath,
+                                  jobjectArray watermarksArray, bool strictPdfToolkit) {
+    if (strictPdfToolkit && !HasToolkitWatermarkMemoryHeadroom(inputPath)) return false;
     jclass watermarkClass = env->FindClass("com/cv/lufick/compose_editor/data_class/PdfWatermarkNative");
+    if (!watermarkClass) return false;
     jfieldID dataPropsField = env->GetFieldID(watermarkClass, "dataProperties", "Ljava/lang/String;");
     jclass jsonClass = env->FindClass("org/json/JSONObject");
+    if (!dataPropsField || !jsonClass) return false;
     jmethodID jsonInit = env->GetMethodID(jsonClass, "<init>", "(Ljava/lang/String;)V");
+    if (!jsonInit) return false;
 
     const int watermarkCount = watermarksArray ? env->GetArrayLength(watermarksArray) : 0;
     std::vector<RawPdfWatermarkSpec> rawWatermarkSpecs;
     rawWatermarkSpecs.reserve(std::max(0, watermarkCount));
+    std::set<int> targetPages;
 
     for (int i = 0; i < watermarkCount; i++) {
         jobject obj = env->GetObjectArrayElement(watermarksArray, i);
-        if (!obj) continue;
+        if (!obj) {
+            if (strictPdfToolkit) return false;
+            continue;
+        }
 
         RawPdfWatermarkSpec spec;
         if (CollectPageLevelTextWatermarkPatternSpec(env, obj, dataPropsField, jsonClass, jsonInit, &spec)) {
@@ -21280,11 +22156,21 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeSaveEdit(
         }
         env->DeleteLocalRef(obj);
     }
+    if (strictPdfToolkit) {
+        for (const auto& spec : rawWatermarkSpecs) {
+            if (spec.pageIndex < 0 || !targetPages.insert(spec.pageIndex).second) return false;
+        }
+        if (rawWatermarkSpecs.size() != static_cast<size_t>(watermarkCount) || env->ExceptionCheck()) {
+            LOGE("PDF_WATERMARK rejected incomplete native specifications");
+            return false;
+        }
+    }
 
     const bool editContentInput = PdfFileHasEditContentMarker(inputPath);
     int success = JNI_FALSE;
     if (editContentInput) {
-        success = CopyFileBinary(inputPath, outputPath) ? JNI_TRUE : JNI_FALSE;
+        success = (strictPdfToolkit ? CopyCheckedToolkitWatermarkFile(inputPath, outputPath)
+                                   : CopyFileBinary(inputPath, outputPath)) ? JNI_TRUE : JNI_FALSE;
     }
     if (!success && !editContentInput) {
         FPDF_DOCUMENT doc = FPDF_LoadDocument(inputPath, nullptr);
@@ -21292,26 +22178,65 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeSaveEdit(
             FILE* file = fopen(outputPath, "wb");
             PdfFileWriter writer{ {1, WriteBlock}, file };
             success = (file) ? FPDF_SaveAsCopy(doc, (FPDF_FILEWRITE*)&writer, FPDF_NO_INCREMENTAL) : JNI_FALSE;
-            if (file) fclose(file);
+            if (file) {
+                if (strictPdfToolkit && (fflush(file) != 0 || ferror(file) || fsync(fileno(file)) != 0)) success = JNI_FALSE;
+                if (fclose(file) != 0 && strictPdfToolkit) success = JNI_FALSE;
+            }
             FPDF_CloseDocument(doc);
         }
     }
     if (!success) {
-        success = CopyFileBinary(inputPath, outputPath) ? JNI_TRUE : JNI_FALSE;
+        success = (strictPdfToolkit ? CopyCheckedToolkitWatermarkFile(inputPath, outputPath)
+                                   : CopyFileBinary(inputPath, outputPath)) ? JNI_TRUE : JNI_FALSE;
     }
 
     if (success && watermarkCount > 0 && rawWatermarkSpecs.empty()) {
         success = JNI_FALSE;
     }
     if (success && !rawWatermarkSpecs.empty()) {
-        const bool watermarkPatched = PatchRawPdfWatermarkPatterns(env, outputPath, rawWatermarkSpecs);
+        const bool watermarkPatched = PatchRawPdfWatermarkPatterns(env, outputPath, rawWatermarkSpecs, strictPdfToolkit);
         if (!watermarkPatched) {
             success = JNI_FALSE;
         }
     }
-    if (success && watermarkCount == 0 && !PatchRawPdfWatermarkPatterns(env, outputPath, rawWatermarkSpecs)) {
+    if (success && watermarkCount == 0 && !PatchRawPdfWatermarkPatterns(env, outputPath, rawWatermarkSpecs, strictPdfToolkit)) {
         success = JNI_FALSE;
     }
+    if (success && strictPdfToolkit) {
+        FPDF_DOCUMENT verified = FPDF_LoadDocument(outputPath, nullptr);
+        const int pages = verified ? FPDF_GetPageCount(verified) : 0;
+        success = pages > 0 && (watermarkCount == 0 || pages == watermarkCount);
+        if (verified) FPDF_CloseDocument(verified);
+        if (!success) LOGE("PDF_WATERMARK staged PDF validation failed");
+    }
+    return success;
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeSaveEdit(
+        JNIEnv* env, jobject, jstring inputPath_, jstring outputPath_,
+        jobjectArray watermarksArray, jboolean strictPdfToolkit) {
+    if (!inputPath_ || !outputPath_) return JNI_FALSE;
+    const char* inputPath = env->GetStringUTFChars(inputPath_, nullptr);
+    if (!inputPath) return JNI_FALSE;
+    const char* outputPath = env->GetStringUTFChars(outputPath_, nullptr);
+    if (!outputPath) {
+        env->ReleaseStringUTFChars(inputPath_, inputPath);
+        return JNI_FALSE;
+    }
+    bool success = false;
+    const bool samePath = strcmp(inputPath, outputPath) == 0;
+    try {
+        if (!strictPdfToolkit || !samePath) {
+            success = SaveWatermarkEditFile(env, inputPath, outputPath, watermarksArray, strictPdfToolkit);
+        }
+    } catch (const std::bad_alloc&) {
+        LOGE("PDF_WATERMARK native allocation failed; staged output rejected");
+    } catch (const std::exception&) {
+        LOGE("PDF_WATERMARK native processing failed; staged output rejected");
+    }
+    if (strictPdfToolkit && env->ExceptionCheck()) success = false;
+    if (!success && strictPdfToolkit && !samePath) remove(outputPath);
     env->ReleaseStringUTFChars(inputPath_, inputPath);
     env->ReleaseStringUTFChars(outputPath_, outputPath);
     return success ? JNI_TRUE : JNI_FALSE;
@@ -21590,24 +22515,30 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeReadFileAtt
             unsigned long fileSize = 0;
             if (attachment &&
                 FPDFAttachment_GetFile(attachment, nullptr, 0, &fileSize) &&
-                fileSize <= 2147483647UL) {
-                std::vector<unsigned char> bytes(fileSize);
-                unsigned long actualSize = 0;
-                if (FPDFAttachment_GetFile(
-                        attachment,
-                        bytes.empty() ? nullptr : bytes.data(),
-                        fileSize,
-                        &actualSize) &&
-                    actualSize <= fileSize) {
-                    result = env->NewByteArray(static_cast<jsize>(actualSize));
-                    if (result && actualSize > 0) {
-                        env->SetByteArrayRegion(
-                                result,
-                                0,
-                                static_cast<jsize>(actualSize),
-                                reinterpret_cast<const jbyte*>(bytes.data()));
+                fileSize <= kMaxAttachmentBytes) {
+                try {
+                    std::vector<unsigned char> bytes(fileSize);
+                    unsigned long actualSize = 0;
+                    if (FPDFAttachment_GetFile(
+                            attachment,
+                            bytes.empty() ? nullptr : bytes.data(),
+                            fileSize,
+                            &actualSize) &&
+                        actualSize <= fileSize) {
+                        result = env->NewByteArray(static_cast<jsize>(actualSize));
+                        if (result && actualSize > 0) {
+                            env->SetByteArrayRegion(
+                                    result,
+                                    0,
+                                    static_cast<jsize>(actualSize),
+                                    reinterpret_cast<const jbyte*>(bytes.data()));
+                        }
                     }
+                } catch (const std::bad_alloc&) {
+                    LOGE("PDF_FILE_ATTACHMENT extraction allocation failed");
                 }
+            } else if (fileSize > kMaxAttachmentBytes) {
+                LOGE("PDF_FILE_ATTACHMENT extraction exceeds 16 MiB budget");
             }
         }
         if (annot) FPDFPage_CloseAnnot(annot);
@@ -21673,6 +22604,59 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeGetPageRota
     return page ? FPDFPage_GetRotation(page) * 90 : 0;
 }
 
+JNIEXPORT jobject JNICALL
+Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeGetSavedImageAnnotationBitmap(
+        JNIEnv* env, jobject, jlong docPtr, jlong pagePtr, jint annotationIndex) {
+    auto* documentFile = reinterpret_cast<DocumentFile*>(docPtr);
+    FPDF_PAGE page = reinterpret_cast<FPDF_PAGE>(pagePtr);
+    if (!documentFile || !documentFile->pdfDocument || !page || annotationIndex < 0 ||
+        annotationIndex >= FPDFPage_GetAnnotCount(page)) return nullptr;
+    FPDF_ANNOTATION annotation = FPDFPage_GetAnnot(page, annotationIndex);
+    if (!annotation) return nullptr;
+    if (FPDFAnnot_GetSubtype(annotation) != FPDF_ANNOT_STAMP) {
+        FPDFPage_CloseAnnot(annotation);
+        return nullptr;
+    }
+    FPDF_PAGEOBJECT image = nullptr;
+    bool ambiguous = false;
+    for (int index = 0; index < FPDFAnnot_GetObjectCount(annotation); ++index) {
+        FPDF_PAGEOBJECT object = FPDFAnnot_GetObject(annotation, index);
+        if (object && FPDFPageObj_GetType(object) == FPDF_PAGEOBJ_IMAGE) {
+            if (image) { ambiguous = true; break; }
+            image = object;
+        }
+    }
+    FPDF_IMAGEOBJ_METADATA metadata{};
+    FS_MATRIX original{};
+    jobject result = nullptr;
+    if (!ambiguous && image && FPDFImageObj_GetImageMetadata(image, page, &metadata) &&
+        metadata.width > 0 && metadata.height > 0 &&
+        static_cast<uint64_t>(metadata.width) * metadata.height <= 16000000ULL &&
+        FPDFPageObj_GetMatrix(image, &original)) {
+        // The caller owns an isolated document. Return canonical source pixels: placement,
+        // rotation and annotation opacity are still retained separately in its metadata.
+        FS_MATRIX source{static_cast<float>(metadata.width), 0, 0,
+                         static_cast<float>(metadata.height), 0, 0};
+        unsigned int red = 255, green = 255, blue = 255, alpha = 255;
+        const bool hasFill = FPDFPageObj_GetFillColor(image, &red, &green, &blue, &alpha);
+        if (FPDFPageObj_SetMatrix(image, &source)) {
+            const bool normalizedFill = hasFill && FPDFPageObj_SetFillColor(image, red, green, blue, 255);
+            FPDF_BITMAP bitmap = (!hasFill || normalizedFill)
+                                 ? FPDFImageObj_GetRenderedBitmap(documentFile->pdfDocument, page, image)
+                                 : nullptr;
+            const bool restored = FPDFPageObj_SetMatrix(image, &original);
+            const bool restoredFill = !normalizedFill || FPDFPageObj_SetFillColor(image, red, green, blue, alpha);
+            if (bitmap) {
+                if (restored && restoredFill) result = ConvertFPDFBitmapToAndroidBitmap(env, bitmap);
+                FPDFBitmap_Destroy(bitmap);
+            }
+        }
+    }
+    if (!result) LOGE("PDF_SAVED_IMAGE: cannot extract single-image annotation index=%d", annotationIndex);
+    FPDFPage_CloseAnnot(annotation);
+    return result;
+}
+
 JNIEXPORT jobjectArray JNICALL //todo main get annotation method
 Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeGetAnnotationsForPage(
         JNIEnv* env,
@@ -21686,7 +22670,11 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeGetAnnotati
         jboolean includeImageBitmaps,
         jint targetImageSourceId) {
 
-    FPDF_DOCUMENT doc = (FPDF_DOCUMENT) docPtr;
+    // Kotlin passes PdfDocument.mNativeDocPtr, which owns a DocumentFile wrapper,
+    // not an FPDF_DOCUMENT. Raw image extraction hid this invalid-handle bug because
+    // it needs only the page object; mask-aware rendering also needs the real document.
+    DocumentFile* documentFile = reinterpret_cast<DocumentFile*>(docPtr);
+    FPDF_DOCUMENT doc = documentFile ? documentFile->pdfDocument : nullptr;
     FPDF_PAGE page = (FPDF_PAGE) pagePtr;
     if (!doc || !page) return nullptr;
 
@@ -21807,6 +22795,26 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeGetAnnotati
                 &interiorB,
                 &interiorA
         );
+        if ((type == 1 || type == 2 || type == 8) && !hasStrokeColor) {
+            // Fully transparent managed markup is still a valid color. The generic
+            // appearance resolver intentionally skips invisible objects for other types.
+            for (int objectIndex = 0; objectIndex < FPDFAnnot_GetObjectCount(annot); objectIndex++) {
+                FPDF_PAGEOBJECT object = FPDFAnnot_GetObject(annot, objectIndex);
+                if (object && FPDFPageObj_GetType(object) == FPDF_PAGEOBJ_PATH &&
+                    FPDFPageObj_GetStrokeColor(object, &r, &g, &b, &a)) {
+                    hasStrokeColor = true;
+                    break;
+                }
+            }
+        }
+        // Filled attachment icons (Graph) have no painted stroke. Keep their visible
+        // fill color when geometry edits rebuild the appearance from this readback.
+        if (type == 21 && !hasStrokeColor && hasInteriorColor) {
+            r = interiorR;
+            g = interiorG;
+            b = interiorB;
+            a = interiorA;
+        }
         if (type == 0) {
             if (hasInteriorColor) {
                 r = interiorR;
@@ -22482,8 +23490,57 @@ Java_com_cv_lufick_compose_1editor_helper_PdfCustomNativeSaver_nativeGetAnnotati
                      : !includeEditContent);
             FPDF_BITMAP imageBitmap = nullptr;
             if (shouldExtractBitmap && canExtractBitmap) {
+                // Targeted readback uses an isolated document. Render at source-pixel density,
+                // not the smaller PDF placement size, without changing orientation or shear.
+                // Do not change matrices during ordinary scans of the live viewer document.
+                FS_MATRIX extractionMatrix{};
+                bool restoreExtractionMatrix = false;
+                if (targetImageSourceId >= 0 && hasImageMetadata &&
+                    imageMetadata.width > 0 && imageMetadata.height > 0 &&
+                    FPDFPageObj_GetMatrix(pageObj, &extractionMatrix)) {
+                    const double widthAxis = std::hypot(extractionMatrix.a, extractionMatrix.b);
+                    const double heightAxis = std::hypot(extractionMatrix.c, extractionMatrix.d);
+                    if (std::isfinite(widthAxis) && std::isfinite(heightAxis) &&
+                        widthAxis > 0.000001 && heightAxis > 0.000001) {
+                        double scale = std::max(imageMetadata.width / widthAxis,
+                                                imageMetadata.height / heightAxis);
+                        const double outputWidth = std::ceil((std::abs(extractionMatrix.a) +
+                                                               std::abs(extractionMatrix.c)) * scale);
+                        const double outputHeight = std::ceil((std::abs(extractionMatrix.b) +
+                                                                std::abs(extractionMatrix.d)) * scale);
+                        // Rotation/shear can enlarge the bounding bitmap beyond the source area.
+                        const double outputPixels = outputWidth * outputHeight;
+                        if (std::isfinite(outputPixels) && outputPixels > 0.0) {
+                            if (outputPixels > 15900000.0) {
+                                scale *= std::sqrt(15900000.0 / outputPixels);
+                            }
+                            FS_MATRIX renderMatrix = extractionMatrix;
+                            renderMatrix.a *= scale;
+                            renderMatrix.b *= scale;
+                            renderMatrix.c *= scale;
+                            renderMatrix.d *= scale;
+                            restoreExtractionMatrix = FPDFPageObj_SetMatrix(pageObj, &renderMatrix);
+                        }
+                    }
+                }
                 imageBitmap = FPDFImageObj_GetRenderedBitmap(doc, page, pageObj);
-                if (!imageBitmap) {
+                if (restoreExtractionMatrix && !FPDFPageObj_SetMatrix(pageObj, &extractionMatrix)) {
+                    if (imageBitmap) FPDFBitmap_Destroy(imageBitmap);
+                    LOGE("PDF_CONTENT_IMAGE: cannot restore extraction matrix object=%d", i);
+                    for (jobject collected : tempCollector) env->DeleteLocalRef(collected);
+                    if (textPage) FPDFText_ClosePage(textPage);
+                    return nullptr;
+                }
+                if (imageBitmap && targetImageSourceId >= 0) {
+                    __android_log_print(ANDROID_LOG_DEBUG, "PDF_CONTENT_IMAGE",
+                                        "rendered extraction ready object=%d format=%d size=%dx%d source=%ux%u",
+                                        i, FPDFBitmap_GetFormat(imageBitmap),
+                                        FPDFBitmap_GetWidth(imageBitmap), FPDFBitmap_GetHeight(imageBitmap),
+                                        imageMetadata.width, imageMetadata.height);
+                } else if (!imageBitmap) {
+                    // Keep extraction usable on PDFs/builds where rendered extraction fails.
+                    // Raw extraction may omit a separate mask; log this for the alpha follow-up.
+                    LOGE("PDF_CONTENT_IMAGE: rendered extraction unavailable; using raw bitmap object=%d", i);
                     imageBitmap = FPDFImageObj_GetBitmap(pageObj);
                 }
             }
